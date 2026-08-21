@@ -12,15 +12,16 @@ applies to any task that changes code in a repository, including small ones.
 
 Before acting on any task this skill applies to, emit exactly one line, in this shape:
 
-    Orchestration: <TIER> | model: <name from routing file> | tree: <clean|dirty>
+    Orchestration: <TIER> | model: <name from routing file> | tree: <clean|dirty> | context: <present|absent>
 
 `<TIER>` is FAST, SMALL, NORMAL, or DIFFICULT. `<name from routing file>` is read from
 `config/model-routing.json` for that tier — never a name recalled from memory.
-`<clean|dirty>` is the result of the `git status` check.
+`<clean|dirty>` is the result of the `git status` check. `<present|absent>` is whether
+`docs/ai-context/` exists in this repository — a directory check, not a judgement.
 
 This line is mandatory. It must appear before the first tool call and not after one, and
-not at the end as a summary. The single exception is the `git status` check itself, which
-is read-only and is what supplies the last field; nothing else may precede the line.
+not at the end as a summary. Two read-only checks may precede it because they supply its
+last two fields: `git status`, and the check for `docs/ai-context/`. Nothing else may.
 
 It is not optional for small tasks. A one-word typo fix emits it exactly as a migration
 does.
@@ -31,7 +32,7 @@ delegation, no command runs ahead of it.
 Reclassification emits the line again, carrying the new tier, the newly selected model,
 and a short reason:
 
-    Orchestration: NORMAL | model: <name from routing file> | tree: clean | reclassified: <reason>
+    Orchestration: NORMAL | model: <name from routing file> | tree: clean | context: present | reclassified: <reason>
 
 ## Core principle
 
@@ -64,6 +65,11 @@ risks, run tests, write or modify tests, review code, verify fixes, and report d
 missing cases. Its findings go back to the implementation agent. Keeping Codex out of the
 production code it reviews is what preserves reviewer independence.
 
+Codex also recalculates impact from the real diff after implementation, selects the
+targeted tests that follow from it, checks whether the implementation touched areas the
+plan did not anticipate, and reports AI context it found to be stale or incomplete. In an
+unfamiliar repository it performs the read-only onboarding analysis.
+
 ## Workflow
 
 ```text
@@ -75,13 +81,19 @@ Model selection
    ↓
 Dirty working tree check
    ↓
+AI context: read it, or bootstrap it if missing
+   ↓
+Impact analysis  →  targeted reads
+   ↓
 Delegate implementation (OpenCode)
    ↓
-Codex review
+Codex review  +  impact re-check against the real diff
    ↓
 Pass?  ── no ──→ fix loop (max 3 attempts) ──→ stop and report to user
    │
   yes
+   ↓
+Context update, only if important project knowledge changed
    ↓
 Local commit
 ```
@@ -149,12 +161,39 @@ Not a default. Choose it only when a task genuinely benefits from large reposito
 context, long-horizon reasoning, or broad codebase analysis. Not for routine
 implementation that the standard tier model handles.
 
+## Project context and impact
+
+The project's own AI context lives in its repository at `docs/ai-context/`. The rules for
+reading, creating, and maintaining it, and for impact analysis and test selection, are in:
+
+```text
+${CLAUDE_PLUGIN_ROOT}/skills/project-context/SKILL.md
+```
+
+Read that file when `context: absent` (it has to be bootstrapped) or when the task is
+NORMAL or DIFFICULT. On a FAST or SMALL task with context present, these four rules are
+enough:
+
+1. Read the parts of `docs/ai-context/` that bear on the task. Do not re-scan the
+   repository because a task arrived; targeted reads follow from the context.
+2. Emit the impact line before delegating, on every tier:
+
+       Impact: <area> | affected: <direct> | risks: <what could regress> | verify: <checks>
+
+   On a FAST task it is one short line. It is still required — "too small to bother" is
+   not a decision available here.
+3. The repository overrides the context. Where a targeted read contradicts the context,
+   trust the code, then fix that context section.
+4. After the task passes, update context only if important project knowledge changed.
+   Most tasks change none.
+
 ## Fast path
 
 FAST and SMALL tasks use the lightweight workflow:
 
 ```text
-Classify FAST / SMALL → delegate directly → implementation
+Classify FAST / SMALL → read the relevant context → lightweight impact check
+→ delegate directly → implementation
 → Codex lightweight diff review → relevant lightweight verification → commit
 ```
 
