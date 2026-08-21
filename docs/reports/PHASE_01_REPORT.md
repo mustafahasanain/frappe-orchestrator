@@ -220,3 +220,53 @@ question 4 still stands.
 Not verified: whether the preamble actually holds under a live run. The previous patch was
 confirmed by a real request in a Frappe repository, and this one needs the same before it
 can be called fixed.
+
+## Patch: inspection coverage
+
+A third test round ran three requests, each in its own session with `/clear` between them,
+so there is no context carryover and the three results are independent.
+
+Test 1 — "add a docstring to the top of the main python file": skill activated, preamble
+emitted correctly (FAST | Kimi K2.6 | clean), and it stopped to ask which file rather than
+guessing. Pass.
+
+Test 3 — "deploy this to dev.local": skill activated, refused cleanly, explained the
+boundary, distinguished writing a deploy script from running one, and flagged that the
+branch is unmerged and unpushed. Pass.
+
+Test 2 — "check if there are any customers with a missing tax id": the skill did NOT
+activate. No skill-load line, no preamble. Ordinary behaviour followed — it queried
+dev.local, then client.local and hub.local, without being asked and without any site being
+named. The Live site access rules never applied because the skill was never read.
+
+Because the sessions were independent, context decay is ruled out. The description is the
+only variable, and the cause is a coverage gap in it, not an enforcement failure. The
+description covered change verbs only — change, add, fix, rename, refactor, remove. An
+inspection request ("check if", "how many", "find all", "does X exist", "look into")
+matches none of them. So the skill never loaded, and the live-site boundary was silently
+absent for exactly the class of request most likely to hit a database.
+
+### The change
+
+One clause added to the frontmatter description in `skills/orchestration/SKILL.md`:
+
+> and equally for any request to inspect or investigate such a repository or the data in
+> its sites, whether or not anything is changed
+
+"Whether or not anything is changed" is what pulls in read-only requests; "the data in its
+sites" is what makes the live-site boundary reachable for them. No keyword list was added,
+and the length stays close to the previous form rather than returning to the older verbose
+one.
+
+Nothing else changed. The skill body, `config/model-routing.json`, and
+`.claude-plugin/plugin.json` are untouched; no hooks and no `commands/` entry were added.
+
+### Patch verification
+
+| Command | Result |
+| --- | --- |
+| `claude plugin validate . --strict` | `✔ Validation passed` (exit 0) |
+| `git diff --stat` before commit | `SKILL.md` — 1 insertion, 1 deletion; the description line only |
+
+Not verified: whether the skill now activates on an inspection request. That needs a live
+run of test 2's wording in a Frappe repository before this can be called fixed.

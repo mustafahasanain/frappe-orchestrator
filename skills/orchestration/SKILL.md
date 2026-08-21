@@ -1,6 +1,6 @@
 ---
 name: orchestration
-description: "Use for any request to change, add, fix, rename, refactor, or remove something in a Frappe/ERPNext or Next.js repository, including small one-line fixes and typos. Also use when asked to deploy or push."
+description: "Use for any request to change, add, fix, rename, refactor, or remove something in a Frappe/ERPNext or Next.js repository, including small one-line fixes and typos, and equally for any request to inspect or investigate such a repository or the data in its sites, whether or not anything is changed. Also use when asked to deploy or push."
 ---
 
 # Orchestration
