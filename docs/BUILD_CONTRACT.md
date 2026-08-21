@@ -39,6 +39,8 @@ This is a Claude Code plugin. The layout rules are non-negotiable:
 - Every component directory (`skills/`, `agents/`, `hooks/`, `commands/`) lives at the
   repository root, never inside `.claude-plugin/`.
 - Skills use the directory form: `skills/<skill-name>/SKILL.md`.
+- `hooks/` holds hook scripts and `hooks/hooks.json`, the plugin's hook configuration.
+  Like `skills/`, it is discovered by convention — `plugin.json` does not point at it.
 - Any path inside the plugin that must be referenced at runtime uses
   `${CLAUDE_PLUGIN_ROOT}`, never an absolute path and never a relative path from cwd.
 - `docs/` is documentation and specification only. Nothing in `docs/` is loaded by the
@@ -70,6 +72,30 @@ Explicitly forbidden in Phase 01:
 - any structured result contract implementation
 - any script that invokes an external CLI
 - any `docs/ai-context/` template
+
+### Phase 01.5 — Enforcement hook
+
+Skill activation is stochastic. When the orchestration skill does not load, none of its
+rules apply. This phase moves the rules whose failure is expensive out of skill prose and
+into a `PreToolUse` hook, which runs whether or not the skill was read.
+
+Allowed:
+
+- `hooks/` — the hook script
+- `hooks/hooks.json` — the hook configuration
+
+Nothing else. `plugin.json` is not touched.
+
+The skill keeps the guidance; the hook makes the dangerous cases unconditional. Three
+rules therefore exist in both places on purpose, and the skill's wording is not weakened
+because the hook exists.
+
+The hook **decides only**. It denies blanket staging, and asks before a push or any
+execution against a Frappe site. It performs no operation of its own. "Permanently out of
+scope" below stands unchanged and binds hooks exactly as it binds skills: the hook must
+refuse deployment, never perform it.
+
+Anything the hook does not recognise is allowed through untouched.
 
 ### Phase 02 — Project Context & Impact
 
@@ -128,6 +154,11 @@ work and is allowed. Invoking it from the plugin is not.
 - Never run `git add .` or `git add -A`. Stage the specific files you created or changed.
 - One commit per phase, at the end, after the report is written.
 - Commit message format: `feat(phase-0X): <short summary>`.
+- Subject line under 60 characters. Add a body only when the change needs explaining;
+  most do not.
+- No attribution trailers of any kind. No `Co-Authored-By`, no "Generated with Claude
+  Code", no tool or model name anywhere in the message. The commit describes the change,
+  nothing else.
 - If the working tree is dirty before you start with changes that are not yours, stop and
   ask. Do not stage or revert anything you did not create.
 
