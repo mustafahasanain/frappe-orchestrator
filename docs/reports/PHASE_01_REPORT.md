@@ -91,3 +91,51 @@
 | `ls -A .claude-plugin` | `plugin.json` only — layout rule holds |
 | `find . -type f` (excluding `.git`) | `skills/` and `config/` are at the repository root, not inside `.claude-plugin/` |
 | `git status --porcelain` before starting | Empty — clean working tree, nothing pre-existing was staged or reverted |
+
+## Patch: skill activation
+
+The plugin loaded correctly (`plugin list` reported `loaded`), but the skill did not
+activate on a real request. In a Frappe repository, `fix the label on the customer form,
+it says "Cusomter"` produced ordinary behaviour: no task classification, no model
+selection, no delegation. The skill was never read.
+
+The cause was the frontmatter description. Skill activation matches the user's request
+against the description, and the original text described what the skill *does* rather
+than *when* it applies — it opened on "Orchestrate any request that changes a
+repository" and then spent most of its length on internal mechanics (classification,
+central routing, working-tree check, OpenCode delegation, Codex review, commit). A
+request phrased as "fix the label, it says Cusomter" resembles none of that wording, and
+the length diluted what signal there was.
+
+**Old description** (566 characters):
+
+> Orchestrate any request that changes a repository — features, bug fixes, refactors, renames, config edits, migrations, dependency bumps, test changes, or 'just fix this quickly' one-liners. Use before writing or delegating code: classify the task, select the implementation model from central routing, check the Git working tree for unrelated changes, delegate implementation to OpenCode, have Codex review independently, and create the local commit. Also use when asked to deploy, push, or update a server, to apply the correct boundary.
+
+**New description** (206 characters):
+
+> Use for any request to change, add, fix, rename, refactor, or remove something in a Frappe/ERPNext or Next.js repository, including small one-line fixes and typos. Also use when asked to deploy or push.
+
+Rationale:
+
+- **Leads with the trigger condition, in the user's vocabulary.** The opening clause is
+  the set of things a user asks for, not the procedure the skill runs.
+- **Names the concrete context** — Frappe/ERPNext and Next.js repositories — rather than
+  the abstract "a repository", which gives the match something specific to bind to.
+- **States the small-task case explicitly.** "including small one-line fixes and typos"
+  covers the class of request that failed, without a keyword list; matching is semantic,
+  so near-synonyms of the opening verbs add noise rather than coverage.
+- **Mechanics removed entirely.** Routing, delegation, review, and commit are rules for
+  the skill body, not activation signal. They remain in the body, unchanged.
+- **Deploy/push boundary retained** as one short trailing clause.
+
+Nothing else changed: the skill body, `config/model-routing.json`, and
+`.claude-plugin/plugin.json` are untouched. Open question 4 above still stands — this
+patch improves description-based triggering but does not make invocation deterministic.
+
+### Patch verification
+
+| Command | Result |
+| --- | --- |
+| `claude plugin validate . --strict` | `✔ Validation passed` (exit 0) |
+| `claude plugin validate skills --strict` | `✔ Validation passed` (exit 0) — new frontmatter accepted |
+| `git diff --stat` before commit | `SKILL.md` — 1 insertion, 1 deletion (the description line only) |

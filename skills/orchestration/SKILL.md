@@ -1,6 +1,6 @@
 ---
 name: orchestration
-description: "Orchestrate any request that changes a repository — features, bug fixes, refactors, renames, config edits, migrations, dependency bumps, test changes, or 'just fix this quickly' one-liners. Use before writing or delegating code: classify the task, select the implementation model from central routing, check the Git working tree for unrelated changes, delegate implementation to OpenCode, have Codex review independently, and create the local commit. Also use when asked to deploy, push, or update a server, to apply the correct boundary."
+description: "Use for any request to change, add, fix, rename, refactor, or remove something in a Frappe/ERPNext or Next.js repository, including small one-line fixes and typos. Also use when asked to deploy or push."
 ---
 
 # Orchestration
