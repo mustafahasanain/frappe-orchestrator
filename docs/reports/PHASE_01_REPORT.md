@@ -139,3 +139,84 @@ patch improves description-based triggering but does not make invocation determi
 | `claude plugin validate . --strict` | `✔ Validation passed` (exit 0) |
 | `claude plugin validate skills --strict` | `✔ Validation passed` (exit 0) — new frontmatter accepted |
 | `git diff --stat` before commit | `SKILL.md` — 1 insertion, 1 deletion (the description line only) |
+
+## Patch: compliance
+
+The activation patch above fixed loading — the skill now triggers on a plain request. The
+following test run then failed on compliance. The agent loaded the skill, skipped task
+classification and model selection entirely, implemented the change itself rather than
+delegating, and ran Python via `bench console` against all three live sites without being
+asked.
+
+Its stated reason was that a typo was too small to be worth the workflow. The skill
+already said the opposite in two places — the opening paragraph ("including small ones")
+and the FAST tier definition ("mechanical one-line changes"). Both were read and treated
+as boilerplate.
+
+A third restatement was therefore rejected as the fix. Prose that has been ignored twice
+does not start working when repeated a third time, and emphasis is not a mechanism. Both
+changes below are structural: one makes compliance visible, the other narrows a boundary
+that was too wide.
+
+### 1. Required preamble
+
+New `## Required preamble` section, placed immediately after the opening paragraph so it
+is read before any other rule. It requires a single line before acting on any task the
+skill applies to:
+
+    Orchestration: <TIER> | model: <name from routing file> | tree: <clean|dirty>
+
+The line is mandatory, must precede the first tool call rather than appear afterwards as a
+summary, and — stated explicitly — if it has not been emitted, the workflow has not
+started. Reclassification emits it again with the new tier, the newly selected model, and
+a short reason.
+
+The mechanism is the point. A prose rule can be read and skipped silently; a required
+visible output cannot be skipped without the omission being obvious in the transcript, to
+the user and to the agent itself. The line also forces the three skipped steps to actually
+happen: the tier cannot be printed without classifying, the model name cannot be printed
+without reading `config/model-routing.json`, and the tree state cannot be printed without
+running the `git status` check.
+
+**Carve-out.** "Before any tool call" and "report the tree state" conflict literally,
+since `git status` is itself a tool call. The section names `git status` as the single
+permitted exception, because it is read-only and is what supplies the last field. The
+alternative considered and rejected was `tree: <unchecked>`, which would have removed the
+conflict by removing the Git safety check from the preamble's enforcement.
+
+One sentence from the drafted wording was cut before writing: an abstract restatement that
+judging a task too small was not a decision available to the agent. The concrete sentence
+retained — "A one-word typo fix emits it exactly as a migration does" — carries the same
+meaning, and the mandatory line is what enforces it.
+
+### 2. Live site boundary
+
+New `### Live site access` subsection inside `## Autonomy boundary`. That section listed
+"repository inspection" under **Allowed automatically** without bounding it, which is the
+gap the `bench console` fan-out went through.
+
+The subsection makes explicit that repository inspection means reading files in the
+working tree — source, Git diff, committed configuration — and stops there. Executing
+against a site database or a running Frappe instance is not inspection: `bench console`,
+`bench mariadb`, `bench execute`, `bench --site ... run`, and any snippet opening a Frappe
+connection (`frappe.init`, `frappe.connect`, `frappe.db`, `frappe.get_doc`). Such
+execution requires an explicit user request, is limited to the single site the user named
+(ask if none was named), and is never fanned out across sites to hunt for something. A
+closing line covers the specific failure: reading a DocType's definition means reading its
+JSON in the working tree, not querying a site.
+
+Nothing else changed. The description, `config/model-routing.json`, and
+`.claude-plugin/plugin.json` are untouched, and no `commands/` entry was added — open
+question 4 still stands.
+
+### Patch verification
+
+| Command | Result |
+| --- | --- |
+| `claude plugin validate . --strict` | `✔ Validation passed` (exit 0) |
+| `claude plugin validate skills --strict` | `✔ Validation passed` (exit 0) |
+| `git diff --stat` before commit | `SKILL.md` — 45 insertions, 0 deletions; two inserted sections, no existing line modified |
+
+Not verified: whether the preamble actually holds under a live run. The previous patch was
+confirmed by a real request in a Frappe repository, and this one needs the same before it
+can be called fixed.

@@ -8,6 +8,31 @@ description: "Use for any request to change, add, fix, rename, refactor, or remo
 You are the orchestrator. You decide; the external agents execute. Every rule below
 applies to any task that changes code in a repository, including small ones.
 
+## Required preamble
+
+Before acting on any task this skill applies to, emit exactly one line, in this shape:
+
+    Orchestration: <TIER> | model: <name from routing file> | tree: <clean|dirty>
+
+`<TIER>` is FAST, SMALL, NORMAL, or DIFFICULT. `<name from routing file>` is read from
+`config/model-routing.json` for that tier — never a name recalled from memory.
+`<clean|dirty>` is the result of the `git status` check.
+
+This line is mandatory. It must appear before the first tool call and not after one, and
+not at the end as a summary. The single exception is the `git status` check itself, which
+is read-only and is what supplies the last field; nothing else may precede the line.
+
+It is not optional for small tasks. A one-word typo fix emits it exactly as a migration
+does.
+
+**If the line has not been emitted, the workflow has not started.** No edit, no
+delegation, no command runs ahead of it.
+
+Reclassification emits the line again, carrying the new tier, the newly selected model,
+and a short reason:
+
+    Orchestration: NORMAL | model: <name from routing file> | tree: clean | reclassified: <reason>
+
 ## Core principle
 
 Use the simplest reliable solution. Never introduce agent servers, message brokers,
@@ -233,5 +258,25 @@ operations, destructive migrations, irreversible data changes, and operations ou
 approved local project environment.
 
 Remote server changes and deployment are never performed here at all.
+
+### Live site access
+
+"Repository inspection" above means reading files in the working tree — source files, the
+Git diff, configuration committed to the repository. It stops there.
+
+Executing anything against a site database or a running Frappe instance is not inspection.
+This covers `bench console`, `bench mariadb`, `bench execute`, `bench --site ... run`, and
+any script or snippet that opens a Frappe connection (`frappe.init`, `frappe.connect`,
+`frappe.db`, `frappe.get_doc`).
+
+Such execution:
+
+- requires an explicit user request — never a step you chose to take on your own;
+- is limited to the single site the user named; if no site was named, ask;
+- is never fanned out across sites, and never repeated site by site to hunt for
+  something.
+
+Reading a DocType's definition means reading its JSON in the working tree, not querying a
+site.
 
 When unsure whether an action crosses the safety boundary: **stop instead of guessing.**
