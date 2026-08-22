@@ -333,3 +333,116 @@ and nothing in the dispatcher.
 
 Still not verified: which `--variant` values the provider accepts, and everything in
 Limitations 1, 5, and 6 above.
+
+## Patch: Codex verified live, result parser rebuilt
+
+Limitation 5 is closed. Codex 0.149.0 is installed, and the review path was exercised
+against the real CLI four times in this repository, not against stubs. The runs found a
+real defect in the parser that no stub had caught.
+
+### What the real CLI does
+
+`codex exec --sandbox read-only` ran correctly from the dispatcher. Every flag the adapter
+was built on is confirmed present in `codex exec --help`: `-m/--model`, `-s/--sandbox`,
+`-C/--cd`, `-o/--output-last-message`, `--json`, `--skip-git-repo-check`.
+
+**The stream split is not what it looks like in a terminal.** The banner (`workdir`,
+`model`, `provider`, `approval`, `sandbox`, `reasoning effort`, `session id`), the prompt
+echo, a second rendering of the answer, and the `tokens used` footer all go to **stderr**.
+stdout carried only the final agent message — 246 bytes on the first run, the fenced block
+and nothing else. Grepping stdout for any banner or footer text returns zero matches. What
+looks like one interleaved stream is two streams rendered together by the terminal; under
+the dispatcher's separate pipes they do not mix.
+
+So the build assumption ("final message on stdout") held. The parser was hardened anyway,
+because one CLI version and one prompt shape is not a guarantee.
+
+**Observed default model: `gpt-5.6-sol`,** with `reasoning effort: high`. Codex stays
+unpinned as decided. Recorded here so a change of default is noticeable — it appears in
+the banner on stderr of every run, and is kept in each workspace's `agent-stderr.txt`.
+
+### The defect the live runs found
+
+Run 4 returned `result_block: "invalid"` on a perfectly well-formed report. The cause was
+in the parser, not the CLI: the report's own `detail` string contained the text
+```` ```json ````, and a non-greedy regex delimiting a block on ``` truncates the body at
+that inner fence, leaving unparseable JSON.
+
+This is not an edge case. It is what happens whenever an agent reviews code that contains
+fenced blocks, or explains a fence in its own findings — which is precisely what a reviewer
+of this repository does. No stub produced it because every stub emitted tidy output.
+
+**Fences are no longer parsed at all.** Extraction is `json.JSONDecoder().raw_decode`
+scanning for balanced objects, which consumes strings correctly whatever they contain. The
+last object carrying one of `RESULT_KEYS` wins — last because the contract asks for the
+block last, and the key requirement because otherwise echoed config or log JSON would be
+handed back as if the agent had written it. `invalid` now means a fence appears somewhere
+so the agent tried and the answer was unusable; `missing` means there was nothing to
+salvage. `import re` is gone from the dispatcher.
+
+Removing fence parsing also removed a whole class of defects rather than patching them one
+at a time: info strings with dots or spaces, unterminated fences, and objects nested in
+fenced arrays are no longer parsing concerns because no fence is parsed.
+
+### The fix loop ran, and it was bounded
+
+The review of the parser change went through the full ladder. Attempts were made against
+the real Codex CLI, and each re-review ran against the current actual diff.
+
+| Attempt | Verdict | Blocking findings | Outcome |
+| --- | --- | --- | --- |
+| 1 | FAIL | 3 | Two fixed; one declined |
+| 2 | FAIL | 2 | Both fixed by simplifying the selection rule |
+| 3 | FAIL | 1 | See below |
+
+The declined finding was attempt 1's first: that a truncated bare `{"verdict":` should
+report `invalid` rather than `missing`. Both states lead the orchestrator to read the
+transcript, so nothing behavioural turned on it. Rather than change the code I defined the
+states explicitly in the docstring so the rule is stated rather than inferred. The
+declined finding and the reason are recorded here because a declined blocking finding
+should be visible, not silent.
+
+**Attempt 3 was the last.** Phase 01 allows no automatic fourth attempt, and none was
+made. Attempt 3's finding concerned fence info strings and unterminated fences leaking
+into the fallback — both real against the code as it then stood. They are resolved not by
+a fourth review round but by the rebuild above, which deletes the fence parsing they were
+about. That rebuild came from reading run 4's actual output myself, not from another
+delegated review.
+
+**The final state has therefore not been reviewed by Codex.** That is the honest position:
+three attempts were spent, the bound held, and the last change is verified by tests rather
+than by review. Re-reviewing it is the recommended first action, and it is now a one
+command job.
+
+### What is still untested
+
+- **The final parser has no Codex review**, for the reason above.
+- **`--mode test` against the real CLI.** `workspace-write` was exercised only through a
+  stub. Codex has not actually written a test file through the dispatcher.
+- **The implement path against the real OpenCode CLI.** Limitation 6 stands unchanged:
+  OpenCode's real stdout shape is still unobserved, and its stubs are a guess at it. The
+  Codex lesson applies directly — the stub was tidier than reality, and that is what hid
+  the defect.
+- **Deny enforcement under `--auto` at runtime.** Limitation 1, unchanged.
+- **Accepted `--variant` values.** Unchanged.
+- **No automated test protects the parser.** 18 cases were run by hand this session,
+  including both captured real outputs. This repository has no test infrastructure and
+  Phase 03's allowed file list does not include creating one, so nothing was added. Worth
+  a decision: the parser is now the component most likely to break silently, and the two
+  real captures are exactly the fixtures a test would need.
+
+### Patch verification
+
+| Command | Result |
+| --- | --- |
+| `claude plugin validate . --strict` | `✔ Validation passed` (exit 0) |
+| `codex --version` | `codex-cli 0.149.0` |
+| `codex exec --help` | `-m/--model`, `-s/--sandbox`, `-C/--cd`, `-o/--output-last-message`, `--json`, `--skip-git-repo-check` all present as built |
+| Live review run 1, trivial docstring diff | `status=completed`, `exit_code=0`, 19.5 s, `result_block=present`, `verdict=PASS` |
+| Live review runs 2–4, real parser diff, NORMAL tier | `status=completed` each; 178.5 s, 186.0 s, 257.3 s; all within the 900 s tier timeout |
+| stdout vs stderr separation | stdout 246 B (block only); stderr 11,393 B (banner, prompt echo, answer, footer). Zero banner/footer matches in stdout |
+| Parser suite, 18 cases | 18/18. Includes both captured real outputs, backticks and braces inside string values, multiword info strings, unterminated fences, config/log JSON rejected as `missing`, config JSON followed by a real report accepted |
+| Stub suite, 12 cases | All as designed. Stubs rewritten to mirror the real stream split, plus a `decorated` mode putting everything on one stream and a `backticks` mode reproducing the run-4 defect |
+| Refusal matrix, 3 cases | exit 2, unchanged |
+| `cli_missing` with `PATH` stripped | Still fires correctly now that codex is genuinely installed |
+| Repository working tree | Only `scripts/delegate` modified; the probe diff used for run 1 was reverted, and no delegation artifact reached the repository |

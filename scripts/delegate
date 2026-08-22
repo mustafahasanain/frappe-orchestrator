@@ -13,7 +13,6 @@ was wrong.
 import argparse
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -282,18 +281,58 @@ def execute(argv, env, stdin_text, cwd, timeout):
     return status, proc.returncode, out, err, time.monotonic() - started
 
 
-JSON_BLOCK = re.compile(r"```json\s*(.*?)```", re.DOTALL)
+# A conforming report always carries at least one of these: every mode's contract
+# requires `summary`, and implement/review add `status` / `verdict`.
+RESULT_KEYS = ("status", "verdict", "summary", "findings")
+
+
+def _json_objects(text):
+    """Every JSON object literal in `text`, outermost first, found by brace balancing."""
+    decoder = json.JSONDecoder()
+    index = 0
+    while True:
+        start = text.find("{", index)
+        if start == -1:
+            return
+        try:
+            _, end = decoder.raw_decode(text, start)
+        except ValueError:
+            index = start + 1
+            continue
+        yield text[start:end]
+        index = end
 
 
 def extract_report(text):
-    """Last fenced JSON block of the agent's output -> (state, parsed or None)."""
-    blocks = JSON_BLOCK.findall(text or "")
-    if not blocks:
-        return "missing", None
-    try:
-        return "present", json.loads(blocks[-1])
-    except ValueError:
-        return "invalid", None
+    """Find the agent's result object in its output -> (state, parsed or None).
+
+    Located structurally, never by position and never by recognising a CLI's wording.
+    Agent CLIs wrap their output in banners, prompt echoes, and token footers whose text
+    changes between versions, so nothing here may depend on that text.
+
+    Fences are deliberately not parsed. A real report contained a fenced example inside
+    one of its own strings, and any regex delimiting a block on ``` truncates the body
+    at that inner fence. Brace balancing has no such failure: the decoder consumes
+    strings correctly, whatever they contain.
+
+    The last object carrying a RESULT_KEY wins - last because the contract asks for the
+    block last, and RESULT_KEY because echoed config and log JSON would otherwise be
+    handed back as if the agent had written it.
+
+    "invalid" means the output has a fence somewhere, so the agent tried to answer and
+    the answer was unusable. Without one there is nothing to salvage, and the state is
+    "missing".
+    """
+    text = text or ""
+    found = None
+    for body in _json_objects(text):
+        parsed = json.loads(body)
+        if isinstance(parsed, dict) and any(key in parsed for key in RESULT_KEYS):
+            found = parsed
+
+    if found is not None:
+        return "present", found
+    return ("invalid" if "```" in text else "missing"), None
 
 
 # --------------------------------------------------------------------------
