@@ -1,0 +1,390 @@
+{
+  "version": 1,
+  "purpose": "The mechanical command boundaries, in one place. hooks/guard.py enforces them for commands Claude runs through the Bash tool; scripts/delegate enforces them inside a delegated OpenCode run, where the hook cannot see anything. Both read this file and each translates it into its own matching form - token parsing in the hook, glob patterns in the dispatcher's permission policy. Nothing here is written in either engine's syntax, and neither engine keeps its own copy of a rule.",
+  "how_to_change": "Add or edit a rule here, not in a consumer. tests/test_parser.py fails by rule name when a rule is not enforced by both consumers that declare a decision for it, when its documented_in heading is missing from the skill it names, or when an example is not caught. Rule order is precedence: the first match wins.",
+  "decisions": {
+    "hook": "What hooks/guard.py decides for a command Claude runs. null means this rule is not the hook's to enforce.",
+    "delegated": "What scripts/delegate's permission policy decides inside a delegated run. null means the rule cannot be expressed there, or does not apply.",
+    "not_enforced_because": "Required whenever hook or delegated is null. A rule that no longer applies to a consumer has to say why, in the data, where the next reader sees it. Without this field a decision could be quietly dropped to null and nothing would notice - which is the shape of the divergence this file exists to prevent, not a hypothetical."
+  },
+  "match_kinds": {
+    "program_subcommand": "program name, plus the subcommand that follows it, options skipped",
+    "program_option": "program name, plus an option appearing anywhere in the command",
+    "program": "program name alone",
+    "segment_text": "an identifier appearing anywhere in the command text, including inside a quoted snippet or a heredoc body"
+  },
+  "rules": [
+    {
+      "name": "push",
+      "intent": "Pushing is never automatic. It leaves the machine, and there is no human inside a delegated run to ask.",
+      "match": {
+        "kind": "program_subcommand",
+        "program": "git",
+        "subcommands": [
+          "push"
+        ]
+      },
+      "hook": "ask",
+      "delegated": "deny",
+      "documented_in": [
+        {
+          "file": "skills/orchestration/SKILL.md",
+          "heading": "## Push boundary"
+        }
+      ],
+      "examples": [
+        "git push",
+        "git push --force origin main",
+        "git -C /repo push"
+      ],
+      "not_examples": [
+        "git status --porcelain",
+        "git log --oneline"
+      ]
+    },
+    {
+      "name": "blanket-staging",
+      "intent": "Staging everything sweeps in unrelated work. Stage the files the task created or changed, by path.",
+      "match": {
+        "kind": "program_subcommand",
+        "program": "git",
+        "subcommands": [
+          "add"
+        ],
+        "any_argument": [
+          ".",
+          "-A",
+          "--all"
+        ]
+      },
+      "hook": "deny",
+      "delegated": "deny",
+      "documented_in": [
+        {
+          "file": "skills/orchestration/SKILL.md",
+          "heading": "## Commit safety"
+        }
+      ],
+      "examples": [
+        "git add .",
+        "git add -A",
+        "git add --all",
+        "git add -- ."
+      ],
+      "not_examples": [
+        "git add hooks/guard.py",
+        "git add skills/ config/"
+      ]
+    },
+    {
+      "name": "commit-inside-delegated-run",
+      "intent": "The orchestrator creates the commit after review passes. An implementer that commits mid-run bypasses diff inspection and the cleanup checklist. Claude's own commits are the normal path, so the hook does not enforce this.",
+      "match": {
+        "kind": "program_subcommand",
+        "program": "git",
+        "subcommands": [
+          "commit"
+        ]
+      },
+      "hook": null,
+      "delegated": "deny",
+      "documented_in": [
+        {
+          "file": "skills/orchestration/SKILL.md",
+          "heading": "## Commit safety"
+        }
+      ],
+      "examples": [
+        "git commit -m 'wip'",
+        "git -C /repo commit --amend"
+      ],
+      "not_examples": [
+        "git status --porcelain"
+      ],
+      "not_enforced_because": {
+        "hook": "Claude commits as the normal end of a task, after review passes. The rule is about an implementer committing mid-run, and only a delegated run can do that."
+      }
+    },
+    {
+      "name": "site-named",
+      "intent": "A bench command carrying --site runs against that live site's database or a running Frappe instance. Confirm the single target site first.",
+      "match": {
+        "kind": "program_option",
+        "program": "bench",
+        "options": [
+          "--site"
+        ]
+      },
+      "hook": "ask",
+      "delegated": "deny",
+      "documented_in": [
+        {
+          "file": "skills/orchestration/SKILL.md",
+          "heading": "### Live site access"
+        },
+        {
+          "file": "skills/frappe-operations/SKILL.md",
+          "heading": "## Site resolution"
+        }
+      ],
+      "examples": [
+        "bench --site dev.local migrate",
+        "bench --site all clear-cache",
+        "bench --site dev.local list-apps"
+      ],
+      "not_examples": [
+        "bench build",
+        "bench start"
+      ]
+    },
+    {
+      "name": "site-unnamed",
+      "intent": "These bench subcommands act on a site, and with no --site they do not stop acting on one: frappe resolves it from default_site, then currentsite.txt. The site acted on is whichever the bench was last pointed at, named nowhere. 75 of these are derived from frappe's own CLI - every command in frappe/commands/*.py that resolves a site - rather than filtered by which look dangerous; re-derive them the same way against a newer frappe instead of appending by hand. \"run\" is the 76th, retained from this rule's earlier four-entry form; frappe's current CLI has no such command.",
+      "match": {
+        "kind": "program_subcommand",
+        "program": "bench",
+        "subcommands": [
+          "add-database-index",
+          "add-system-manager",
+          "add-to-email-queue",
+          "add-to-hosts",
+          "add-user",
+          "backup",
+          "browse",
+          "build-message-files",
+          "build-search-index",
+          "bulk-rename",
+          "clear-cache",
+          "clear-log-table",
+          "clear-website-cache",
+          "compile-po-to-mo",
+          "console",
+          "create-po-file",
+          "data-import",
+          "db-console",
+          "describe-database-table",
+          "destroy-all-sessions",
+          "disable-scheduler",
+          "disable-user",
+          "doctor",
+          "enable-scheduler",
+          "execute",
+          "export-csv",
+          "export-doc",
+          "export-fixtures",
+          "export-json",
+          "generate-pot-file",
+          "get-untranslated",
+          "import-doc",
+          "import-translations",
+          "install-app",
+          "jupyter",
+          "list-apps",
+          "mariadb",
+          "migrate",
+          "migrate-csv-to-po",
+          "migrate-translations",
+          "ngrok",
+          "partial-restore",
+          "postgres",
+          "publish-realtime",
+          "ready-for-migration",
+          "rebuild-global-search",
+          "reinstall",
+          "reload-doc",
+          "reload-doctype",
+          "remove-from-installed-apps",
+          "request",
+          "reset-perms",
+          "restore",
+          "run",
+          "run-parallel-tests",
+          "run-patch",
+          "run-tests",
+          "run-ui-tests",
+          "scheduler",
+          "serve",
+          "set-admin-password",
+          "set-config",
+          "set-last-active-for-user",
+          "set-maintenance-mode",
+          "set-password",
+          "show-config",
+          "show-pending-jobs",
+          "start-recording",
+          "stop-recording",
+          "transform-database",
+          "trigger-scheduler-event",
+          "trim-database",
+          "trim-tables",
+          "uninstall-app",
+          "update-po-files",
+          "update-translations"
+        ]
+      },
+      "hook": "ask",
+      "delegated": "deny",
+      "documented_in": [
+        {
+          "file": "skills/frappe-operations/SKILL.md",
+          "heading": "## Site resolution"
+        },
+        {
+          "file": "skills/orchestration/SKILL.md",
+          "heading": "### Live site access"
+        }
+      ],
+      "examples": [
+        "bench migrate",
+        "bench clear-cache",
+        "bench install-app erpnext",
+        "bench console",
+        "bench list-apps",
+        "bench -s dev.local migrate"
+      ],
+      "not_examples": [
+        "bench build",
+        "bench build --app erpnext",
+        "bench start",
+        "bench setup requirements",
+        "bench init newbench",
+        "bench version"
+      ]
+    },
+    {
+      "name": "database-client",
+      "intent": "A direct route to the database, bypassing every Frappe-shaped rule around it.",
+      "match": {
+        "kind": "program",
+        "programs": [
+          "mysql",
+          "mariadb"
+        ]
+      },
+      "hook": "ask",
+      "delegated": "deny",
+      "documented_in": [
+        {
+          "file": "skills/orchestration/SKILL.md",
+          "heading": "### Live site access"
+        }
+      ],
+      "examples": [
+        "mysql -u root -p",
+        "mariadb -u root"
+      ],
+      "not_examples": [
+        "cat /etc/mysql/my.cnf",
+        "grep mysql notes.txt"
+      ]
+    },
+    {
+      "name": "frappe-connection",
+      "intent": "A snippet that opens a Frappe connection reaches a site without naming a bench command. Not expressible as a command pattern in a delegated run, where the site rules above cover the same ground. Rule order is precedence, and a bench command carrying a snippet is caught by the bench rules above first - both ask, so the outcome is the same.",
+      "match": {
+        "kind": "segment_text",
+        "identifiers": [
+          "frappe.init",
+          "frappe.connect",
+          "frappe.db",
+          "frappe.get_doc",
+          "frappe.get_all",
+          "frappe.get_list"
+        ]
+      },
+      "hook": "ask",
+      "delegated": null,
+      "documented_in": [
+        {
+          "file": "skills/orchestration/SKILL.md",
+          "heading": "### Live site access"
+        }
+      ],
+      "examples": [
+        "python3 -c \"frappe.get_all('Customer')\"",
+        "echo 'frappe.get_doc(\"User\", \"x\")' | python3"
+      ],
+      "not_examples": [
+        "python3 -c \"print('hello')\"",
+        "grep -r frappe_utils ."
+      ],
+      "not_enforced_because": {
+        "delegated": "Not expressible as a command pattern: it matches an identifier anywhere in the command text, including inside a quoted snippet. The bench and database-client rules deny the delegated routes to the same place."
+      }
+    },
+    {
+      "name": "bare-agent-run",
+      "intent": "A coding agent started outside the dispatcher carries none of the central routing, none of this permission policy, and no result contract. The dispatcher launches the CLIs as its own child processes, which are not Bash tool calls, so it is not caught by its own rule.",
+      "match": {
+        "kind": "program_subcommand",
+        "program": "opencode",
+        "subcommands": [
+          "run"
+        ],
+        "unless_flags": [
+          "--help",
+          "-h",
+          "--version"
+        ]
+      },
+      "hook": "deny",
+      "delegated": null,
+      "documented_in": [
+        {
+          "file": "skills/orchestration/SKILL.md",
+          "heading": "## Delegation"
+        }
+      ],
+      "examples": [
+        "opencode run 'do the thing'",
+        "opencode run --agent build --auto 'x'"
+      ],
+      "not_examples": [
+        "opencode models",
+        "opencode --help",
+        "opencode run --help",
+        "npm run build"
+      ],
+      "not_enforced_because": {
+        "delegated": "A delegated run is already inside the dispatcher. Nesting is not the boundary this rule protects."
+      }
+    },
+    {
+      "name": "bare-agent-exec",
+      "intent": "The same rule for the other agent CLI. Separate because each CLI has its own subcommand and its own options that take a separate argument.",
+      "match": {
+        "kind": "program_subcommand",
+        "program": "codex",
+        "subcommands": [
+          "exec"
+        ],
+        "unless_flags": [
+          "--help",
+          "-h",
+          "--version"
+        ]
+      },
+      "hook": "deny",
+      "delegated": null,
+      "documented_in": [
+        {
+          "file": "skills/orchestration/SKILL.md",
+          "heading": "## Delegation"
+        }
+      ],
+      "examples": [
+        "codex exec -",
+        "codex exec --sandbox read-only -",
+        "codex exec \"explain the --help output\""
+      ],
+      "not_examples": [
+        "codex --version",
+        "codex exec --help",
+        "codex exec -h"
+      ],
+      "not_enforced_because": {
+        "delegated": "As above."
+      }
+    }
+  ]
+}

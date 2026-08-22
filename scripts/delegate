@@ -52,45 +52,94 @@ VERDICT_MODES = frozenset({"review", "test"})
 # "*": "ask" is the base rather than "allow", so a run without --auto stalls instead
 # of running anything. --auto approves asks; it cannot lift a deny.
 #
-# These mirror hooks/guard.py. If one changes, change the other.
+# The rules are not written here. They are read from config/command-boundaries.json,
+# the same file hooks/guard.py reads, and translated below into the glob patterns
+# OpenCode's permission system matches on. They were two hand-maintained copies until
+# the copies disagreed: a bench subcommand with no --site was denied here for four
+# subcommands and asked for by the hook for seventy-six, so a delegated run had wider
+# access to live sites than Claude did. One source, two translations, and a test that
+# fails by rule name when either translation drops a rule.
 # --------------------------------------------------------------------------
 
-DENIED_BASH = (
-    # Push is never automatic, and there is no human inside this process to ask.
-    "git push*",
-    "git * push*",
-    # The orchestrator creates the commit after review passes. An implementer that
-    # commits mid-run bypasses diff inspection.
-    "git commit*",
-    "git * commit*",
-    # Blanket staging sweeps in unrelated work.
-    "git add .",
-    "git add . *",
-    "git add -A*",
-    "git add --all*",
-    "git add -- .*",
-    "git * add .",
-    "git * add -A*",
-    "git * add --all*",
-    # Execution against a live site database or a running Frappe instance.
-    "bench console*",
-    "bench mariadb*",
-    "bench execute*",
-    "bench --site*",
-    "bench -s *",
-    "bench * console*",
-    "bench * mariadb*",
-    "bench * execute*",
-    "mysql*",
-    "mariadb*",
-)
+BOUNDARIES = Path(__file__).resolve().parent.parent / "config" / "command-boundaries.json"
 
 
-def opencode_permissions():
+def load_boundaries(fail):
+    try:
+        return json.loads(BOUNDARIES.read_text())["rules"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        # Refused, not degraded. The hook can fall back to asking because a human is
+        # there to answer; nothing is watching a delegated run, so a run without its
+        # permission policy is a run with no boundary at all.
+        fail(
+            "cannot read the command boundaries from %s: %s. Refusing to delegate - "
+            "these rules are what holds a delegated run inside the same boundaries the "
+            "hook enforces, and nothing else applies them." % (BOUNDARIES, exc)
+        )
+
+
+def rule_patterns(rule):
+    """One boundary rule -> the OpenCode bash patterns that express it.
+
+    Glob translation lives here because it is this engine's mechanics, not the rule.
+    The one subtlety worth stating: a trailing `*` is safe after an option but not
+    after a path, so `git add .` expands to the exact command and `git add . *`,
+    never to `git add .*`, which would also deny `git add .gitignore` - staging one
+    dotfile by name is the correct thing this rule exists to leave alone.
+    """
+    match = rule["match"]
+    kind = match.get("kind")
+
+    if kind == "program":
+        return ["%s*" % name for name in match["programs"]]
+
+    program = match.get("program")
+
+    if kind == "program_option":
+        return [
+            form % (program, option)
+            for option in match["options"]
+            for form in ("%s %s*", "%s * %s*")
+        ]
+
+    if kind == "program_subcommand":
+        patterns = []
+        for sub in match["subcommands"]:
+            prefixes = ["%s %s" % (program, sub), "%s * %s" % (program, sub)]
+            arguments = match.get("any_argument")
+            if not arguments:
+                patterns += ["%s*" % prefix for prefix in prefixes]
+                continue
+            for argument in arguments:
+                for prefix in prefixes:
+                    if argument.startswith("-"):
+                        patterns.append("%s %s*" % (prefix, argument))
+                    else:
+                        patterns += [
+                            "%s %s" % (prefix, argument),
+                            "%s %s *" % (prefix, argument),
+                            "%s -- %s" % (prefix, argument),
+                            "%s -- %s *" % (prefix, argument),
+                        ]
+        return patterns
+
+    return []   # a kind this consumer does not implement; the suite fails by rule name
+
+
+def denied_bash(rules):
+    """Every pattern denied inside a delegated run, from the shared boundary data."""
+    patterns = []
+    for rule in rules:
+        if rule.get("delegated") == "deny":
+            patterns += rule_patterns(rule)
+    return patterns
+
+
+def opencode_permissions(rules):
     """Permission config for a delegated OpenCode run, as a JSON-ready dict."""
-    rules = {"*": "ask"}
-    rules.update({pattern: "deny" for pattern in DENIED_BASH})
-    block = {"bash": rules}
+    bash = {"*": "ask"}
+    bash.update({pattern: "deny" for pattern in denied_bash(rules)})
+    block = {"bash": bash}
     return {"permission": block, "agent": {"build": {"permission": block}}}
 
 
@@ -258,7 +307,7 @@ reported as such, not as a failure.
 # --------------------------------------------------------------------------
 
 
-def adapt_opencode(*, brief, model_id, effort, mode, cwd):
+def adapt_opencode(*, brief, model_id, effort, mode, cwd, rules=()):
     # --dir, not the process working directory. Setting the child's cwd is not enough:
     # OpenCode resolved its working directory from the inherited PWD instead, so a run
     # launched from one repository with --cwd pointing at another operated on the first
@@ -273,8 +322,23 @@ def adapt_opencode(*, brief, model_id, effort, mode, cwd):
         argv += ["--variant", effort]
     argv.append(brief)
     env = dict(os.environ)
-    env["OPENCODE_CONFIG_CONTENT"] = json.dumps(opencode_permissions())
+    env["OPENCODE_CONFIG_CONTENT"] = json.dumps(opencode_permissions(rules))
     env["PWD"] = cwd
+    # WSL only hands a variable to a Windows process if WSLENV names it, so on a machine
+    # where the opencode on PATH is the Windows build - which is the case wherever this
+    # plugin runs under WSL against a Windows npm install - the permission policy above
+    # was set in an environment the CLI never saw. It was not weakened, it was absent:
+    # the resolved config had zero bash rules, not even the "*": "ask" base, and --auto
+    # then approves everything. A delegated run executed `bench migrate` unrefused.
+    #
+    # /w is the direction that matters here (WSL -> Win32); /u is the opposite one and
+    # does nothing for this. No path translation: the value is JSON, and /p would mangle
+    # it. Appending is harmless on a pure-Linux machine, where WSLENV is simply unused.
+    existing = env.get("WSLENV")
+    env["WSLENV"] = (
+        "%s:OPENCODE_CONFIG_CONTENT/w" % existing if existing
+        else "OPENCODE_CONFIG_CONTENT/w"
+    )
     return argv, env, None
 
 
@@ -582,6 +646,7 @@ def main():
         )
 
     routing = load_routing(fail)
+    boundaries = load_boundaries(fail)
 
     tier = (routing.get("tiers") or {}).get(args.tier)
     if tier is None:
@@ -620,7 +685,8 @@ def main():
     )
 
     argv, env, stdin_text = ADAPTERS[args.agent](
-        brief=full_brief, model_id=model_id, effort=effort, mode=args.mode, cwd=cwd
+        brief=full_brief, model_id=model_id, effort=effort, mode=args.mode, cwd=cwd,
+        rules=boundaries,
     )
 
     if args.dry_run:
@@ -634,7 +700,7 @@ def main():
                 "env_overrides": {
                     k: v
                     for k, v in env.items()
-                    if k in ("OPENCODE_CONFIG_CONTENT", "PWD")
+                    if k in ("OPENCODE_CONFIG_CONTENT", "PWD", "WSLENV")
                 },
             },
             sys.stdout,

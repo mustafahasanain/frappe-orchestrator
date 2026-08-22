@@ -4,11 +4,12 @@
 > mode — and the probe corrected a reason this repository had recorded as settled. See
 > [Finding: what workspace-write actually refuses](#finding-what-workspace-write-actually-refuses).
 >
-> **Two containment gaps found.** One is closed, in its own commit under a Phase 01.5
-> amendment: a bench command with no `--site` still acts on a site. The other is open and
-> is not mine to close — `scripts/delegate`'s deny list has the same hole, so the two
-> layers now disagree. See
-> [Gap not closed](#gap-not-closed-the-dispatchers-deny-list-has-the-same-hole).
+> **Three containment gaps found, all now closed.** A bench command with no `--site`
+> still acts on a site (closed in its own commit, under a Phase 01.5 amendment). The
+> dispatcher's deny list had the same hole, so the two layers disagreed (closed by
+> single-sourcing the rules, under a Phase 03 amendment). And underneath both, the
+> delegated permission policy **was never reaching OpenCode at all** — see
+> [Gap: the two layers disagreed, and neither was in force](#gap-the-two-layers-disagreed-and-neither-was-in-force).
 >
 > **The duplication map** this phase was asked to produce, rather than add to, is at
 > [The duplication map](#the-duplication-map).
@@ -36,10 +37,16 @@
   pointers to the correction, per that report's own convention.
 - `hooks/guard.py`, `docs/reports/PHASE_01_5_REPORT.md` — the fifth rule, committed
   separately before this phase.
+- `config/command-boundaries.json`, `hooks/guard.py`, `scripts/delegate`,
+  `tests/test_parser.py` — the mechanical rules moved into one data file that both
+  consumers read, the drift test that fails by rule name, and the `WSLENV` fix that made
+  the delegated permission policy actually reach the CLI. Authorised as a Phase 03 patch,
+  contract amended, written up in the Phase 03 report.
 - `docs/reports/PHASE_04_REPORT.md` — this report.
 
-No helper script was written. No test was added: this phase ships prose, and nothing in it
-fails silently. `config/`, `scripts/`, `.claude-plugin/`, and the phase documents were not
+No helper script was written, and the Frappe operations skill itself ships prose with
+nothing that fails silently. The tests added under the Phase 03 patch cover the shared
+boundary data, which does fail silently — that is the whole reason it earned one. `config/`, `scripts/`, `.claude-plugin/`, and the phase documents were not
 touched.
 
 ## Spec coverage
@@ -114,9 +121,13 @@ touched.
 
 ## Open questions
 
-1. **`scripts/delegate`'s deny list now disagrees with the hook.** Detailed below. It is
-   the one thing found this phase that is still open, and it is a rules change to a
-   Phase 03 file, so it is not mine to make.
+1. **Closed.** The dispatcher's deny list disagreed with the hook; the rules are now
+   single-sourced and both engines are checked against them. What it uncovered is not
+   closed and is not mine to decide: **a delegated OpenCode run executes in PowerShell**
+   against `//wsl.localhost/...` UNC paths on this machine, where `bench` does not exist
+   and `git status` fails on dubious ownership. Delegated implementation may not work here
+   at all, and a run that cannot read the working tree still reports `status=completed`.
+   That deserves its own look before the next delegated implement task.
 2. **Nothing verifies the plan line, as nothing verifies the other two.** The preamble, the
    impact line, and now the operations plan line are all skill prose. The hook sees Bash
    commands, not missing output. This is the same gap Phase 02 recorded, one line longer.
@@ -225,64 +236,98 @@ CLI resolves a site for, derived from the command definitions rather than filter
 look dangerous. It asks, matching the `--site` form rather than being weaker than it. Full
 write-up and verification are in the Phase 01.5 report.
 
-## Gap not closed: the dispatcher's deny list has the same hole
+## Gap: the two layers disagreed, and neither was in force
 
-`scripts/delegate`'s `DENIED_BASH` is the layer that holds a delegated **OpenCode** run
-inside the same boundaries. Checked against the same command shapes:
+`scripts/delegate`'s `DENIED_BASH` is what holds a delegated **OpenCode** run inside the
+same boundaries the hook enforces. After the hook commit, the two disagreed: `bench
+migrate`, `clear-cache`, `install-app`, `backup`, `reinstall`, `trim-tables` and
+`drop-site` asked when Claude ran them and were permitted when a delegated agent ran them.
+A delegated run had wider access to live sites than the orchestrator.
 
-| Command | `DENIED_BASH` |
-| --- | --- |
-| `bench --site dev.local migrate` | denied by `bench --site*` |
-| `bench console`, `mysql -u root` | denied |
-| `bench migrate` | **no pattern matches** → falls to `"*": "ask"` → `--auto` approves it |
-| `bench clear-cache`, `bench install-app <app>`, `bench backup`, `bench reinstall`, `bench trim-tables`, `bench drop-site <site>` | **same** |
+Reported here as out of scope, then authorised as a Phase 03 patch, because the rule set
+spans two phases' files and neither phase could fix it alone. **Not** by copying the
+subcommand list into the dispatcher: the copy is the defect, and a third copy would agree
+only until the next edit.
 
-So after the hook commit the two layers disagree: the same command asks when Claude runs it
-and executes silently when a delegated OpenCode agent runs it. The `--auto` flag makes this
-concrete — an `ask` is auto-approved, and there is no human in that process to ask.
+`config/command-boundaries.json` now holds the nine mechanical rules once. Both consumers
+read it and each translates it into its own matching form. `tests/test_parser.py` fails by
+rule name when either translation drops a rule, when the two disagree about one of its own
+examples, or when the skill section a rule names does not exist. The full write-up, the
+regression probes, and the live verification are in the Phase 03 report.
 
-I did not fix it. It is a rules change to a Phase 03 file, and the contract's Phase 01.5
-amendment permits touching only the deny *reason* string. The fix is mechanical — the same
-subcommand set, as `"bench <sub>*"` patterns — and it is your call. Until then,
-`## Operations are never delegated` in the new skill is not stylistic advice, which is why
-the skill states the reason rather than the rule alone.
+**And underneath it, the finding that matters more.** The verification asked for a
+previously-permitted command to be refused. Nothing was refused — because the policy was
+never delivered. `opencode debug config` resolved **zero** bash rules from it, not even
+the `"*": "ask"` base, and a live delegated run executed `bench migrate` outright. The
+`opencode` on this machine is the Windows build, and WSL forwards an environment variable
+to a Windows process only if `WSLENV` names it; `OPENCODE_CONFIG_CONTENT` was being set in
+an environment the CLI never saw. With `--auto` approving everything not explicitly
+denied, and nothing denied, a delegated OpenCode run had unrestricted shell access.
+
+So the divergence Phase 04 found was real but was not the live risk it appeared to be:
+neither side of it was in force. Both are now. The fix is one variable
+(`WSLENV=…:OPENCODE_CONFIG_CONTENT/w`), and the live run afterwards refuses `bench migrate`
+by name with a hostile project config in place.
 
 ## The duplication map
 
-Every rule that now exists in more than one place. **Nothing keeps any row in sync.** No
-test asserts agreement between a skill and the hook, or between the hook and the
-dispatcher; each pairing is prose in the contract saying they must match. This is a map,
-not a proposal — no row was refactored.
+Every rule that exists in more than one place, **after** the mechanical rules were
+single-sourced. The map was produced first, then acted on for the rows that were pure
+copies; what follows shows which rows collapsed and which are genuinely duplicated.
+
+### Single-sourced (was: six rows of hand-maintained copies)
+
+`config/command-boundaries.json` is now the only place these rules are written.
+`hooks/guard.py` translates them into token matching, `scripts/delegate` into glob
+patterns, and neither owns a rule.
+
+| # | Rule | Source | Consumers | Kept in sync by |
+| --- | --- | --- | --- | --- |
+| 1 | Push is never automatic | `command-boundaries.json` rule `push` | hook (ask), delegated (deny) | `check_command_boundaries()`, by rule name |
+| 2 | No blanket staging | rule `blanket-staging` | hook (deny), delegated (deny) | same |
+| 3 | Live-site execution | rules `site-named`, `site-unnamed`, `database-client`, `frappe-connection` | hook (ask), delegated (deny except the snippet rule, which states why) | same, plus all 76 bench subcommands checked through both engines |
+| 4 | Agent CLIs run through the dispatcher | rules `bare-agent-run`, `bare-agent-exec` | hook (deny) | same |
+| 7 | The orchestrator owns the commit | rule `commit-inside-delegated-run` | delegated (deny); the hook deliberately does not, and says why | same |
+
+Three things are asserted that prose could not: that both translations catch each rule's
+examples and leave its counter-examples alone, that the two engines agree wherever both
+apply, and that a decision dropped to `null` carries a stated reason.
+
+The rules are still *stated* in skill prose — that is the point of the hook existing at
+all, since skill activation is stochastic — but the prose is no longer a copy that can
+drift into being wrong about what is enforced: each rule names the skill section that
+documents it, and the suite fails if that section disappears.
+
+### Still genuinely duplicated
 
 | # | Rule | Copies | Kept in sync by |
 | --- | --- | --- | --- |
-| 1 | Push is never automatic | `skills/orchestration/SKILL.md:478`, `:499` · `hooks/guard.py:94` (ask) · `scripts/delegate:60-61` (deny) · `docs/BUILD_CONTRACT.md:233` | nothing |
-| 2 | No blanket staging | `orchestration:473` · `guard.py:32,99,167` (deny) · `delegate:67-74` (deny, 9 patterns) · `BUILD_CONTRACT.md:234` | nothing |
-| 3 | Live-site execution needs confirmation | `orchestration:505-524` (`### Live site access`) · `guard.py:45-65,125,184` · `delegate:75-85` | nothing. **Three matching engines**: a prose list, a token/subcommand parser, and glob patterns |
-| 4 | Agent CLIs run through the dispatcher | `orchestration:220-241` · `guard.py:71-74,104-112` (deny) | nothing |
-| 5 | The dispatcher's own invocation — modes, `--cwd`, `--model` | `orchestration:231-234` · `guard.py:106-107` (inside the deny reason) · `delegate:27,352-356,549,560` | the contract permits updating the hook's reason string; nothing checks it |
-| 6 | Codex never implements | `orchestration:61,238` · `delegate:26,574` | nothing |
-| 7 | The orchestrator owns the commit | `orchestration:463-475` · `delegate:62-64` (`git commit*` denied) | nothing |
-| 8 | BLOCKED is not a failed attempt | `orchestration:363-381` · `delegate:146-148` (contract text) · `frappe-operations:211-221` (defers, does not restate) | nothing |
-| 9 | Context and impact rules | `orchestration:181-205` (4 rules) · `skills/project-context/SKILL.md` (full) | nothing; the duplication is deliberate, for when the second skill does not load |
+| 5 | The dispatcher's own invocation — modes, `--cwd`, `--model` | `orchestration:231-234` · `guard.py` (inside the bare-agent deny reason) · `delegate` (`MODES`, `--cwd` validation) | the contract permits updating the hook's reason string; nothing checks it |
+| 6 | Codex never implements | `orchestration:61,238` · `delegate:26` and its refusal message | nothing |
+| 8 | BLOCKED is not a failed attempt | `orchestration:363-381` · `delegate` review contract text · `frappe-operations:211-221` (defers, does not restate) | nothing |
+| 9 | Context and impact rules | `orchestration:181-205` (4 rules) · `skills/project-context/SKILL.md` (full) | nothing — deliberate, so the rules survive the second skill not loading |
 | 10 | Deployment is refused, never performed | `orchestration:480-491,503` · `frappe-operations:11,190-192` · `templates/OPERATIONS.md:39` · `BUILD_CONTRACT.md:96,219-227` | nothing |
-| 11 | A site is never guessed; dev site must be declared | `frappe-operations:123-148` · `orchestration:339-349` · `templates/OPERATIONS.md:11-14` · `guard.py:34-44,114-122` | nothing. **New this phase** — three of those four are new or newly edited |
-| 12 | The bench subcommand set that resolves a site | `guard.py:45-64` (75 entries) · frappe's own CLI, from which it was derived | nothing. Drifts when frappe adds a command; the file records how to re-derive |
+| 11 | A site is never guessed; dev site must be declared | `frappe-operations:123-148` · `orchestration:339-349` · `templates/OPERATIONS.md:11-14` · the `site-unnamed` rule's intent | the enforcement half is single-sourced; the guidance half is not |
+| 12 | The bench subcommand set that resolves a site | `command-boundaries.json` · frappe's own CLI, from which it was derived | nothing — and unfixable here: the other copy is another project's source. The data records how to re-derive it |
 | 13 | Which operations a diff requires | `frappe-operations:58-110` · each project's `docs/ai-context/OPERATIONS.md` | by design: the project overrides, and the skill says so |
 
-Three observations, offered because the map is what was asked for:
+### What is left, and what it would take
 
-- **Row 3 is the expensive one.** The same rule in three engines, and the Phase 03 report
-  already flagged that chained-command matching differs between them. Row 11 has just
-  joined it at four copies.
-- **Rows 1, 2, and 3 are duplicated on purpose and correctly** — the hook exists because
-  skill activation is stochastic. Duplication is the mechanism, not the defect. What is
-  missing is anything that fails when the copies disagree, which is exactly how row 3 came
-  to have the hole this phase found in one copy and not the others.
-- **The one place a duplicate is checked** is `tests/test_parser.py`'s mode matrix, which
-  asserts that four tables inside `scripts/delegate` agree. That is the shape a check would
-  take for the rest: a test that reads both copies and compares them. Row 12 could not be
-  checked that way — its other copy is frappe's source, not this repository's.
+The remaining rows are of three kinds, and only one is a candidate for the same treatment:
+
+- **Prose stating what a mechanism enforces** (5, 6, 8). These could be checked the way
+  rule 3 now checks its skill sections — assert the sentence exists, not generate it. Row
+  5 is the one with a live drift risk, because the hook's deny reason enumerates the
+  dispatcher's modes and required arguments, and a mode added to `MODES` will not update
+  that string.
+- **Deliberate redundancy** (9, 10, 11's guidance half). These exist because a skill may
+  not load. Collapsing them would remove the property they were built for.
+- **A copy of someone else's source** (12). Nothing in this repository can hold that in
+  sync; the best available is the recorded derivation.
+
+My recommendation, for what it is worth: row 5 is worth a check, the rest are not worth
+touching. Rows 9 and 10 are load-bearing duplication and rows 12 and 13 are not really
+duplication at all.
 
 ## Codex version note
 
@@ -315,6 +360,7 @@ expired between the two, which cost this phase its first probe attempt.
 | `git diff --stat` on the template | 8 insertions, 2 deletions — one hint comment |
 | `ls -A .claude-plugin` | `plugin.json` only — layout rule holds |
 | `find . -type f` | `skills/frappe-operations/` is at the repository root alongside the others |
+| Boundary single-sourcing, drift probes, live deny run | See the Phase 03 report — 51 hook payloads unchanged, five regression probes, `bench migrate` refused live with a hostile project config in place |
 | `git status --porcelain` before starting | Empty — clean working tree; nothing pre-existing was staged or reverted |
 | Working tree after the probes | No probe artifact, delegation workspace, or scratch file reached this repository |
 

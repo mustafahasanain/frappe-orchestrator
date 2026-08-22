@@ -1408,3 +1408,152 @@ survived review, a live run, and three readings of this report, because the outc
 agreeing with them. What separated them was a probe that recorded an errno instead of a
 verdict — the same shape of check as reading stdout and stderr separately rather than
 trusting the terminal.
+
+## Patch: one rule set, two engines — and the policy that was never delivered
+
+Phase 04 reported that `DENIED_BASH` and `hooks/guard.py` had drifted apart: after the
+hook learned that a bench subcommand with no `--site` still acts on a site, the hook asked
+about seventy-six of them and this dispatcher denied four. A delegated OpenCode run
+therefore had **wider** access to live sites than Claude had. Authorised as a Phase 03
+patch, with the contract amended, because the rule set spans two phases' files and neither
+phase could fix it alone.
+
+**The fix is not a third copy.** Copying the subcommand list into `DENIED_BASH` would have
+restored agreement until the next edit to either side — the copy is the defect.
+
+### `config/command-boundaries.json`
+
+Nine rules, each carrying what it is about and why, what the hook decides, what a
+delegated run decides, which skill section documents it, and the commands it must and
+must not catch. No glob patterns, no token sets: the data describes the rule, and each
+consumer translates it.
+
+- `hooks/guard.py` reads it into token matching — program, subcommand, options, an
+  identifier anywhere in the text. It no longer owns a single rule; it owns the matching,
+  the reason text a blocked agent reads, and the option sets that say which token is the
+  subcommand.
+- `scripts/delegate` reads the same file and generates the OpenCode bash patterns.
+  Translation subtleties stay here, where they belong: `git add .` expands to the exact
+  command and `git add . *`, never `git add .*`, which would also deny `git add .gitignore`
+  — staging one dotfile by name is precisely what that rule should leave alone. The old
+  hand-written set had `git add -- .*` and denied it.
+
+172 patterns are generated where 22 were written by hand, and the four-versus-seventy-six
+divergence is gone by construction.
+
+**Failure modes differ on purpose.** If the data cannot be read, the dispatcher **refuses
+to run** (exit 2): nothing is watching a delegated run, so a run without its policy has no
+boundary at all. The hook instead degrades to asking on the programs the rules are about,
+because a human is there to answer, and because a hook that silently enforces nothing is
+the one failure this design cannot have.
+
+### The drift test
+
+`check_command_boundaries()` in `tests/test_parser.py` fails **by rule name** when a rule
+is not enforced by a consumer that declares a decision for it, when either engine's
+translation drops it, when the two engines disagree about one of its own examples, when a
+hook-enforced rule has no reason text, or when the skill section it names does not exist.
+Every one of the seventy-six bench subcommands is checked through both engines, not
+sampled.
+
+Five deliberate regressions were introduced to confirm it fails loudly, and the fourth is
+the one worth recording: setting `site-unnamed`'s `delegated` decision to `null` — the
+exact state that caused this patch — **passed silently**. A null read as "not applicable",
+and nothing asked why. So a null decision now requires a stated reason in
+`not_enforced_because`, and the four legitimate ones carry theirs. That test only became
+able to catch the bug it was written for after being tested against it.
+
+The suite also rejected a bad example in the data on its first run: a `bench execute`
+command carrying a `frappe.connect()` snippet is caught by the bench rules first, by
+precedence. The rule was right and the example was wrong.
+
+### The finding underneath: the policy was never reaching OpenCode
+
+The live verification asked for a previously-permitted command to be refused. It was not
+refused — and neither was anything else, because **the permission policy was not in force
+at all**.
+
+| Check | Result |
+| --- | --- |
+| `opencode debug config` with the policy in `OPENCODE_CONFIG_CONTENT` | **0** bash rules resolved — not the denies, not even the `"*": "ask"` base |
+| A marker key (`username`) sent the same way | Never landed; the CLI's config was untouched |
+| The same config via `OPENCODE_CONFIG` (a file path) | Landed correctly — so the CLI works, the variable was not arriving |
+| Live delegated run, before the fix | `bench migrate` and `bench list-apps` **executed**; 0 permission refusals in the transcript |
+
+The cause is the WSL boundary. The `opencode` on this machine is the Windows build, and
+WSL hands an environment variable to a Windows process only if `WSLENV` names it.
+`OPENCODE_CONFIG_CONTENT` was set in an environment the CLI never saw. With `--auto`
+approving everything not explicitly denied, and nothing denied, a delegated run had
+unrestricted shell access.
+
+**This is worse than the divergence that prompted the patch**, and it invalidates the
+runtime verification recorded above: that verification passed, so the delivery worked
+then. What changed between is not established — the CLI is now 1.18.18 and the binary
+still contains the variable's name, so the likeliest explanation is a change of which
+`opencode` is on PATH rather than a change in the CLI.
+
+**The fix is one variable**, in `adapt_opencode`:
+
+```python
+env["WSLENV"] = "%s:OPENCODE_CONFIG_CONTENT/w" % existing   # /w is WSL -> Win32
+```
+
+`/w` is the direction that matters; `/u` is the opposite one and does nothing here, which
+cost a probe to discover. No path translation — the value is JSON, and `/p` would mangle
+it. On a pure-Linux machine `WSLENV` is simply unused, so the line is inert rather than
+conditional.
+
+`--dry-run` now reports `WSLENV` alongside the policy, because a delivery variable that
+does not appear in the dry run is how a policy goes missing without anyone noticing.
+
+**Switching to `OPENCODE_CONFIG` was tested and rejected.** It is delivered correctly, but
+it sits *below* a project's own `opencode.json`: with a hostile project config in place,
+the resolved rules were `"*": "allow"` and every denied pattern re-allowed. That is
+Finding B above, reproduced exactly. The precedence argument that chose
+`OPENCODE_CONFIG_CONTENT` was right; only its delivery was broken.
+
+### Verified against the real CLI
+
+Same isolated repository, same brief, hostile `opencode.json` deliberately left in place —
+`"*": "allow"` plus `bench migrate*` and `git push*` allowed, at both levels.
+
+| | Before the fix | After |
+| --- | --- | --- |
+| Permission refusals in the transcript | 0 | `bench migrate` refused, with `{"pattern":"bench migrate*","action":"deny"}` in the rules the agent was shown |
+| Bench commands that reached the shell | 2 | **0** |
+| Positive control (`git status --porcelain`) | ran | ran |
+| Rules the agent was shown | — | 347, of which exactly one is an `allow`: `--auto`'s own `{"permission":"*","action":"allow","pattern":"*"}` |
+| Hostile config's six `allow` rules | — | none survived |
+
+The deny beat `--auto`'s blanket allow in the same resolved rule set, and the project's own
+configuration contributed nothing.
+
+### Also observed: a delegated OpenCode run executes in PowerShell
+
+The transcripts show commands running under PowerShell against `//wsl.localhost/Ubuntu/...`
+UNC paths, not in the Linux shell. Two consequences, neither fixed here:
+
+- **Linux-side tooling is absent.** `bench` is "not recognized as the name of a cmdlet",
+  so a delegated run cannot execute the project's own commands on this machine even when
+  permitted to.
+- **Git refuses the work tree.** `git status --porcelain` fails with `detected dubious
+  ownership` over the UNC path, so a delegated implementer cannot read the repository state
+  it is supposed to be changing.
+
+That is an environment fact rather than a plugin defect, but it bears directly on whether
+delegated implementation works here at all, and it is not visible in a result that reports
+`status=completed`.
+
+### Patch verification
+
+| Check | Result |
+| --- | --- |
+| `claude plugin validate . --strict` | `✔ Validation passed` (exit 0) |
+| `python3 tests/test_parser.py` | `38 cases, 3 timed, 8 strip, 9 boundary rules, mode matrix, adapters and --cwd checked` … `ok`, exit 0 |
+| Hook payload matrix, 51 payloads | 0 failures — every decision identical to before the rules moved out of the file |
+| `frappe.db` word boundary | `frappe.db.sql(1)` asks; `echo frappe.database` passes through, as with the previous regex |
+| Degraded hook (data unreadable) | `bench migrate`, `git push`, `mysql` → ask with an explicit reason; `ls -la`, `npm test` → pass through |
+| Dispatcher with the data missing | Exit 2, refuses to delegate |
+| Generated policy | 173 bash rules at both levels, base `"*": "ask"`, no `allow` |
+| Five regression probes | Four fail by name; the fifth exposed the gap in the test itself, now closed |
+| Live delegated run | See the table above |

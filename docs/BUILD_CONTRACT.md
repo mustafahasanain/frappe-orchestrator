@@ -158,11 +158,32 @@ Allowed:
 - agent adapters for OpenCode and Codex
 - structured brief and result contracts
 - integration edits to earlier skills
+- the shared command-boundary data, and the edits to both consumers that read it
 
 It must reuse `config/model-routing.json` from Phase 01. It must not create a second
 routing mechanism.
 
 Forbidden: background services, queues, daemons, persistent task databases.
+
+**Amendment after Phase 04.** The last item was added because one rule set spans two
+phases' files. The boundaries that hold a delegated run inside the same limits as
+Claude's own commands were written twice — as token matching in `hooks/guard.py`, which
+Phase 01.5 owns, and as glob patterns in the dispatcher's permission policy, which this
+phase owns — and the two copies drifted. After Phase 01.5 closed the unnamed-site hole in
+the hook, a delegated agent had *wider* access to live sites than Claude did, which is a
+safety gap and not a tidiness one.
+
+Neither phase's scope could fix that alone: Phase 01.5 may not touch `scripts/delegate`,
+and Phase 04 may touch neither. Copying the rule a third time would have restored
+agreement for exactly as long as nobody edited one copy. This phase therefore also owns
+`config/command-boundaries.json` — one source of rules, read by both consumers, each
+translating it into its own matching form — and the edits to `hooks/guard.py` needed to
+make it a reader rather than an owner. The rules themselves are unchanged by that move,
+and a rule that either consumer stops enforcing fails `tests/test_parser.py` by name.
+
+This is not licence to widen the hook's *rules* from here. Adding or changing one still
+belongs to Phase 01.5; what this phase owns is where they are written down and how they
+reach the two engines.
 
 ### Phase 04 — Frappe Operations
 

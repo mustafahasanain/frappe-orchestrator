@@ -24,8 +24,10 @@ the body there. A tidier stub is exactly how that defect survived.
 No framework and nothing to install: standard library only.
 """
 
+import fnmatch
 import importlib.machinery
 import importlib.util
+import json
 import os
 import tempfile
 import time
@@ -45,11 +47,22 @@ def load_dispatcher():
     return module
 
 
+def load_module(path, name):
+    """Import a file that has no .py extension, without running it."""
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
 def fixture(name):
     return (FIXTURES / name).read_text()
 
 
 d = load_dispatcher()
+g = load_module(ROOT / "hooks" / "guard.py", "guard")
+BOUNDARIES = json.loads((ROOT / "config" / "command-boundaries.json").read_text())
 extract = d.extract_report
 
 BANNER = "OpenAI Codex v0.149.0\n--------\nmodel: gpt-5.6-sol\n--------\n"
@@ -357,6 +370,140 @@ KNOWN_GAPS = [
 ]
 
 
+def check_command_boundaries():
+    """The one rule set, and both engines that translate it.
+
+    `config/command-boundaries.json` exists because these rules were maintained twice, by
+    hand, in two matching engines - and the copies drifted apart without anything
+    noticing. A bench subcommand with no --site ended up asked for by the hook and
+    permitted inside a delegated run, which gave a delegated agent wider access to live
+    sites than Claude had. That is the failure this function exists to make loud: every
+    rule must be enforced by every consumer that declares a decision for it, and a rule
+    added to the data and dropped by one translation fails here, by name.
+
+    It also checks that each rule names a real section of a real skill. Prose is written
+    by hand and stays that way; what is enforced is that it exists.
+    """
+    problems = []
+    rules = BOUNDARIES["rules"]
+
+    if not rules:
+        return ["the boundary data declares no rules at all"]
+
+    for rule in rules:
+        name = rule.get("name", "<unnamed>")
+        hook, delegated = rule.get("hook"), rule.get("delegated")
+        examples = rule.get("examples") or []
+        counters = rule.get("not_examples") or []
+
+        if not examples:
+            problems.append("%s: no examples, so nothing checks either translation" % name)
+        if hook is None and delegated is None:
+            problems.append("%s: no consumer enforces this rule" % name)
+
+        # A null decision has to be justified in the data. Without this, dropping a rule
+        # from one consumer is a one-word edit that nothing objects to - which is how the
+        # divergence this file exists to prevent came about in the first place.
+        stated = rule.get("not_enforced_because") or {}
+        for consumer, decision, where in (
+            ("hook", hook, "by the hook"),
+            ("delegated", delegated, "inside a delegated run"),
+        ):
+            if decision is None and not stated.get(consumer):
+                problems.append(
+                    "%s: not enforced %s and no reason given - say why in "
+                    "not_enforced_because, or restore the decision" % (name, where)
+                )
+
+        # --- the hook's translation ---------------------------------------
+        if hook:
+            if not g.REASONS.get(name):
+                problems.append(
+                    "%s: enforced by the hook with no reason text, so a blocked agent is "
+                    "told only the rule's intent" % name
+                )
+            for command in examples:
+                matched = g.match_rule(command)
+                if matched is None or matched.get("name") != name:
+                    problems.append(
+                        "%s: hook does not catch %r (matched %r)"
+                        % (name, command, matched.get("name") if matched else None)
+                    )
+                elif g.check(command)[0] != hook:
+                    problems.append(
+                        "%s: hook decided %r on %r, data says %r"
+                        % (name, g.check(command)[0], command, hook)
+                    )
+            for command in counters:
+                matched = g.match_rule(command)
+                if matched is not None and matched.get("name") == name:
+                    problems.append("%s: hook wrongly catches %r" % (name, command))
+
+        # --- the dispatcher's translation ---------------------------------
+        if delegated == "deny":
+            patterns = d.rule_patterns(rule)
+            if not patterns:
+                problems.append(
+                    "%s: denied in a delegated run but the dispatcher produced no "
+                    "pattern for it - match kind %r is not implemented there"
+                    % (name, (rule.get("match") or {}).get("kind"))
+                )
+            for command in examples:
+                if not any(fnmatch.fnmatch(command, p) for p in patterns):
+                    problems.append("%s: delegated policy does not deny %r" % (name, command))
+            for command in counters:
+                hit = [p for p in patterns if fnmatch.fnmatch(command, p)]
+                if hit:
+                    problems.append(
+                        "%s: delegated policy wrongly denies %r via %r" % (name, command, hit[0])
+                    )
+
+        # --- the prose ----------------------------------------------------
+        for where in rule.get("documented_in") or []:
+            path = ROOT / where["file"]
+            if not path.exists():
+                problems.append("%s: documented_in names a missing file %s" % (name, where["file"]))
+            elif where["heading"] not in path.read_text():
+                problems.append(
+                    "%s: %s has no section %r - the rule is enforced but undocumented"
+                    % (name, where["file"], where["heading"])
+                )
+
+    # --- the set both engines must cover in full --------------------------
+    site = next((r for r in rules if r["name"] == "site-unnamed"), None)
+    if site is None:
+        problems.append("the site-unnamed rule is gone; bench subcommands resolve a site silently")
+    else:
+        subs = site["match"]["subcommands"]
+        patterns = d.rule_patterns(site)
+        missed_hook = [s for s in subs
+                       if (g.match_rule("bench %s" % s) or {}).get("name") != "site-unnamed"]
+        missed_deleg = [s for s in subs
+                        if not any(fnmatch.fnmatch("bench %s" % s, p) for p in patterns)]
+        if missed_hook:
+            problems.append("hook misses %d of %d bench subcommands, e.g. %s"
+                            % (len(missed_hook), len(subs), ", ".join(missed_hook[:5])))
+        if missed_deleg:
+            problems.append("delegated policy misses %d of %d bench subcommands, e.g. %s"
+                            % (len(missed_deleg), len(subs), ", ".join(missed_deleg[:5])))
+
+    # --- the two engines agree where both apply ---------------------------
+    for rule in rules:
+        if rule.get("hook") and rule.get("delegated") == "deny":
+            patterns = d.rule_patterns(rule)
+            for command in rule.get("examples") or []:
+                seen_by_hook = (g.match_rule(command) or {}).get("name") == rule["name"]
+                denied = any(fnmatch.fnmatch(command, p) for p in patterns)
+                if seen_by_hook != denied:
+                    problems.append(
+                        "%s: the engines disagree on %r - hook %s, delegated %s"
+                        % (rule["name"], command,
+                           "catches" if seen_by_hook else "misses",
+                           "denies" if denied else "permits")
+                    )
+    return problems
+
+
 def main():
     failures = []
 
@@ -395,14 +542,16 @@ def main():
             if report is None or key not in report or report[key] != before[key]:
                 failures.append("%s: %r did not survive intact" % (name, key))
 
+    failures.extend("boundaries: " + line for line in check_command_boundaries())
     failures.extend("mode matrix: " + line for line in check_matrix())
     failures.extend("working directory: " + line for line in check_working_directory())
     with tempfile.TemporaryDirectory() as tmp:
         failures.extend("--cwd: " + line for line in check_cwd_validation(Path(tmp)))
 
     print(
-        "%d cases, %d timed, %d strip, mode matrix, adapters and --cwd checked"
-        % (len(CASES), len(TIMED), len(STRIP))
+        "%d cases, %d timed, %d strip, %d boundary rules, mode matrix, adapters "
+        "and --cwd checked"
+        % (len(CASES), len(TIMED), len(STRIP), len(BOUNDARIES["rules"]))
     )
 
     regressed = []

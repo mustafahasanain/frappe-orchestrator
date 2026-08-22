@@ -4,6 +4,12 @@ live-site execution.
 
 Reads a PreToolUse payload on stdin. Prints a JSON permission decision when a rule
 matches, and prints nothing otherwise. Anything it does not recognise is allowed.
+
+The rules themselves are not here. They live in config/command-boundaries.json, which
+scripts/delegate reads as well - the same boundaries have to hold whether Claude runs a
+command through the Bash tool, where this hook sees it, or a delegated agent runs it in
+its own process, where this hook sees nothing. Two hand-maintained copies of one rule set
+is how those two layers came to disagree. This file owns the matching, not the rules.
 """
 
 import json
@@ -11,95 +17,78 @@ import os
 import re
 import shlex
 import sys
+from pathlib import Path
+
+BOUNDARIES = Path(__file__).resolve().parent.parent / "config" / "command-boundaries.json"
 
 SEPARATORS = re.compile(r"&&|\|\||[;|&\n]")
 
 # Options taking a separate argument, so the token after them is not the subcommand.
-GIT_OPTS_WITH_ARG = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
-BENCH_OPTS_WITH_ARG = {"--site", "-s"}
-OPENCODE_OPTS_WITH_ARG = {
-    "-m", "--model", "--agent", "--variant", "--prompt", "-s", "--session",
-    "--log-level", "--port", "--hostname", "--mdns-domain", "--format", "--dir",
-    "--command", "-f", "--file", "--title", "--attach", "-u", "--username",
-    "-p", "--password", "--replay-limit",
-}
-CODEX_OPTS_WITH_ARG = {
-    "-m", "--model", "-C", "--cd", "-s", "--sandbox", "-p", "--profile",
-    "-c", "--config", "-a", "--ask-for-approval", "--color", "--add-dir",
-    "-o", "--output-last-message", "--output-schema", "-i", "--image",
-}
-
-BLANKET_ADD = {".", "-A", "--all"}
-
-# Bench subcommands that act on a site. A missing --site does not make one of these
-# site-free: frappe's CLI resolves a site from configuration instead - default_site in
-# common_site_config.json, then currentsite.txt (frappe/utils/bench_helper.py). So the
-# site acted on is whichever the bench was last pointed at, chosen by configuration and
-# named nowhere on the command line, which is the case this rule exists for.
-#
-# Derived rather than judged: every @click.command in frappe/commands/*.py whose body
-# calls get_site(context) or reads context.sites. "Looks dangerous" is not the test -
-# `bench list-apps` and `bench migrate` pick their site the same way, and the failure
-# being prevented is acting on a site nobody chose. Re-derive it the same way against a
-# newer frappe rather than appending names by hand.
-SITE_SUBCOMMANDS = {
-    "add-database-index", "add-system-manager", "add-to-email-queue", "add-to-hosts",
-    "add-user", "backup", "browse", "build-message-files", "build-search-index",
-    "bulk-rename", "clear-cache", "clear-log-table", "clear-website-cache",
-    "compile-po-to-mo", "console", "create-po-file", "data-import", "db-console",
-    "describe-database-table", "destroy-all-sessions", "disable-scheduler",
-    "disable-user", "doctor", "enable-scheduler", "execute", "export-csv", "export-doc",
-    "export-fixtures", "export-json", "generate-pot-file", "get-untranslated",
-    "import-doc", "import-translations", "install-app", "jupyter", "list-apps",
-    "mariadb", "migrate", "migrate-csv-to-po", "migrate-translations", "ngrok",
-    "partial-restore", "postgres", "publish-realtime", "ready-for-migration",
-    "rebuild-global-search", "reinstall", "reload-doc", "reload-doctype",
-    "remove-from-installed-apps", "request", "reset-perms", "restore", "run",
-    "run-parallel-tests", "run-patch", "run-tests", "run-ui-tests", "scheduler",
-    "serve", "set-admin-password", "set-config", "set-last-active-for-user",
-    "set-maintenance-mode", "set-password", "show-config", "show-pending-jobs",
-    "start-recording", "stop-recording", "transform-database", "trigger-scheduler-event",
-    "trim-database", "trim-tables", "uninstall-app", "update-po-files",
-    "update-translations",
-}
-DATABASE_CLIENTS = {"mysql", "mariadb"}
-FRAPPE_CONNECTION = re.compile(r"frappe\.(init|connect|db|get_doc|get_all|get_list)\b")
-
-# Program -> (subcommand that starts an agent run, options taking a separate argument).
-# Matched on the subcommand, not the program, so `opencode models`, `opencode --help`,
-# and `codex --version` are untouched.
-AGENT_CLIS = {
-    "opencode": ("run", OPENCODE_OPTS_WITH_ARG),
-    "codex": ("exec", CODEX_OPTS_WITH_ARG),
+# Matching mechanics, not rules: which token is the subcommand is a fact about each CLI's
+# argument parser, and the dispatcher's glob patterns have no equivalent question to ask.
+OPTS_WITH_ARG = {
+    "git": {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"},
+    "bench": {"--site", "-s"},
+    "opencode": {
+        "-m", "--model", "--agent", "--variant", "--prompt", "-s", "--session",
+        "--log-level", "--port", "--hostname", "--mdns-domain", "--format", "--dir",
+        "--command", "-f", "--file", "--title", "--attach", "-u", "--username",
+        "-p", "--password", "--replay-limit",
+    },
+    "codex": {
+        "-m", "--model", "-C", "--cd", "-s", "--sandbox", "-p", "--profile",
+        "-c", "--config", "-a", "--ask-for-approval", "--color", "--add-dir",
+        "-o", "--output-last-message", "--output-schema", "-i", "--image",
+    },
 }
 
-# Flags that make an agent CLI print text and exit instead of starting a run, so there is
-# nothing to route through the dispatcher. `codex exec --help` was denied before this,
-# which is a deny that fires on nothing dangerous - and a rule that cries wolf is a rule
-# people learn to work around.
-#
-# Matched as whole tokens, never as a substring of the segment: the brief is an argument,
-# so `codex exec "explain the --help output"` mentions the flag without being one, and a
-# substring test would exempt a real run for quoting a word.
-#
-# Scoped to this rule alone on purpose. The live-site rules must not take the same
-# exemption, because there `--help` can be inert rather than suppressing: an extra
-# argument on `python -c "frappe.connect()"` is ignored by the interpreter and the snippet
-# still runs.
-INFO_FLAGS = {"--help", "-h", "--version"}
+# What the agent is told when a rule fires, keyed by rule name. Instructions, not
+# descriptions: each names the corrective action, in the hook's own voice. The data file
+# carries each rule's intent, which is what a reader needs; this is what the blocked agent
+# needs, which is a different text for a different audience. A rule with no entry here
+# falls back to its intent rather than failing at runtime - and the test suite fails by
+# name, so the gap is loud in the one place that can afford to be.
+REASONS = {
+    "push": (
+        "Pushing is never automatic. Confirm the target branch and remote with the user "
+        "first, state what will be pushed, and continue only once they agree."
+    ),
+    "blanket-staging": (
+        "Do not stage with `git add .` or `git add -A` - it sweeps in unrelated work. Run "
+        "`git status --porcelain` to see what changed, then stage only the files this task "
+        "created or changed, by path."
+    ),
+    "site-named": (
+        "This runs against a live site database or a running Frappe instance. Confirm with "
+        "the user which single site to target before continuing, and do not repeat it across "
+        "other sites. If you only need a DocType definition or other committed configuration, "
+        "read that file in the working tree instead of querying a site."
+    ),
+    "site-unnamed": (
+        "This bench subcommand acts on a site, and no site is named on the command line. "
+        "That does not make it site-free: bench resolves one from configuration instead - "
+        "`default_site` in common_site_config.json, then currentsite.txt - so it will act on "
+        "whichever site the bench was last pointed at, which nobody chose for this task. "
+        "Name the site explicitly: `bench --site <site> <subcommand>`, using a site that the "
+        "project's docs/ai-context/OPERATIONS.md or the user identifies as a development "
+        "site."
+    ),
+    "database-client": (
+        "This runs against a live database directly. Confirm with the user which single "
+        "site or database to target before continuing. If you only need committed "
+        "configuration, read that file in the working tree instead."
+    ),
+    "frappe-connection": (
+        "This opens a connection to a live site. Confirm with the user which single site to "
+        "target before continuing, and do not repeat it across other sites. If you only need "
+        "a DocType definition or other committed configuration, read that file in the "
+        "working tree instead of querying a site."
+    ),
+    "bare-agent-run": None,   # filled in below - both agent rules share one text
+    "bare-agent-exec": None,
+}
 
 DELEGATE = os.path.join(os.environ.get("CLAUDE_PLUGIN_ROOT", ""), "scripts", "delegate")
-
-PUSH_REASON = (
-    "Pushing is never automatic. Confirm the target branch and remote with the user "
-    "first, state what will be pushed, and continue only once they agree."
-)
-
-ADD_REASON = (
-    "Do not stage with `git add .` or `git add -A` - it sweeps in unrelated work. Run "
-    "`git status --porcelain` to see what changed, then stage only the files this task "
-    "created or changed, by path."
-)
 
 AGENT_REASON = (
     "Coding agents run through the dispatcher, not directly. Use `" + DELEGATE + " "
@@ -110,23 +99,46 @@ AGENT_REASON = (
     "policy that holds a delegated run inside the same boundaries enforced here, and "
     "the structured result contract. A bare invocation skips all three."
 )
+REASONS["bare-agent-run"] = AGENT_REASON
+REASONS["bare-agent-exec"] = AGENT_REASON
 
-UNNAMED_SITE_REASON = (
-    "This bench subcommand acts on a site, and no site is named on the command line. "
-    "That does not make it site-free: bench resolves one from configuration instead - "
-    "`default_site` in common_site_config.json, then currentsite.txt - so it will act on "
-    "whichever site the bench was last pointed at, which nobody chose for this task. "
-    "Name the site explicitly: `bench --site <site> <subcommand>`, using a site that the "
-    "project's docs/ai-context/OPERATIONS.md or the user identifies as a development "
-    "site."
-)
+# Last resort, and deliberately not a second copy of the rules: the programs any rule has
+# ever been about. If the boundary data cannot be read there are no rules to apply, and
+# silently enforcing nothing is the one failure mode this hook must not have. Asking on
+# these programs turns a total, invisible lapse into a visible degraded one.
+GUARDED_PROGRAMS = frozenset({"git", "bench", "mysql", "mariadb", "opencode", "codex"})
 
-SITE_REASON = (
-    "This runs against a live site database or a running Frappe instance. Confirm with "
-    "the user which single site to target before continuing, and do not repeat it across "
-    "other sites. If you only need a DocType definition or other committed configuration, "
-    "read that file in the working tree instead of querying a site."
-)
+UNREADABLE_REASON = (
+    "The command boundaries could not be read from %s, so none of them are being "
+    "enforced right now, and this command is one they cover. Check that file before "
+    "continuing - a hook that cannot read its rules is not protecting anything."
+) % BOUNDARIES
+
+
+def load_rules():
+    """Rules this hook enforces, in precedence order. None if the data is unusable."""
+    try:
+        rules = json.loads(BOUNDARIES.read_text())["rules"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    usable = []
+    for rule in rules:
+        if not isinstance(rule, dict) or not rule.get("hook"):
+            continue
+        match = rule.get("match") or {}
+        if match.get("kind") == "segment_text":
+            # Word-bounded so `frappe.db` does not fire on `frappe.database`. Built here
+            # rather than stored as a regex: the data says which identifiers matter, and
+            # this is the one engine that expresses that as a pattern.
+            idents = match.get("identifiers") or []
+            rule = dict(rule, _pattern=re.compile(
+                "(?:%s)\\b" % "|".join(re.escape(i) for i in idents)
+            ))
+        usable.append(rule)
+    return usable
+
+
+RULES = load_rules()
 
 
 def split_tokens(segment):
@@ -155,37 +167,71 @@ def subcommand(tokens, opts_with_arg):
     return None
 
 
-def check(segment):
-    """Return (decision, reason) if a rule matches this command segment, else None."""
+def rule_matches(rule, segment, tokens, name):
+    """Does this command segment fall under this rule?"""
+    match = rule["match"]
+    kind = match.get("kind")
+
+    if kind == "segment_text":
+        # Runs on the raw segment, so it also catches python -c "..." payloads and
+        # heredoc bodies, where there is no program name to look at.
+        return bool(rule["_pattern"].search(segment))
+
+    if kind == "program":
+        return name in match.get("programs", ())
+
+    if name != match.get("program"):
+        return False
+
+    if kind == "program_option":
+        return any(option in tokens for option in match.get("options", ()))
+
+    if kind == "program_subcommand":
+        # An informational flag means the CLI prints text and exits, so there is nothing
+        # to route anywhere. Whole tokens, never a substring of the segment: a brief is an
+        # argument, so `codex exec "explain the --help output"` mentions the flag without
+        # carrying it, and a substring test would exempt a real run for quoting a word.
+        # Only rules that declare it get the exemption - `--help` is inert rather than
+        # suppressing for an interpreter, which ignores the extra argument and runs the
+        # snippet anyway.
+        unless = match.get("unless_flags")
+        if unless and set(unless).intersection(tokens):
+            return False
+        if subcommand(tokens, OPTS_WITH_ARG.get(name, frozenset())) not in match.get(
+            "subcommands", ()
+        ):
+            return False
+        arguments = match.get("any_argument")
+        return not arguments or bool(set(arguments).intersection(tokens))
+
+    return False   # a kind this hook does not implement; the suite fails by rule name
+
+
+def match_rule(segment):
+    """The first rule this segment falls under, or None. Data order is precedence."""
+    if RULES is None:
+        return None
     tokens = split_tokens(segment)
     name = program(tokens)
-
-    if name == "git":
-        sub = subcommand(tokens, GIT_OPTS_WITH_ARG)
-        if sub == "push":
-            return "ask", PUSH_REASON
-        if sub == "add" and BLANKET_ADD.intersection(tokens):
-            return "deny", ADD_REASON
-
-    if name == "bench":
-        if "--site" in tokens:
-            return "ask", SITE_REASON
-        if subcommand(tokens, BENCH_OPTS_WITH_ARG) in SITE_SUBCOMMANDS:
-            return "ask", UNNAMED_SITE_REASON
-
-    if name in AGENT_CLIS:
-        target, opts = AGENT_CLIS[name]
-        if subcommand(tokens, opts) == target and not INFO_FLAGS.intersection(tokens):
-            return "deny", AGENT_REASON
-
-    if name in DATABASE_CLIENTS:
-        return "ask", SITE_REASON
-
-    # Catches inline snippets too: python -c "...", heredoc bodies, bench execute payloads.
-    if FRAPPE_CONNECTION.search(segment):
-        return "ask", SITE_REASON
-
+    for rule in RULES:
+        if rule_matches(rule, segment, tokens, name):
+            return rule
     return None
+
+
+def check(segment):
+    """Return (decision, reason) if a rule matches this command segment, else None."""
+    if RULES is None:
+        # Degraded: no rules loaded. Ask on the programs the rules are about rather than
+        # enforcing nothing at all.
+        return ("ask", UNREADABLE_REASON) if program(
+            split_tokens(segment)
+        ) in GUARDED_PROGRAMS else None
+
+    rule = match_rule(segment)
+    if rule is None:
+        return None
+    return rule["hook"], REASONS.get(rule["name"]) or rule.get("intent", "")
 
 
 def main():
@@ -215,4 +261,5 @@ def main():
     )
 
 
-main()
+if __name__ == "__main__":
+    main()
