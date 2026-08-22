@@ -128,3 +128,96 @@ layout is defined in one place only.
 | `find . -type f` (excluding `.git`) | `hooks/` is at the repository root alongside `skills/` and `config/` |
 | Hooks reference cross-check | `docs.claude.com/en/docs/claude-code/hooks` now 301s to `code.claude.com/docs/en/hooks`. Fetched both that page and the plugins reference. Confirmed verbatim: `hookSpecificOutput` with `hookEventName: "PreToolUse"`, `permissionDecision` ∈ `allow` / `deny` / `ask`, `permissionDecisionReason`; stdin fields `tool_name` and `tool_input`; plugin hooks at `hooks/hooks.json` with a top-level `hooks` object keyed by event name; `${CLAUDE_PLUGIN_ROOT}` supported in hook commands in both exec and shell form. No field name was written from memory |
 | `git status --porcelain` before starting | Empty — clean working tree; nothing pre-existing was staged or reverted |
+
+## Patch: bare agent invocation
+
+Phase 03 added the delegation dispatcher, and with it a gap this hook is the only thing
+that can close.
+
+The dispatcher carries three things a bare CLI call does not: the model, effort, and
+timeout resolved from `config/model-routing.json`; the OpenCode permission policy that
+holds a delegated run inside the same push, staging, and live-site boundaries this hook
+enforces; and the structured result contract that keeps an agent's self-report separate
+from verification. A bare `opencode run` or `codex exec` typed as a Bash command skips all
+three. Every boundary this hook exists to make unconditional would lapse the moment work
+was delegated outside the dispatcher — and delegation is now the normal path.
+
+Phase 03 was forbidden from touching `hooks/`, so it reported the command shape instead.
+This patch is the decision that followed.
+
+### The rule
+
+A fourth rule in `hooks/guard.py`, alongside push, blanket staging, and live-site
+execution:
+
+```python
+AGENT_CLIS = {
+    "opencode": ("run", OPENCODE_OPTS_WITH_ARG),
+    "codex": ("exec", CODEX_OPTS_WITH_ARG),
+}
+```
+
+**Deny, not ask.** Same test that made blanket staging a deny and push an ask: deny is
+free where a correct alternative always exists. For a bare agent run it does — the
+dispatcher. For push it does not, which is why push stayed an ask.
+
+**Matched on the subcommand, not the program.** `opencode` and `codex` are ordinary CLIs
+with ordinary informational subcommands, and denying the program name would break them.
+`AGENT_CLIS` maps each program to the one subcommand that starts an agent run, resolved
+through the existing `subcommand()` helper — the same mechanism already used for `git` and
+`bench`. Each program gets its own options-with-argument set, because `-c` is a boolean
+(`--continue`) for OpenCode and takes a value (`--config`) for Codex; one shared set would
+have mis-parsed one of them.
+
+**The reason redirects rather than scolds.** It gives the exact dispatcher command to use
+and says what a bare invocation skips. `CLAUDE_PLUGIN_ROOT` is exported to hook processes,
+so the reason names the real absolute path to `scripts/delegate`; with the variable absent
+it degrades to the relative path rather than producing a broken one.
+
+### The dispatcher is not caught by its own rule
+
+Confirmed, not assumed. The rule binds commands Claude runs through the Bash tool, which
+is what `PreToolUse` with matcher `Bash` sees. `scripts/delegate` launches `opencode` and
+`codex` with `subprocess.Popen` from its own process; those children are not Bash tool
+calls and no hook runs for them.
+
+Both halves were verified: a payload whose command is a `scripts/delegate …` invocation
+passes through untouched (program name is `delegate`, which matches no rule), and the
+dispatcher run end to end against a stub CLI still executed its child and returned
+`status=completed`, `result_block=present`.
+
+### Open questions from this patch
+
+1. **The bypass is closed for the Bash tool, not for the process tree.** Anything that
+   spawns `opencode` or `codex` without going through the Bash tool is invisible here, as
+   it always has been. That is the same boundary Open question 1 below describes for
+   `sudo mysql`, not a new class of gap.
+2. **Option sets are best-effort.** An option that takes a separate argument, appears
+   before the subcommand, and is missing from that program's set would cause
+   `subcommand()` to return the option's value and the rule not to fire. The sets were
+   built from each CLI's own help output and source, and the common forms are verified
+   below, but they are literals and can drift as the CLIs change.
+3. **The duplication set is now four rules in the hook.** Push, staging, and live-site are
+   mirrored in `skills/orchestration/SKILL.md`; this fourth one is mirrored in that skill's
+   `## Delegation` section and in `scripts/delegate`'s own permission policy. Nothing
+   enforces that they stay in sync.
+
+### Patch verification
+
+| Command | Result |
+| --- | --- |
+| `claude plugin validate . --strict` | `✔ Validation passed` (exit 0) |
+| 8 bare-invocation payloads | All `deny`: `opencode run "…"`, the full dispatcher-shaped `opencode run --agent build --auto --model … "…"`, `codex exec --sandbox read-only -`, `codex exec "…"`, `opencode -m … run "…"`, `codex -m … exec "…"`, `cd /repo && opencode run "…"`, `git status; codex exec "…"` |
+| 11 pass-through payloads | All silent: `opencode models`, `opencode --help`, `opencode --version`, `codex --version`, `codex --help`, `opencode models \| grep run`, `opencode agent list`, `opencode debug config`, `opencode upgrade`, `npm run build`, `yarn run test` |
+| 3 dispatcher-invocation payloads | All silent — relative path, absolute path, and with a stdin redirect |
+| Dispatcher end to end with a stub CLI | `status=completed`, `exit_code=0`, `result_block=present`; the child CLI ran. The hook is not in that path |
+| Regression, 11 payloads | Unchanged: `git push` / `--force` / `git -C … push` → ask; `git add .` / `-A` / `--all` → deny; `bench console`, `bench --site … migrate`, `bench execute …`, `mysql -u root -p`, inline `frappe.get_all` → ask |
+| Regression, 7 pass-through payloads | Unchanged: `git add <path>`, `git status --porcelain`, `git commit -m "push the fix"`, `bench start`, `bench build`, `npm test`, `ls -la` |
+| Malformed payloads (`not json`, `{}`, `{"tool_input":null}`, `{"tool_input":{"bash_id":"x"}}`) | Exit 0, no stdout, no stderr |
+| Reason string with `CLAUDE_PLUGIN_ROOT` set | Names the absolute `…/scripts/delegate` |
+| Reason string with the variable absent | Degrades to `scripts/delegate` |
+| Timing, 10 invocations | 37 ms each |
+| `git ls-files -s hooks/guard.py` | `100755` — exec bit retained |
+
+Not verified: the rule firing inside a live session. Open question 3 above stood for the
+original three rules and stands for this one.

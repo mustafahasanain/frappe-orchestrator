@@ -86,16 +86,34 @@ Allowed:
 
 Nothing else. `plugin.json` is not touched.
 
-The skill keeps the guidance; the hook makes the dangerous cases unconditional. Three
-rules therefore exist in both places on purpose, and the skill's wording is not weakened
+The skill keeps the guidance; the hook makes the dangerous cases unconditional. Rules
+therefore exist in both places on purpose, and the skill's wording is not weakened
 because the hook exists.
 
-The hook **decides only**. It denies blanket staging, and asks before a push or any
-execution against a Frappe site. It performs no operation of its own. "Permanently out of
-scope" below stands unchanged and binds hooks exactly as it binds skills: the hook must
-refuse deployment, never perform it.
+The hook **decides only**. It denies blanket staging and bare coding-agent invocations,
+and asks before a push or any execution against a Frappe site. It performs no operation
+of its own. "Permanently out of scope" below stands unchanged and binds hooks exactly as
+it binds skills: the hook must refuse deployment, never perform it.
 
 Anything the hook does not recognise is allowed through untouched.
+
+**Amendment after Phase 03.** The delegation dispatcher carries the central routing, the
+permission policy that holds a delegated run inside these same boundaries, and the
+structured result contract. A bare `opencode run` or `codex exec` typed as a Bash command
+skips all three, so every boundary enforced here lapses the moment work is delegated
+outside the dispatcher. The rule that closes this belongs to Phase 01.5, not to Phase 03,
+which is forbidden from touching `hooks/`. This phase entry therefore also allows that
+fourth rule, added to `hooks/guard.py` under the same constraints as the other three:
+
+- It **denies**, because a correct alternative always exists — the dispatcher.
+- It matches the **subcommand**, not the program, so informational invocations
+  (`opencode models`, `opencode --help`, `codex --version`) pass through untouched.
+- It binds commands Claude runs through the Bash tool. The dispatcher launches the agent
+  CLIs as its own child processes, which are not Bash tool calls, so the dispatcher is
+  unaffected by its own rule.
+
+Later phases that add a component the hook should guard follow the same route: report the
+command shape, and amend Phase 01.5 rather than widening their own scope.
 
 ### Phase 02 — Project Context & Impact
 

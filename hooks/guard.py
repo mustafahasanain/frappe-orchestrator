@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""PreToolUse guard: deny blanket staging, ask before pushes and live-site execution.
+"""PreToolUse guard: deny blanket staging and bare agent runs, ask before pushes and
+live-site execution.
 
 Reads a PreToolUse payload on stdin. Prints a JSON permission decision when a rule
 matches, and prints nothing otherwise. Anything it does not recognise is allowed.
 """
 
 import json
+import os
 import re
 import shlex
 import sys
@@ -15,11 +17,32 @@ SEPARATORS = re.compile(r"&&|\|\||[;|&\n]")
 # Options taking a separate argument, so the token after them is not the subcommand.
 GIT_OPTS_WITH_ARG = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
 BENCH_OPTS_WITH_ARG = {"--site", "-s"}
+OPENCODE_OPTS_WITH_ARG = {
+    "-m", "--model", "--agent", "--variant", "--prompt", "-s", "--session",
+    "--log-level", "--port", "--hostname", "--mdns-domain", "--format", "--dir",
+    "--command", "-f", "--file", "--title", "--attach", "-u", "--username",
+    "-p", "--password", "--replay-limit",
+}
+CODEX_OPTS_WITH_ARG = {
+    "-m", "--model", "-C", "--cd", "-s", "--sandbox", "-p", "--profile",
+    "-c", "--config", "-a", "--ask-for-approval", "--color", "--add-dir",
+    "-o", "--output-last-message", "--output-schema", "-i", "--image",
+}
 
 BLANKET_ADD = {".", "-A", "--all"}
 SITE_SUBCOMMANDS = {"console", "mariadb", "execute", "run"}
 DATABASE_CLIENTS = {"mysql", "mariadb"}
 FRAPPE_CONNECTION = re.compile(r"frappe\.(init|connect|db|get_doc|get_all|get_list)\b")
+
+# Program -> (subcommand that starts an agent run, options taking a separate argument).
+# Matched on the subcommand, not the program, so `opencode models`, `opencode --help`,
+# and `codex --version` are untouched.
+AGENT_CLIS = {
+    "opencode": ("run", OPENCODE_OPTS_WITH_ARG),
+    "codex": ("exec", CODEX_OPTS_WITH_ARG),
+}
+
+DELEGATE = os.path.join(os.environ.get("CLAUDE_PLUGIN_ROOT", ""), "scripts", "delegate")
 
 PUSH_REASON = (
     "Pushing is never automatic. Confirm the target branch and remote with the user "
@@ -30,6 +53,15 @@ ADD_REASON = (
     "Do not stage with `git add .` or `git add -A` - it sweeps in unrelated work. Run "
     "`git status --porcelain` to see what changed, then stage only the files this task "
     "created or changed, by path."
+)
+
+AGENT_REASON = (
+    "Coding agents run through the dispatcher, not directly. Use `" + DELEGATE + " "
+    "--agent <opencode|codex> --mode <implement|review|test> --tier <TIER> "
+    "[--model \"<name from the routing file>\"]` with the brief on stdin. The "
+    "dispatcher supplies the model and timeout from central routing, the permission "
+    "policy that holds a delegated run inside the same boundaries enforced here, and "
+    "the structured result contract. A bare invocation skips all three."
 )
 
 SITE_REASON = (
@@ -81,6 +113,11 @@ def check(segment):
     if name == "bench":
         if subcommand(tokens, BENCH_OPTS_WITH_ARG) in SITE_SUBCOMMANDS or "--site" in tokens:
             return "ask", SITE_REASON
+
+    if name in AGENT_CLIS:
+        target, opts = AGENT_CLIS[name]
+        if subcommand(tokens, opts) == target:
+            return "deny", AGENT_REASON
 
     if name in DATABASE_CLIENTS:
         return "ask", SITE_REASON
