@@ -3,15 +3,15 @@
   "models": {
     "Kimi K2.6": {
       "executor": "opencode",
-      "id": "<supply provider id>"
+      "id": "opencode/kimi-k2.6"
     },
     "Kimi K2.7 Code": {
       "executor": "opencode",
-      "id": "<supply provider id>"
+      "id": "opencode/kimi-k2.7-code"
     },
     "Kimi K3": {
       "executor": "opencode",
-      "id": "<supply provider id>"
+      "id": "opencode/kimi-k3"
     },
     "GLM-5.2": {
       "executor": "opencode",

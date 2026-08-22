@@ -260,3 +260,76 @@ Also worth a decision: `--cwd` is not constrained to the current repository.
 | `git status --porcelain` before starting | Empty |
 
 Not verified: anything requiring a real model call — see Limitations 1, 5, and 6.
+
+## Patch: model ids and variant tolerance
+
+Two changes after the phase commit. Open question 1 is closed; open question 2 is not, and
+the dispatcher was changed to behave honestly while it stays open.
+
+### Model ids
+
+The three placeholders in the `models` map were replaced with ids confirmed from
+`opencode models`:
+
+| Model | id | executor |
+| --- | --- | --- |
+| Kimi K2.6 | `opencode/kimi-k2.6` | opencode |
+| Kimi K2.7 Code | `opencode/kimi-k2.7-code` | opencode |
+| Kimi K3 | `opencode/kimi-k3` | opencode |
+| GLM-5.2 | `opencode/glm-5.2` | opencode |
+| Claude Sonnet 5 | — | claude |
+| Claude Opus | — | claude |
+
+No placeholders remain, and the two `claude`-executor models correctly still have no id.
+The routing file diff is three lines.
+
+### Variant values are still unverified
+
+`opencode run --help` describes `--variant` as "model variant (provider-specific reasoning
+effort, e.g., high, max, minimal)". Those examples are not the `low` / `medium` / `high`
+the routing file's `effort` uses, and the accepted set is provider-specific. It cannot be
+settled without a real model call, so it stays unverified here.
+
+The dispatcher was made tolerant rather than confident. No list of accepted variants was
+hardcoded — that would be guessing at provider behaviour, and would go stale silently.
+
+**Pass-through.** If an effort value is present it is passed as `--variant <value>`,
+unchanged. `--effort ''` omits the flag entirely, which is the escape hatch and the
+discriminating test. `--effort` now distinguishes "not given" (fall back to the tier's
+effort) from "given as empty" (omit the flag); previously an empty value fell through to
+the tier default.
+
+**Surfacing a rejection.** `--variant` is the only argument the dispatcher passes whose
+accepted values are unverified; every other flag was confirmed against the CLI's own help
+or source. A CLI that rejects an argument exits before producing any output, so that
+combination — non-zero exit, empty stdout, and a `--variant` in the argv — is reported as
+`status: "usage_error"` instead of a generic `failed`, with an error naming the exact
+variant value, the re-run that isolates it, and the CLI's stderr.
+
+The signal is structural, not text matching, so it does not encode any assumption about
+how a particular CLI words its errors. It is also not a certainty: a startup failure with
+no output and an argument rejection look alike from outside the process. The message says
+so and gives the test that separates them rather than asserting a cause. An agent that
+ran and then failed produces output, so it stays a plain `failed`.
+
+Once the accepted values are known, the fix is a value change in `config/model-routing.json`
+and nothing in the dispatcher.
+
+### Patch verification
+
+| Command | Result |
+| --- | --- |
+| `claude plugin validate . --strict` | `✔ Validation passed` (exit 0) |
+| `python3 -c "json.load(...)"` on the routing file | valid |
+| `git diff` on the routing file | 3 insertions, 3 deletions — the id values only |
+| All four delegated models, `--dry-run` | Each resolves to its id; no placeholder refusal remains |
+| Stub rejects `--variant` (non-zero, empty stdout) | `status=usage_error`, error names `--variant low`, the `--effort ''` re-run, and the stderr |
+| Stub fails after producing output | `status=failed`, `exit_code=3` — unchanged, not reclassified |
+| Same rejection with `--effort ''` | `status=failed` — with no variant passed, the variant cannot be the cause, and it is not blamed |
+| `--effort ''` vs. default, `--dry-run` | `--variant` absent and present respectively |
+| Refusal matrix, 5 cases | All still exit 2 |
+| Codex review via stub | `status=completed`, `result_block=present`, `verdict=PASS`, argv `['codex','exec','--sandbox','read-only','-']` |
+| Real `codex` absent | `status=cli_missing` — unchanged |
+
+Still not verified: which `--variant` values the provider accepts, and everything in
+Limitations 1, 5, and 6 above.

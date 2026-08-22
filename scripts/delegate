@@ -313,7 +313,10 @@ def main():
         "--tier", required=True, choices=("FAST", "SMALL", "NORMAL", "DIFFICULT")
     )
     parser.add_argument("--model", help="display name from the routing file")
-    parser.add_argument("--effort", help="defaults to the tier's effort")
+    parser.add_argument(
+        "--effort",
+        help="defaults to the tier's effort; pass an empty string to omit --variant",
+    )
     parser.add_argument("--cwd", help="defaults to the current directory")
     parser.add_argument("--timeout", type=int, help="defaults to the tier's timeout")
     parser.add_argument(
@@ -350,7 +353,7 @@ def main():
         if not args.model:
             fail("--model is required for --agent opencode")
         model_id = resolve_model(routing, args.model, fail)
-        effort = args.effort or tier.get("effort")
+        effort = args.effort if args.effort is not None else tier.get("effort")
     else:
         if args.model:
             fail(
@@ -414,6 +417,13 @@ def main():
     (workspace / "agent-stderr.txt").write_text(err)
     block_state, report = extract_report(out)
 
+    # --variant is the only argument this dispatcher passes whose accepted values are
+    # not verified against the CLI; they are provider-specific. A CLI that rejects an
+    # argument exits before producing any output, so that combination is reported as a
+    # usage error rather than a generic failure - otherwise the cause is invisible.
+    if status == "failed" and not out.strip() and "--variant" in argv:
+        status = "usage_error"
+
     result = {
         "status": status,
         "agent": args.agent,
@@ -435,6 +445,16 @@ def main():
     if status == "cli_missing":
         result["error"] = (
             "%s is not installed or not on PATH. Nothing was run." % argv[0]
+        )
+    elif status == "usage_error":
+        result["error"] = (
+            "%s exited %s before producing any output, which is how a CLI reports a "
+            "rejected argument. The only argument here whose accepted values are "
+            "unverified is `--variant %s`, taken from the tier's effort in the routing "
+            "file; variant names are provider-specific. Re-run with --effort '' to drop "
+            "it. If that succeeds, the variant value is the cause; if it fails the same "
+            "way, look at the stderr below. CLI stderr: %s"
+            % (argv[0], code, effort, err.strip()[:800] or "(empty)")
         )
     elif status == "error":
         result["error"] = err
