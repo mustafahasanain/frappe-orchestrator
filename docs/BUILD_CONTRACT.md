@@ -151,6 +151,30 @@ Forbidden: anything that touches a remote host.
 
 ---
 
+## Testing
+
+A `tests/` directory is allowed at the repository root, with fixtures under
+`tests/fixtures/`. Nothing in `tests/` is loaded by the plugin at runtime; like `docs/`,
+it exists for people working on the plugin.
+
+Tests are for the components that **fail silently**. A dispatcher that cannot start its
+CLI, a hook that denies the wrong command, a malformed routing file — all announce
+themselves. A parser that quietly returns the wrong object does not, and that is what
+earns a test. Do not add tests for everything else because a `tests/` directory now
+exists.
+
+Keep the harness minimal: plain Python, no framework, no dependency to install, runnable
+with one command. Fixtures are real captured output, not invented samples — a fixture
+tidier than reality is how a parsing defect survives.
+
+**Precedent.** Phase 03 needed test coverage that its own file list did not allow, and
+amended this contract rather than widening its scope. That is the route: a phase that
+needs a file class no phase allows amends this document first, in its own section, and
+records the amendment in its report. The same route Phase 01.5 took for the hook rule
+Phase 03 could not add itself.
+
+---
+
 ## Permanently out of scope
 
 Deployment is outside the plugin and outside the phase system. Across every phase, never

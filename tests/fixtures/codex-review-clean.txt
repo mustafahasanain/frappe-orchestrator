@@ -1,0 +1,9 @@
+```json
+{
+  "verdict": "PASS",
+  "summary": "The diff only adds a temporary note to the extract_report docstring. Executable behavior is unchanged, and no tests are warranted.",
+  "findings": [],
+  "tests_run": [],
+  "missing_coverage": []
+}
+```

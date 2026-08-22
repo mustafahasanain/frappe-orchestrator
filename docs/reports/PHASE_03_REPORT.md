@@ -446,3 +446,116 @@ command job.
 | Refusal matrix, 3 cases | exit 2, unchanged |
 | `cli_missing` with `PATH` stripped | Still fires correctly now that codex is genuinely installed |
 | Repository working tree | Only `scripts/delegate` modified; the probe diff used for run 1 was reverted, and no delegation artifact reached the repository |
+
+## Patch: parser reviewed to the attempt bound, and tested
+
+The previous patch left the rebuilt parser unreviewed. That is now closed: it went through
+a full review loop against the real Codex CLI, which reached the three-attempt bound
+without a PASS. Minimal test infrastructure was then added, under a contract amendment.
+
+### On stdout and stderr, recorded so it is not re-assumed
+
+The banner, prompt echo, answer, and `tokens used` footer that appear to be on stdout are
+on **stderr**. stdout carries the final agent message only — 246 bytes on the clean run.
+
+Worth stating as a rule rather than a fact about one CLI: **what a terminal shows is not
+evidence of what a pipe receives.** A terminal renders both streams into one scrollback
+with no marker of which is which, so reading it as a single stream is the natural mistake,
+and it survives because it is almost never tested directly. The check is one command —
+redirect the streams to separate files and look at each — and it takes a few seconds. It
+was worth doing here: the assumption was wrong in the other direction, and correcting it
+was what pointed at the actual defect.
+
+### The review loop, run properly and bounded
+
+Three attempts, every one against the real CLI, each re-review against the current diff.
+
+| Attempt | Verdict | Blocking | What happened |
+| --- | --- | --- | --- |
+| 1 | FAIL | 4 | RecursionError escaping; single-key false positives; O(n) per candidate; nested reports skipped. All four reproduced first, then fixed |
+| 2 | FAIL | 2 | Key counting still admitted generic pairs; the attempt cap bounded candidates but not cumulative cost. Both reproduced, then fixed |
+| 3 | FAIL | 1 | The discriminator alone still admits `{"status":"completed","operation":"session"}`. Reproduced; **not fixed** |
+
+Every finding was reproduced against the code before being accepted. Two measurements
+worth keeping:
+
+- Attempt 1's runtime finding was real but its stated cause was not the whole story. A
+  failed `raw_decode` builds a `JSONDecodeError`, and that counts newlines from offset
+  zero to the failure point. Scanning backwards means large offsets, so the cost was
+  O(n) *per candidate*. Decoding from a bounded slice made it constant: 1,000,000
+  candidates went from >30s to 0.08s.
+- Attempt 2's finding showed a candidate cap does not bound cumulative work. A wall-clock
+  budget does. Compact hostile nesting went from 24.95s to exactly the 5s budget.
+
+**Attempt 3 is where it stopped.** Phase 01 allows no automatic fourth attempt and none
+was made.
+
+The surviving finding is real and reproduced. It was not fixed because the obvious
+one-line tightening does not close it: also requiring `summary` still admits
+`{"verdict":"PASS","summary":"x","rule":"transport"}`. Each round has narrowed the
+heuristic and each round has found the next object that satisfies it, which is the
+signature of a problem that successive key checks cannot terminate.
+
+**Root cause.** Identifying "the agent's report" inside arbitrary text is inherently
+heuristic. Three rounds tightened it from *any fenced JSON* to *two contract keys* to *the
+contract's own enumerated discriminator*, and a counterexample survived each time.
+
+**Recommended next action, and it is a design change rather than another round.** Stop
+guessing. Have the dispatcher generate a random token per run, put it in the brief as the
+delimiter the agent must wrap its report in, and extract by that token. Identification
+becomes exact, no CLI output can collide with it, and the whole class disappears rather
+than being narrowed again. That is a change to the brief contract as well as the parser,
+so it is your call, not something to slip in here.
+
+The current parser is safe in the meantime: it fails closed, is bounded three ways, does
+not raise on any input tried, and its failure mode is a report the orchestrator can see is
+wrong rather than a silent substitution.
+
+### Contract amendment
+
+`docs/BUILD_CONTRACT.md` gained a `## Testing` section: `tests/` is allowed at the
+repository root with fixtures under `tests/fixtures/`, nothing there loads at runtime,
+tests are for components that fail silently, and the harness stays framework-free. It
+records the precedent explicitly — a phase needing a file class no phase allows amends the
+contract first and records it in its report, the same route Phase 01.5 took for the hook
+rule Phase 03 could not add itself.
+
+### Test infrastructure
+
+**`python3 tests/test_parser.py`** — one command, standard library only, nothing to
+install. Exits non-zero on failure.
+
+- `tests/test_parser.py` — 29 cases and 3 timed bounds, covering the parser only.
+- `tests/fixtures/codex-review-clean.txt` — real captured stdout from `codex exec`.
+- `tests/fixtures/codex-review-inner-fence.txt` — the real output that broke the fence
+  parser. Its own `detail` string contains a fenced example, which is what a reviewer of
+  this repository naturally produces. Kept as a fixture because an invented sample would
+  not have contained it — the defect survived precisely because every stub was tidier
+  than reality.
+
+The two findings from attempt 3 are encoded as `KNOWN_GAPS`: they run, they are printed as
+documented gaps rather than counted as passes, and if one starts behaving differently the
+suite says so. A known defect asserted as correct behaviour would be worse than no test.
+
+`scripts/delegate` gained a standard `if __name__ == "__main__":` guard so the module can
+be imported without executing. That is the only change to it in this patch that is not the
+parser.
+
+### Patch verification
+
+| Command | Result |
+| --- | --- |
+| `claude plugin validate . --strict` | `✔ Validation passed` (exit 0) |
+| `python3 tests/test_parser.py` | `29 cases, 3 timed` … `ok`, exit 0, 10.2s (dominated by the 5s hostile-input budget) |
+| Suite catches a real regression | The historical fence regex was reinjected: 16 failures including both real fixtures, exit 1, and the known-gap tracker flagged the change. Restored, green again |
+| Live review attempts 1–3 | `status=completed` each; 344.5 s, 400.9 s, 155.5 s; all within the 900 s NORMAL timeout |
+| All 7 findings reproduced before fixing | Each demonstrated against the code; attempt 3's two probes reproduced and left in place as `KNOWN_GAPS` |
+| Runtime bounds | 1,000,000 candidates 0.12 s; compact hostile nesting 5.00 s (the budget); hostile input with a real report at the end under 1 ms |
+| Stub suite | opencode good/noblock/invalid and codex real/backticks all as designed |
+| Hook regression | `opencode run` deny, `codex exec` deny, `opencode models` pass-through, `git add .` deny |
+| Working tree | `.gitignore` gained `__pycache__/`; no bytecode or delegation artifact committed |
+
+Still untested, unchanged from the previous patch: `--mode test` against the real CLI, the
+implement path against the real OpenCode CLI (Limitation 6 — its stdout shape is still
+unobserved, and the Codex lesson applies to it directly), deny enforcement under `--auto`
+at runtime, and the accepted `--variant` values.

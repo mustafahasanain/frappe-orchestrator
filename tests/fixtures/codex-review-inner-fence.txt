@@ -1,0 +1,22 @@
+```json
+{
+  "verdict": "FAIL",
+  "summary": "The stated fixes work for recognized fences: `_blank` preserves offsets, complete fenced arrays are excluded, and the last qualifying parse wins. However, valid fenced regions can remain unrecognized and leak into the bare fallback.",
+  "findings": [
+    {
+      "category": "blocking",
+      "file": "scripts/delegate",
+      "detail": "`FENCED_BLOCK` only accepts a single whitespace-free info token and requires a closing delimiter. A fence such as ```json result containing an array is not blanked, so the bare scanner extracts a nested report-shaped object and returns `present` instead of `invalid`; unterminated fences leak similarly, contradicting the documented guarantee that fallback never scans inside a fence."
+    }
+  ],
+  "tests_run": [
+    "git diff --check -- scripts/delegate",
+    "python3 - <<'PY' ... compile and targeted extract_report assertions covering offset preservation, fenced-array rejection, fenced preference, last fenced/bare selection, missing, and invalid states ... PY",
+    "python3 - <<'PY' ... regression assertions for multiword-info and unterminated fenced arrays ... PY (failed: multiword-info fenced array returned present)"
+  ],
+  "missing_coverage": [
+    "No automated test protects space-bearing or multiword fence info strings from leaking into the bare fallback.",
+    "No automated test protects unterminated fenced regions from being scanned as bare output."
+  ]
+}
+```
