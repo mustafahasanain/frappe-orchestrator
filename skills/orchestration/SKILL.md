@@ -228,17 +228,38 @@ ${CLAUDE_PLUGIN_ROOT}/scripts/delegate
 The brief goes in on stdin; the result comes back as JSON on stdout.
 
 ```text
-delegate --agent opencode --mode implement --tier <TIER> --model "<name from routing file>"
-delegate --agent codex    --mode review    --tier <TIER>
-delegate --agent codex    --mode test      --tier <TIER>
-delegate --agent codex    --mode onboard   --tier <TIER>
+delegate --agent opencode --mode implement --tier <TIER> --cwd <repository root> --model "<name from routing file>"
+delegate --agent codex    --mode review    --tier <TIER> --cwd <repository root>
+delegate --agent codex    --mode test      --tier <TIER> --cwd <repository root>
+delegate --agent codex    --mode onboard   --tier <TIER> --cwd <repository root>
 ```
 
 Those four are the only valid combinations, and the dispatcher refuses the rest.
 Codex never implements: a reviewer that writes the code it reviews is not independent.
 
-The provider model id, effort, and timeout come from the routing file. `--effort`,
-`--timeout`, and `--cwd` override them when needed.
+The provider model id, effort, and timeout come from the routing file. `--effort` and
+`--timeout` override them when needed.
+
+### The working directory is explicit
+
+`--cwd` is required on every delegated run, and it is the repository root. There is no
+default and nothing is inherited. The dispatcher exits 2 if it is missing, if the path is
+not a git work tree, or if it is a subdirectory of one rather than the root — a
+subdirectory is refused rather than resolved upward, and the error names the root.
+
+This is not pedantry about a flag. A delegated agent does not necessarily work in the
+directory this process is in, so an unstated directory is not "here" — it is whichever
+directory happened to be current, and a run can edit one repository while its result
+describes another. Naming the wrong repository on purpose is still possible; choosing one
+by accident is what this removes.
+
+When you report a delegated run, state the directory the result came back with, verbatim:
+
+    Delegated: <agent> <mode> | tier: <TIER> | cwd: <resolved path from the result>
+
+Take it from the result's `cwd`, not from what you passed in — those are the same thing
+only when nothing went wrong, and the point of stating it is the case where something
+did.
 
 NORMAL and DIFFICULT timeouts are longer than a foreground command may run, so start
 those in the background and collect the result when it finishes. The dispatcher prints
@@ -287,6 +308,8 @@ claimed. Keep the two apart.
   `cli_missing`, `error`. `completed` means the process exited cleanly and nothing more.
 - `result_block` — `missing` or `invalid` means the agent returned no usable report.
   Read the file at `transcript` before concluding anything.
+- `cwd` — the absolute, symlink-resolved repository root the run was given. This is the
+  directory the run worked in, and it is what you quote when reporting the run.
 - `off_contract_keys` — verdict keys the agent volunteered in a mode that has none, and
   which were removed. Non-empty means the agent answered a contract it was not given;
   the rest of its report still stands, but do not go looking for the removed value.

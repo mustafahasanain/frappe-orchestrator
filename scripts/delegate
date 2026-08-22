@@ -339,6 +339,70 @@ def resolve_model(routing, name, fail):
 
 
 # --------------------------------------------------------------------------
+# Working directory
+#
+# Never inherited, never defaulted, always validated. OpenCode resolved its working
+# directory from the environment rather than from the process it was given, so an omitted
+# --cwd did not mean "here" - it meant "wherever the orchestrator's shell happened to be",
+# while the result reported something else. A directory chosen by accident is the failure
+# this refuses; naming the wrong repository on purpose is still possible and is not what
+# this is for.
+# --------------------------------------------------------------------------
+
+CWD_REQUIRED = (
+    "--cwd is required and is never inferred. The directory a delegated run works in is "
+    "not inherited from this process: OpenCode resolves it from the environment, so an "
+    "omitted --cwd means whichever directory the caller's shell was in, and the result "
+    "would report a directory the agent never touched. Pass the repository root."
+)
+
+
+def enclosing_repository(path):
+    """Nearest ancestor of `path` that is a git work tree root, or None."""
+    current = path
+    while True:
+        parent = os.path.dirname(current)
+        if parent == current:  # filesystem root
+            return None
+        current = parent
+        if os.path.exists(os.path.join(current, ".git")):
+            return current
+
+
+def resolve_working_directory(raw, fail):
+    """--cwd -> an absolute, symlink-resolved git work tree root.
+
+    A subdirectory of a repository is refused rather than resolved upward. Resolving it
+    would hand the agent a wider scope than the caller named, silently - the same shape of
+    quiet substitution that made the inherited-directory defect survive. The error names
+    the root, so correcting it is one edit.
+
+    `.git` is tested for as a path rather than by running git: a work tree added with
+    `git worktree add` has it as a file, a normal clone as a directory, and a bare
+    repository has neither, which is correctly refused - there is no work tree to edit.
+    """
+    if raw is None:
+        fail(CWD_REQUIRED)
+    path = os.path.realpath(os.path.expanduser(raw))
+    if not os.path.isdir(path):
+        fail("--cwd is not a directory: %s" % path)
+    if not os.path.exists(os.path.join(path, ".git")):
+        root = enclosing_repository(path)
+        if root:
+            fail(
+                "--cwd must be a repository root, and %s is a subdirectory of %s. It is "
+                "not resolved upward for you: a delegated run given a wider scope than "
+                "the one named is how the wrong tree gets edited quietly. Pass %s."
+                % (path, root, root)
+            )
+        fail(
+            "--cwd is not a git work tree: %s contains no .git. A delegated run is "
+            "scoped to one repository, and this is not one." % path
+        )
+    return path
+
+
+# --------------------------------------------------------------------------
 # Execution
 # --------------------------------------------------------------------------
 
@@ -491,7 +555,10 @@ def main():
         "--effort",
         help="defaults to the tier's effort; pass an empty string to omit --variant",
     )
-    parser.add_argument("--cwd", help="defaults to the current directory")
+    parser.add_argument(
+        "--cwd",
+        help="required: the repository root the run works in, never inherited",
+    )
     parser.add_argument("--timeout", type=int, help="defaults to the tier's timeout")
     parser.add_argument(
         "--dry-run",
@@ -542,9 +609,7 @@ def main():
             fail("the brief is read from stdin and was empty")
         brief = "(dry run: no brief supplied)"
 
-    cwd = os.path.abspath(args.cwd or os.getcwd())
-    if not os.path.isdir(cwd):
-        fail("--cwd is not a directory: %s" % cwd)
+    cwd = resolve_working_directory(args.cwd, fail)
 
     # The leading heading also guarantees the brief never starts with "-" when it is
     # passed as a positional argument.

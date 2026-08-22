@@ -1196,3 +1196,122 @@ values.
 | Test suite caught the adapter signature change | `adapt_codex() missing 1 required keyword-only argument: 'cwd'` — the matrix check calls the adapters, so it failed before any run did |
 | Stray file from the defect | One untracked `probe-artifact.txt` written into this repository by the staging probe, deleted. Nothing was staged or committed — the deny rules are what stopped that |
 | Working tree | `scripts/delegate` and `tests/test_parser.py` modified; probe repositories and delegation workspaces are all outside the repository |
+
+## Rule: the layer under test cannot also be the layer protecting the test
+
+Recorded as a rule because it was violated in this repository and the violation was
+invisible until the results were checked against the filesystem.
+
+The runtime deny probes were built to run in throwaway repositories so that a failed deny
+could do no damage. The isolation did not exist — `--cwd` was ignored — so the probes ran
+here, and what actually stood between `git add -A` / `git commit` and this repository was
+the deny policy being measured. Both held, so the cost was one untracked file. Had the
+policy been broken, the probe designed to detect that would have been the thing damaged by
+it, and the evidence would have been contaminated by the same failure it was looking for.
+
+**The rule, for every probe from here on:**
+
+1. **Real isolation.** A scratch target whose total loss costs nothing — created for the
+   probe, not merely different from the important thing.
+2. **No reliance on the mechanism under test.** If the probe would be safe *only because*
+   the thing being verified works, it is not isolated; it is assuming its own conclusion.
+3. **Verify the isolation before trusting it**, not after. One command establishing that
+   the probe is where it thinks it is. The cost of skipping it here was that a defect
+   found by accident could just as easily have been missed.
+4. **Check ground truth outside the agent's account.** The bare remote's ref, the index,
+   the log. An exit code and a well-formed report are what a wrong-directory run produces
+   too.
+
+Point 3 is the one that failed. Points 1 and 2 were designed for and silently defeated;
+point 4 is what caught it.
+
+## Patch: --cwd is required and validated
+
+The remaining `--cwd` decision, settled: **no default at all.**
+
+### What it does now
+
+`--cwd` is required on every mode. Absent, the dispatcher exits 2 with a usage error
+before anything runs. Given, it is resolved with `realpath` — absolute, symlinks
+followed — and then it must be a git work tree root. Four refusals, all exit 2:
+
+| `--cwd` | Outcome |
+| --- | --- |
+| absent | Refused: required, never inferred |
+| a path that is not a directory | Refused: not a directory |
+| a directory containing no `.git` | Refused: not a git work tree |
+| a subdirectory of a repository | Refused, **and the error names the root** |
+
+**The stated decision on subdirectories: refused, not resolved upward.** Resolving would
+hand the agent a wider scope than the caller named, silently — the same shape of quiet
+substitution that let the inherited-directory defect live. Refusing costs one edit,
+because the error carries the root to use.
+
+`.git` is tested for as a path rather than by running `git`. A normal clone has it as a
+directory and a `git worktree add` tree has it as a file — both accepted, and the linked
+work tree case is in the suite. A bare repository has neither and is refused, correctly:
+there is no work tree to edit.
+
+This does not stop someone naming the wrong repository, and is not meant to. It stops one
+being chosen by accident, which is what happened.
+
+### The resolved path is in the record
+
+`result.json`'s `cwd` is the resolved absolute path — it always existed, but it now
+carries a value that was validated rather than defaulted, and after the previous patch it
+is also where the agent actually worked. The orchestration skill requires it to be quoted
+when a delegated run is reported:
+
+    Delegated: <agent> <mode> | tier: <TIER> | cwd: <resolved path from the result>
+
+Taken from the result rather than from what was passed in: those agree only when nothing
+went wrong, and the reason to state it is the case where something did. A run aimed at the
+wrong repository is then visible in the record instead of being reconstructed from it
+afterwards.
+
+### Suite coverage
+
+`check_cwd_validation()` runs against a real temporary directory tree — a repository, a
+subdirectory of it, a plain directory, a linked work tree whose `.git` is a file, and a
+symlink to the root:
+
+- absent `--cwd` refused
+- non-repository directory refused
+- non-existent path refused
+- a file passed where a directory belongs refused
+- subdirectory refused, and the refusal names the enclosing root
+- root accepted, and accepted through a trailing separator, a relative path, and a symlink
+- linked work tree accepted
+- `enclosing_repository()` finds the enclosing root from a subdirectory and returns `None`
+  when handed a root itself
+
+Both regressions are caught by name: restoring the default-to-cwd behaviour fails six of
+these, and refusing-versus-resolving-upward fails the subdirectory case specifically. That
+second probe matters more than it looks — it is the one that pins the stated decision, so
+the decision cannot be quietly reversed later by someone who finds the refusal
+inconvenient.
+
+### Left as they were
+
+- **`--variant`** untouched. The routing file is Phase 01 data, and effort remains
+  unverifiable on this provider.
+- **`--mode test` is still unverified against the real Codex CLI.** It is the only mode
+  never exercised live, it is the only one that gets `workspace-write`, and it is
+  therefore also where the open question about a local-socket database connection under
+  that sandbox sits. Noted, not closed.
+
+### Patch verification
+
+| Check | Result |
+| --- | --- |
+| `claude plugin validate . --strict` | `✔ Validation passed` (exit 0) |
+| `python3 tests/test_parser.py` | `38 cases, 3 timed, 8 strip, mode matrix, adapters and --cwd checked` … `ok`, exit 0 |
+| `ruff check --line-length 90` on `scripts/delegate`, `hooks/guard.py`, `tests/test_parser.py` | `All checks passed` |
+| CLI refusals, 4 shapes | Absent, `/tmp`, `./skills/orchestration`, `/nope/nothing` — all exit 2, each with its own reason; the subdirectory error names the repository root |
+| Valid root accepted | `--cwd ./` and `--cwd .` resolve to `/home/mustafa/Projects/frappe-orchestrator`, exit 0 |
+| Regression probe: default-to-cwd restored | 6 failures, including the absent case and the symlink resolution |
+| Regression probe: subdirectory resolved upward | 1 failure, naming the subdirectory case |
+| Live run under the new rules | `opencode implement`, FAST, 20.3 s, `status=completed`, `result_block=present`; the agent's `pwd` and `git rev-parse --show-toplevel` are both the requested repository |
+| Guard matrix after the deny-reason edit | 12 payloads, 0 failures; the reason now states `--cwd <repository root>` |
+| Contract amendment | The Phase 01.5 amendment covered the `--mode` enumeration; widened to what the dispatcher accepts or requires, since `--cwd` is now part of the invocation it states |
+| Working tree | Five files modified, no new file, no delegation artifact in the repository |

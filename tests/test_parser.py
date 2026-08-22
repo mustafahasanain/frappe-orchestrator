@@ -26,6 +26,8 @@ No framework and nothing to install: standard library only.
 
 import importlib.machinery
 import importlib.util
+import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -233,6 +235,80 @@ def check_matrix():
     return failures
 
 
+class Refused(Exception):
+    """What the dispatcher's `fail` does: reports and exits. Raised so a test can catch it."""
+
+
+def refuse(message):
+    raise Refused(message)
+
+
+def check_cwd_validation(tmp):
+    """--cwd is required, absolute, and a repository root - or the run does not start.
+
+    A default here is the defect: an inherited directory reads as "here" and is not. So
+    the absent case is checked as carefully as the invalid ones, and the accepted case
+    asserts the returned path is resolved rather than echoed.
+    """
+    failures = []
+
+    def real(q):
+        return os.path.realpath(str(q))
+
+    root = tmp / "repo"
+    (root / ".git").mkdir(parents=True)
+    (root / "src").mkdir()
+    (tmp / "plain").mkdir()
+    worktree = tmp / "linked"
+    worktree.mkdir()
+    (worktree / ".git").write_text("gitdir: ../repo/.git/worktrees/linked\n")
+    link = tmp / "link-to-repo"
+    link.symlink_to(root)
+
+    def refused(name, raw, expect_in):
+        try:
+            d.resolve_working_directory(raw, refuse)
+        except Refused as exc:
+            if expect_in not in str(exc):
+                failures.append("%s: refused, but the reason lacks %r" % (name, expect_in))
+        else:
+            failures.append("%s: accepted, and must not be" % name)
+
+    def accepted(name, raw, want):
+        try:
+            got = d.resolve_working_directory(raw, refuse)
+        except Refused as exc:
+            failures.append("%s: refused (%s)" % (name, str(exc)[:60]))
+            return
+        if got != want:
+            failures.append("%s: resolved to %r, wanted %r" % (name, got, want))
+
+    refused("absent --cwd", None, "required")
+    refused("directory that is not a repository", str(tmp / "plain"), "not a git work tree")
+    refused("path that does not exist", str(tmp / "missing"), "not a directory")
+    refused("a file rather than a directory", str(worktree / ".git"), "not a directory")
+    # Stated decision: a subdirectory is refused, not resolved upward. The error names the
+    # root so the fix is one edit.
+    refused("subdirectory of a repository", str(root / "src"), "subdirectory of")
+    try:
+        d.resolve_working_directory(str(root / "src"), refuse)
+    except Refused as exc:
+        if real(root) not in str(exc):
+            failures.append("subdirectory refusal does not name the repository root")
+
+    accepted("repository root", str(root), real(root))
+    accepted("trailing separator", str(root) + "/", real(root))
+    accepted("relative path", os.path.relpath(str(root)), real(root))
+    accepted("symlink to a repository root", str(link), real(root))
+    accepted("linked work tree, .git is a file", str(worktree), real(worktree))
+
+    if d.enclosing_repository(str(root / "src")) != real(root):
+        failures.append("enclosing_repository did not find the enclosing root")
+    if d.enclosing_repository(real(root)) is not None:
+        failures.append("enclosing_repository looked at the path itself, not its ancestors")
+    return failures
+
+
 def check_working_directory():
     """Every adapter must state the working directory, not inherit it.
 
@@ -321,9 +397,11 @@ def main():
 
     failures.extend("mode matrix: " + line for line in check_matrix())
     failures.extend("working directory: " + line for line in check_working_directory())
+    with tempfile.TemporaryDirectory() as tmp:
+        failures.extend("--cwd: " + line for line in check_cwd_validation(Path(tmp)))
 
     print(
-        "%d cases, %d timed, %d strip, mode matrix and working directory checked"
+        "%d cases, %d timed, %d strip, mode matrix, adapters and --cwd checked"
         % (len(CASES), len(TIMED), len(STRIP))
     )
 
