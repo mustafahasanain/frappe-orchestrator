@@ -258,17 +258,27 @@ reported as such, not as a failure.
 # --------------------------------------------------------------------------
 
 
-def adapt_opencode(*, brief, model_id, effort, mode):
-    argv = ["opencode", "run", "--agent", "build", "--auto", "--model", model_id]
+def adapt_opencode(*, brief, model_id, effort, mode, cwd):
+    # --dir, not the process working directory. Setting the child's cwd is not enough:
+    # OpenCode resolved its working directory from the inherited PWD instead, so a run
+    # launched from one repository with --cwd pointing at another operated on the first
+    # one - reading, writing and running git in a repository the dispatcher had not been
+    # asked to touch, while reporting the one it had. PWD is set to match as well, so
+    # nothing further down inherits a directory that disagrees with the process.
+    argv = [
+        "opencode", "run", "--agent", "build", "--auto",
+        "--dir", cwd, "--model", model_id,
+    ]
     if effort:
         argv += ["--variant", effort]
     argv.append(brief)
     env = dict(os.environ)
     env["OPENCODE_CONFIG_CONTENT"] = json.dumps(opencode_permissions())
+    env["PWD"] = cwd
     return argv, env, None
 
 
-def adapt_codex(*, brief, mode, **_):
+def adapt_codex(*, brief, mode, cwd, **_):
     # Both sandboxes execute model-generated shell commands - the CLI's own help for
     # --sandbox says so. What they restrict is reach: read-only permits no write and no
     # network, workspace-write confines writes to the working tree and still has no
@@ -280,7 +290,12 @@ def adapt_codex(*, brief, mode, **_):
     # above for the same argument on the other agent - and a new mode silently landing on
     # the write side of an `if mode == "review"` test is exactly how that would lapse.
     sandbox = "workspace-write" if mode == "test" else "read-only"
-    return ["codex", "exec", "--sandbox", sandbox, "-"], dict(os.environ), brief
+    # -C for the same reason --dir is passed to OpenCode. Codex was verified to honour the
+    # process working directory correctly, unlike OpenCode, but a directory this important
+    # is stated rather than inherited: the failure is silent and the run looks normal.
+    env = dict(os.environ)
+    env["PWD"] = cwd
+    return ["codex", "exec", "--sandbox", sandbox, "-C", cwd, "-"], env, brief
 
 
 ADAPTERS = {"opencode": adapt_opencode, "codex": adapt_codex}
@@ -540,7 +555,7 @@ def main():
     )
 
     argv, env, stdin_text = ADAPTERS[args.agent](
-        brief=full_brief, model_id=model_id, effort=effort, mode=args.mode
+        brief=full_brief, model_id=model_id, effort=effort, mode=args.mode, cwd=cwd
     )
 
     if args.dry_run:
@@ -552,7 +567,9 @@ def main():
                 "timeout_seconds": timeout,
                 "stdin": "brief" if stdin_text is not None else None,
                 "env_overrides": {
-                    k: v for k, v in env.items() if k == "OPENCODE_CONFIG_CONTENT"
+                    k: v
+                    for k, v in env.items()
+                    if k in ("OPENCODE_CONFIG_CONTENT", "PWD")
                 },
             },
             sys.stdout,

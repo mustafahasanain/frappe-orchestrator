@@ -223,13 +223,51 @@ def check_matrix():
     # Read-only is the default for Codex, so a mode added later cannot land on the write
     # side of the sandbox test by omission.
     for mode in d.MODES["codex"]:
-        argv, _env, _stdin = d.adapt_codex(brief="b", mode=mode)
+        argv, _env, _stdin = d.adapt_codex(brief="b", mode=mode, cwd="/probe")
         sandbox = argv[argv.index("--sandbox") + 1]
         expected = "workspace-write" if mode == "test" else "read-only"
         if sandbox != expected:
             failures.append(
                 "codex %s mode: sandbox %s, wanted %s" % (mode, sandbox, expected)
             )
+    return failures
+
+
+def check_working_directory():
+    """Every adapter must state the working directory, not inherit it.
+
+    This is here because the failure is silent and looks like success. OpenCode resolved
+    its directory from the inherited PWD rather than from the child process's cwd, so a
+    delegated run operated on whatever repository the orchestrator's shell was sitting in
+    while the dispatcher's result reported the directory it had been given. Nothing about
+    the run looked wrong: it exited 0, returned a well-formed report, and described work
+    it had done somewhere else.
+    """
+    failures = []
+    cwd = "/probe/target"
+
+    argv, env, stdin = d.adapt_opencode(
+        brief="b", model_id="p/m", effort="low", mode="implement", cwd=cwd
+    )
+    if "--dir" not in argv:
+        failures.append("opencode: no --dir; the directory would be inherited")
+    elif argv[argv.index("--dir") + 1] != cwd:
+        failures.append("opencode: --dir is not the requested directory")
+    if env.get("PWD") != cwd:
+        failures.append("opencode: PWD %r disagrees with the requested directory" % env.get("PWD"))
+    if stdin is not None or argv[-1] != "b":
+        failures.append("opencode: the brief is no longer the final argument")
+
+    for mode in d.MODES["codex"]:
+        argv, env, stdin = d.adapt_codex(brief="b", mode=mode, cwd=cwd)
+        if "-C" not in argv:
+            failures.append("codex %s: no -C; the directory would be inherited" % mode)
+        elif argv[argv.index("-C") + 1] != cwd:
+            failures.append("codex %s: -C is not the requested directory" % mode)
+        if env.get("PWD") != cwd:
+            failures.append("codex %s: PWD disagrees with the requested directory" % mode)
+        if stdin != "b" or argv[-1] != "-":
+            failures.append("codex %s: the brief is no longer delivered on stdin" % mode)
     return failures
 
 
@@ -282,9 +320,10 @@ def main():
                 failures.append("%s: %r did not survive intact" % (name, key))
 
     failures.extend("mode matrix: " + line for line in check_matrix())
+    failures.extend("working directory: " + line for line in check_working_directory())
 
     print(
-        "%d cases, %d timed, %d strip, mode matrix checked"
+        "%d cases, %d timed, %d strip, mode matrix and working directory checked"
         % (len(CASES), len(TIMED), len(STRIP))
     )
 
