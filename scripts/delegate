@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+"""Delegation dispatcher: run one coding-agent CLI against the current repository.
+
+Reads a brief on stdin, runs the requested agent CLI in the repository working tree,
+and prints a structured result as JSON. Execution mechanics only - it makes no task,
+model, or review decisions. Those belong to the orchestrator.
+
+Exit status is 0 whenever a result was produced, including a failed, timed out, or
+missing-CLI run; read the "status" field. Exit status 2 means the invocation itself
+was wrong.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+ROUTING = Path(__file__).resolve().parent.parent / "config" / "model-routing.json"
+
+# Which modes each agent may run. Codex is absent from "implement" on purpose: a
+# reviewer that writes the production code it reviews is not an independent reviewer.
+MODES = {"opencode": ("implement",), "codex": ("review", "test")}
+
+
+# --------------------------------------------------------------------------
+# Delegated OpenCode permissions
+#
+# A delegated agent runs its own shell commands inside its own process, where the
+# plugin's PreToolUse hook cannot see them. These rules are what stops a delegated
+# run from crossing the same boundaries the hook enforces. They are passed through
+# OPENCODE_CONFIG_CONTENT, which is the only config layer that outranks a target
+# repository's own opencode.json, and they are set at both the top level and on the
+# `build` agent, because agent-level permissions are resolved separately and would
+# otherwise survive untouched.
+#
+# "*": "ask" is the base rather than "allow", so a run without --auto stalls instead
+# of running anything. --auto approves asks; it cannot lift a deny.
+#
+# These mirror hooks/guard.py. If one changes, change the other.
+# --------------------------------------------------------------------------
+
+DENIED_BASH = (
+    # Push is never automatic, and there is no human inside this process to ask.
+    "git push*",
+    "git * push*",
+    # The orchestrator creates the commit after review passes. An implementer that
+    # commits mid-run bypasses diff inspection.
+    "git commit*",
+    "git * commit*",
+    # Blanket staging sweeps in unrelated work.
+    "git add .",
+    "git add . *",
+    "git add -A*",
+    "git add --all*",
+    "git add -- .*",
+    "git * add .",
+    "git * add -A*",
+    "git * add --all*",
+    # Execution against a live site database or a running Frappe instance.
+    "bench console*",
+    "bench mariadb*",
+    "bench execute*",
+    "bench --site*",
+    "bench -s *",
+    "bench * console*",
+    "bench * mariadb*",
+    "bench * execute*",
+    "mysql*",
+    "mariadb*",
+)
+
+
+def opencode_permissions():
+    """Permission config for a delegated OpenCode run, as a JSON-ready dict."""
+    rules = {"*": "ask"}
+    rules.update({pattern: "deny" for pattern in DENIED_BASH})
+    block = {"bash": rules}
+    return {"permission": block, "agent": {"build": {"permission": block}}}
+
+
+# --------------------------------------------------------------------------
+# Output contracts
+#
+# Appended to every brief by the dispatcher rather than left to the caller, so the
+# result contract holds even when the orchestrator forgets to ask for it.
+# --------------------------------------------------------------------------
+
+_TAIL = """End your reply with exactly one fenced JSON block and nothing after it:
+
+```json
+%s
+```
+"""
+
+CONTRACTS = {
+    "implement": """## Requested output
+
+Make the change in the repository working tree. Read the files you need directly;
+do not ask for them to be pasted.
+
+"""
+    + _TAIL
+    % json.dumps(
+        {
+            "status": "completed | incomplete",
+            "summary": "<two sentences at most>",
+            "touched_files": ["<repository-relative path>"],
+            "commands_run": ["<command>"],
+            "tests_run": ["<command>"],
+            "warnings": ["<anything the orchestrator should know>"],
+        },
+        indent=2,
+    )
+    + """
+"completed" means your execution finished. It does not mean the change is correct -
+an independent reviewer decides that. Report what you actually did, including work
+you could not finish.
+""",
+    "review": """## Requested output
+
+You are reviewing, not implementing. Do not modify production code. Inspect the
+actual diff and the affected code, run the tests that the change actually warrants,
+and report what you find.
+
+Use "blocking" only for findings that must be fixed before this can be committed:
+incorrect behaviour, regression, failing required test, data corruption risk,
+permission problem, missing required behaviour, unsafe implementation. Everything
+else is "non_blocking" and will not trigger rework.
+
+Return BLOCKED, not FAIL, when verification could not be completed reliably - a
+missing dependency, an unavailable service, a broken test environment. BLOCKED is
+not a verdict on the implementation.
+
+"""
+    + _TAIL
+    % json.dumps(
+        {
+            "verdict": "PASS | FAIL | BLOCKED",
+            "blocker_reason": "<only when BLOCKED>",
+            "summary": "<two sentences at most>",
+            "findings": [
+                {
+                    "category": "blocking | non_blocking",
+                    "file": "<repository-relative path>",
+                    "detail": "<what is wrong and why it matters>",
+                }
+            ],
+            "tests_run": ["<command>"],
+            "missing_coverage": ["<behaviour a test should protect but none does>"],
+        },
+        indent=2,
+    ),
+    "test": """## Requested output
+
+You may create or modify test files only. Do not modify production code; if the fix
+belongs in production code, say so in a finding instead of making it.
+
+Write the smallest tests that establish whether the behaviour under review is
+correct, run them, and report the outcome.
+
+"""
+    + _TAIL
+    % json.dumps(
+        {
+            "verdict": "PASS | FAIL | BLOCKED",
+            "blocker_reason": "<only when BLOCKED>",
+            "summary": "<two sentences at most>",
+            "findings": [
+                {
+                    "category": "blocking | non_blocking",
+                    "file": "<repository-relative path>",
+                    "detail": "<what is wrong and why it matters>",
+                }
+            ],
+            "tests_added": ["<repository-relative path>"],
+            "tests_run": ["<command>"],
+        },
+        indent=2,
+    ),
+}
+
+
+# --------------------------------------------------------------------------
+# Adapters - the only agent-specific code in this file.
+# Each returns (argv, env, stdin_text). stdin_text is None when the brief is
+# delivered as an argument instead.
+# --------------------------------------------------------------------------
+
+
+def adapt_opencode(*, brief, model_id, effort, mode):
+    argv = ["opencode", "run", "--agent", "build", "--auto", "--model", model_id]
+    if effort:
+        argv += ["--variant", effort]
+    argv.append(brief)
+    env = dict(os.environ)
+    env["OPENCODE_CONFIG_CONTENT"] = json.dumps(opencode_permissions())
+    return argv, env, None
+
+
+def adapt_codex(*, brief, mode, **_):
+    # read-only cannot write or run commands; workspace-write is confined to the
+    # working tree and has no network access, so TEST mode can add tests and run
+    # them but cannot reach a remote.
+    sandbox = "read-only" if mode == "review" else "workspace-write"
+    return ["codex", "exec", "--sandbox", sandbox, "-"], dict(os.environ), brief
+
+
+ADAPTERS = {"opencode": adapt_opencode, "codex": adapt_codex}
+
+
+# --------------------------------------------------------------------------
+# Routing lookup
+# --------------------------------------------------------------------------
+
+
+def load_routing(fail):
+    try:
+        return json.loads(ROUTING.read_text())
+    except (OSError, ValueError) as exc:
+        fail("cannot read %s: %s" % (ROUTING, exc))
+
+
+def resolve_model(routing, name, fail):
+    """Display name -> provider CLI id, refusing anything not delegable."""
+    models = routing.get("models") or {}
+    entry = models.get(name)
+    if entry is None:
+        fail(
+            'unknown model "%s". Names in %s: %s'
+            % (name, ROUTING, ", ".join(sorted(models)) or "none")
+        )
+    executor = entry.get("executor")
+    if executor != "opencode":
+        fail(
+            '"%s" has executor "%s" in the routing file, not "opencode". Claude '
+            "implements that tier directly with its own access, then delegates the "
+            "review to Codex. Do not delegate it to OpenCode." % (name, executor)
+        )
+    model_id = entry.get("id")
+    if not model_id or (model_id.startswith("<") and model_id.endswith(">")):
+        fail(
+            '"%s" has no provider CLI id in %s (found %r). Fill it in before '
+            "delegating to this model." % (name, ROUTING, model_id)
+        )
+    return model_id
+
+
+# --------------------------------------------------------------------------
+# Execution
+# --------------------------------------------------------------------------
+
+
+def execute(argv, env, stdin_text, cwd, timeout):
+    """Run the CLI. Returns (status, exit_code, stdout, stderr, seconds)."""
+    started = time.monotonic()
+    try:
+        proc = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as exc:
+        return "error", None, "", str(exc), time.monotonic() - started
+
+    try:
+        out, err = proc.communicate(input=stdin_text, timeout=timeout)
+        status = "completed" if proc.returncode == 0 else "failed"
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, err = proc.communicate()
+        status = "timeout"
+    return status, proc.returncode, out, err, time.monotonic() - started
+
+
+JSON_BLOCK = re.compile(r"```json\s*(.*?)```", re.DOTALL)
+
+
+def extract_report(text):
+    """Last fenced JSON block of the agent's output -> (state, parsed or None)."""
+    blocks = JSON_BLOCK.findall(text or "")
+    if not blocks:
+        return "missing", None
+    try:
+        return "present", json.loads(blocks[-1])
+    except ValueError:
+        return "invalid", None
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="delegate",
+        description="Run one coding-agent CLI against the current repository. "
+        "The brief is read from stdin.",
+    )
+    parser.add_argument("--agent", required=True, choices=sorted(MODES))
+    parser.add_argument("--mode", required=True, choices=("implement", "review", "test"))
+    parser.add_argument(
+        "--tier", required=True, choices=("FAST", "SMALL", "NORMAL", "DIFFICULT")
+    )
+    parser.add_argument("--model", help="display name from the routing file")
+    parser.add_argument("--effort", help="defaults to the tier's effort")
+    parser.add_argument("--cwd", help="defaults to the current directory")
+    parser.add_argument("--timeout", type=int, help="defaults to the tier's timeout")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the command that would run, and do not run it",
+    )
+    args = parser.parse_args()
+    fail = parser.error  # exits 2
+
+    if args.mode not in MODES[args.agent]:
+        if args.agent == "codex" and args.mode == "implement":
+            fail(
+                "Codex does not implement. It reviews the production code it did not "
+                "write, which is what makes the review independent. Delegate "
+                "implementation to OpenCode, or implement it directly when the "
+                "routing file gives that model executor \"claude\"."
+            )
+        fail(
+            "--agent %s supports --mode %s"
+            % (args.agent, " or ".join(MODES[args.agent]))
+        )
+
+    routing = load_routing(fail)
+
+    tier = (routing.get("tiers") or {}).get(args.tier)
+    if tier is None:
+        fail('tier "%s" is not in %s' % (args.tier, ROUTING))
+    timeout = args.timeout or tier.get("timeout_seconds")
+    if not timeout:
+        fail('tier "%s" has no timeout_seconds in %s' % (args.tier, ROUTING))
+
+    if args.agent == "opencode":
+        if not args.model:
+            fail("--model is required for --agent opencode")
+        model_id = resolve_model(routing, args.model, fail)
+        effort = args.effort or tier.get("effort")
+    else:
+        if args.model:
+            fail(
+                "--model is not accepted for --agent codex; Codex is not pinned to a "
+                "model and uses its own CLI default."
+            )
+        model_id, effort = None, None
+
+    brief = "" if sys.stdin.isatty() else sys.stdin.read()
+    if not brief.strip():
+        if not args.dry_run:
+            fail("the brief is read from stdin and was empty")
+        brief = "(dry run: no brief supplied)"
+
+    cwd = os.path.abspath(args.cwd or os.getcwd())
+    if not os.path.isdir(cwd):
+        fail("--cwd is not a directory: %s" % cwd)
+
+    # The leading heading also guarantees the brief never starts with "-" when it is
+    # passed as a positional argument.
+    full_brief = "# Delegated task (%s)\n\n%s\n\n%s" % (
+        args.mode,
+        brief.strip(),
+        CONTRACTS[args.mode],
+    )
+
+    argv, env, stdin_text = ADAPTERS[args.agent](
+        brief=full_brief, model_id=model_id, effort=effort, mode=args.mode
+    )
+
+    if args.dry_run:
+        json.dump(
+            {
+                "dry_run": True,
+                "argv": argv,
+                "cwd": cwd,
+                "timeout_seconds": timeout,
+                "stdin": "brief" if stdin_text is not None else None,
+                "env_overrides": {
+                    k: v for k, v in env.items() if k == "OPENCODE_CONFIG_CONTENT"
+                },
+            },
+            sys.stdout,
+            indent=2,
+        )
+        print()
+        return
+
+    # Outside the repository, so delegation artifacts never reach the working tree.
+    workspace = Path(tempfile.mkdtemp(prefix="delegate-%s-%s-" % (args.agent, args.mode)))
+    (workspace / "brief.md").write_text(full_brief)
+    # Echoed early so the workspace is recoverable if this process is killed.
+    print("workspace: %s" % workspace, file=sys.stderr)
+
+    if shutil.which(argv[0]) is None:
+        status, code, out, err, seconds = "cli_missing", None, "", "", 0.0
+    else:
+        status, code, out, err, seconds = execute(argv, env, stdin_text, cwd, timeout)
+
+    (workspace / "agent-output.txt").write_text(out)
+    (workspace / "agent-stderr.txt").write_text(err)
+    block_state, report = extract_report(out)
+
+    result = {
+        "status": status,
+        "agent": args.agent,
+        "mode": args.mode,
+        "tier": args.tier,
+        "model": args.model,
+        "model_id": model_id,
+        "effort": effort,
+        "exit_code": code,
+        "duration_seconds": round(seconds, 1),
+        "timeout_seconds": timeout,
+        "cwd": cwd,
+        "workspace": str(workspace),
+        "transcript": str(workspace / "agent-output.txt"),
+        "result_block": block_state,
+        "agent_report": report,
+    }
+
+    if status == "cli_missing":
+        result["error"] = (
+            "%s is not installed or not on PATH. Nothing was run." % argv[0]
+        )
+    elif status == "error":
+        result["error"] = err
+    elif status == "timeout":
+        # A timeout is a blocker, not a verdict on the implementation.
+        result["blocker_reason"] = "timeout"
+        if args.mode in ("review", "test"):
+            result["verdict"] = "BLOCKED"
+
+    (workspace / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+    json.dump(result, sys.stdout, indent=2)
+    print()
+
+
+main()

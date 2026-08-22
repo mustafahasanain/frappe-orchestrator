@@ -1,25 +1,53 @@
 {
   "version": 1,
+  "models": {
+    "Kimi K2.6": {
+      "executor": "opencode",
+      "id": "<supply provider id>"
+    },
+    "Kimi K2.7 Code": {
+      "executor": "opencode",
+      "id": "<supply provider id>"
+    },
+    "Kimi K3": {
+      "executor": "opencode",
+      "id": "<supply provider id>"
+    },
+    "GLM-5.2": {
+      "executor": "opencode",
+      "id": "opencode/glm-5.2"
+    },
+    "Claude Sonnet 5": {
+      "executor": "claude"
+    },
+    "Claude Opus": {
+      "executor": "claude"
+    }
+  },
   "tiers": {
     "FAST": {
       "model": "Kimi K2.6",
       "effort": "low",
+      "timeout_seconds": 180,
       "description": "Extremely clear, low risk, mechanical, very limited scope; latency is the priority."
     },
     "SMALL": {
       "model": "Kimi K2.7 Code",
       "effort": "low",
+      "timeout_seconds": 420,
       "description": "Clear requirement, limited scope, one or a few related files, no architecture impact, low regression risk."
     },
     "NORMAL": {
       "model": "Kimi K2.7 Code",
       "effort": "medium",
+      "timeout_seconds": 900,
       "description": "Normal feature development, several related files, moderate business logic, manageable regression risk."
     },
     "DIFFICULT": {
       "model": "Claude Sonnet 5",
       "effort": "medium",
       "effort_upgrade": "high",
+      "timeout_seconds": 1800,
       "description": "Subtle business logic, hard debugging, permissions, integration behaviour, data integrity, concurrency, complex migrations, architectural decisions, high ambiguity, or previous implementation failure. Raise effort to high when reasoning complexity or risk justifies it."
     }
   },

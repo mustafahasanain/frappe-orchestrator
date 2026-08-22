@@ -81,10 +81,10 @@ Not every project uses every structure listed. Inspection stays targeted.
 
 ### Who runs the analysis
 
-Claude performs the onboarding analysis directly, read-only, using the strategy above.
-Once the Phase 03 dispatcher exists, it is delegated to Codex in REVIEW mode — read-only,
-targeted repository analysis rather than diff review, returning concise structured
-findings that Claude validates.
+The onboarding analysis is delegated to Codex in REVIEW mode — read-only, targeted
+repository analysis rather than diff review, returning concise structured findings that
+Claude validates. When Codex is unavailable, Claude performs it directly, read-only,
+using the strategy above.
 
 Claude owns the resulting context in both cases. A project Claude built from the start
 needs no onboarding scan; write the context directly.
@@ -119,8 +119,8 @@ the known regression risks. Blind implementation is what this prevents.
 
 ## Post-implementation impact validation
 
-After implementation, impact is recalculated against the real diff — by Codex once the
-Phase 03 dispatcher exists, and these are the rules it executes.
+After implementation, impact is recalculated against the real diff by Codex in REVIEW
+mode. These are the rules it executes.
 
 Inputs: the preliminary impact line, the actual Git diff, the AI context, and targeted
 code inspection.

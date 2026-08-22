@@ -85,17 +85,19 @@ AI context: read it, or bootstrap it if missing
    ↓
 Impact analysis  →  targeted reads
    ↓
-Delegate implementation (OpenCode)
+Implementation — delegated, or your own (see Who implements)
    ↓
-Codex review  +  impact re-check against the real diff
+Actual Git diff
    ↓
-Pass?  ── no ──→ fix loop (max 3 attempts) ──→ stop and report to user
-   │
-  yes
+Required environment operations, if any
    ↓
-Context update, only if important project knowledge changed
+Re-inspect the diff if they changed the working tree
    ↓
-Local commit
+Codex REVIEW  +  impact re-check against the real diff
+   ↓
+PASS ─────→ context update if project knowledge changed ─→ cleanup ─→ local commit
+FAIL ─────→ fix loop (max 3 attempts) ──→ stop and report to user
+BLOCKED ──→ resolve safely, or stop and ask
 ```
 
 ## Task classification
@@ -143,6 +145,20 @@ ${CLAUDE_PLUGIN_ROOT}/config/model-routing.json
 Read the tier from that file. Never hardcode a model name here or in any other skill, and
 never create a second routing mechanism — model availability changes there and nowhere
 else.
+
+### Who implements
+
+Every model in the routing file carries an `executor`. Read it from the file; never
+infer it from the model's name.
+
+- **`opencode`** — delegate the implementation through the dispatcher.
+- **`claude`** — implement it yourself, with your own access. These models have no
+  provider CLI id and no dispatcher call for the implementation step. The DIFFICULT
+  tier and the Claude Opus escalation rung are both `claude`.
+
+Implementing directly is not a shortcut around the workflow. The preamble, the impact
+line, the Codex review, the bounded fix loop, and the commit rules all apply
+unchanged. The only difference is who writes the code.
 
 ### Escalation ladder
 
@@ -200,19 +216,126 @@ Classify FAST / SMALL → read the relevant context → lightweight impact check
 The fast path must not automatically perform architecture planning, broad repository
 analysis, agent debate, repository-wide regression testing, or heavy documentation work.
 
-## Delegation briefs
+## Delegation
 
-Send a concise, self-contained brief. Include only what the implementer needs: the goal,
-the required behaviour, relevant constraints, files or areas already known to be relevant,
-what must not change, and the verification expectations.
+One dispatcher runs every agent CLI:
+
+```text
+${CLAUDE_PLUGIN_ROOT}/scripts/delegate
+```
+
+The brief goes in on stdin; the result comes back as JSON on stdout.
+
+```text
+delegate --agent opencode --mode implement --tier <TIER> --model "<name from routing file>"
+delegate --agent codex    --mode review    --tier <TIER>
+delegate --agent codex    --mode test      --tier <TIER>
+```
+
+Those three are the only valid combinations, and the dispatcher refuses the rest.
+Codex never implements: a reviewer that writes the code it reviews is not independent.
+
+The provider model id, effort, and timeout come from the routing file. `--effort`,
+`--timeout`, and `--cwd` override them when needed.
+
+NORMAL and DIFFICULT timeouts are longer than a foreground command may run, so start
+those in the background and collect the result when it finishes. The dispatcher prints
+its workspace path to stderr immediately, so a run that is cut off short is still
+recoverable there.
+
+### Briefs
+
+Send a concise, self-contained brief: the goal, the required behaviour, relevant
+constraints, files or areas already known to be relevant, what must not change, and the
+verification expectations. Carry over the affected area, its direct dependencies, and
+the known regression risks from the impact analysis.
 
 Do not read repository files and copy their contents into the brief. Agents read the
 repository directly. Large source dumps are only acceptable when there is genuinely no
 other way.
 
-Results returned to you should be concise by default: status, short summary, files
-changed, tests or commands run, failures, concerns, exit status. Request detailed output
-only when you need it to diagnose something.
+The dispatcher appends the output contract itself. Do not write one.
+
+### Reading the result
+
+Top-level fields are what the dispatcher observed. `agent_report` is what the agent
+claimed. Keep the two apart.
+
+- `status` — whether the CLI run finished: `completed`, `failed`, `timeout`,
+  `cli_missing`, `error`. `completed` means the process exited cleanly and nothing more.
+- `result_block` — `missing` or `invalid` means the agent returned no usable report.
+  Read the file at `transcript` before concluding anything.
+- `agent_report` — the agent's own account of its work. **An implementation agent's
+  self-report is never verification.** Only the actual diff and an independent review
+  are.
+
+## The actual diff is authoritative
+
+After any implementation, delegated or your own, inspect the real repository state with
+`git status` and `git diff`, or appropriately scoped equivalents.
+
+Compare four things: the original task, the preliminary impact analysis, the
+implementation result, and the actual diff. Where the summary and the diff disagree, the
+diff is what happened.
+
+## Environment operations
+
+Some projects need local environment commands to run after implementation before a
+review means anything. If any ran and changed the working tree, inspect the diff again
+before delegating the review.
+
+None are defined yet, so this step is currently a no-op.
+
+## Review outcome
+
+Codex returns exactly one of three states.
+
+- **PASS** — requested behaviour implemented, no blocking regression, required tests and
+  relevant quality gates pass, diff within scope. Continue to the context check, cleanup,
+  and commit.
+- **FAIL** — a blocking correctness problem. Send the blocking findings to the
+  implementer and enter the fix loop.
+- **BLOCKED** — verification could not be completed reliably. This is not an
+  implementation failure and does not consume an attempt on its own.
+
+Findings are `blocking` or `non_blocking`. Only blocking findings trigger another
+attempt. Surface non-blocking ones when useful, but never expand the task merely to
+clear them.
+
+### Handling BLOCKED
+
+Decide which kind of blocker it is.
+
+- **Safe and local** — a dependency to install in the project, a local test service to
+  start, generated files to rebuild, a local command that failed for an environment
+  reason. Resolve it inside the autonomy boundary, then retry verification.
+- **Unsafe or external** — a remote server, a destructive database change, production
+  access, missing credentials, an ambiguous external service. Stop and ask the user.
+
+A `timeout` is a blocker, not a verdict on the code. Retry, escalate, or stop based on
+context; do not record it as a failed attempt.
+
+## Tests
+
+Verification scope follows the impact, not the tier alone: the smallest set of checks
+that gives reasonable confidence. FAST is a diff review plus one relevant check; SMALL
+adds the affected tests; NORMAL adds targeted tests and the relevant lint, type, and
+build checks; DIFFICULT may add integration and full-module tests. The full suite still
+requires a stated reason.
+
+Codex REVIEW runs the tests that already exist. Use `--mode test` only when meaningful
+coverage is genuinely missing, not for every small task. In that mode Codex may write and
+modify tests, never production code.
+
+Decide which new tests survive:
+
+- **Durable** — reproduces a fixed bug, protects important business logic, verifies newly
+  introduced behaviour, protects an integration contract, or covers a previously missing
+  high-risk scenario. It stays, and is committed with the task.
+- **Temporary** — a reproduction script, a debug assertion, a one-off diagnostic. It is
+  removed before the commit.
+
+Codex does not decide persistence on its own.
 
 ## Implementation / review loop
 
@@ -223,7 +346,11 @@ Never run an unlimited autonomous loop. **Maximum three implementation attempts.
    them, then Codex re-reviews. The second brief carries only the new findings and the
    context needed for them; do not resend the full original task.
 3. **Attempt 3** — if the second attempt still fails, move one step up the escalation
-   ladder and let the escalated model fix or reimplement, then Codex reviews.
+   ladder and let the escalated model fix or reimplement, then Codex reviews. If that
+   rung's executor is `claude`, the attempt is yours to implement directly.
+
+After every fix, Codex reviews again against the *current* actual diff, not the previous
+one.
 
 ### Stop condition
 
@@ -265,6 +392,11 @@ Inspect `git status` before starting implementation.
 
 Commit automatically only after the quality gates pass. Propose a short conventional
 commit message, stage only the files belonging to the current task, then commit locally.
+
+Before staging, verify that no temporary diagnostic files remain, no delegation artifacts
+entered the repository, no unrelated dirty files are included, durable tests are retained,
+required documentation is updated, and the diff matches the task scope. Generated build
+artifacts are staged only when the project already tracks them in Git.
 
 Never use `git add .` or `git add -A` as the staging mechanism. Stage task-owned files
 explicitly, by path.
