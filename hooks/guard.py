@@ -57,7 +57,7 @@ ADD_REASON = (
 
 AGENT_REASON = (
     "Coding agents run through the dispatcher, not directly. Use `" + DELEGATE + " "
-    "--agent <opencode|codex> --mode <implement|review|test> --tier <TIER> "
+    "--agent <opencode|codex> --mode <implement|review|test|onboard> --tier <TIER> "
     "[--model \"<name from the routing file>\"]` with the brief on stdin. The "
     "dispatcher supplies the model and timeout from central routing, the permission "
     "policy that holds a delegated run inside the same boundaries enforced here, and "

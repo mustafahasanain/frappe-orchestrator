@@ -81,10 +81,17 @@ Not every project uses every structure listed. Inspection stays targeted.
 
 ### Who runs the analysis
 
-The onboarding analysis is delegated to Codex in REVIEW mode — read-only, targeted
-repository analysis rather than diff review, returning concise structured findings that
-Claude validates. When Codex is unavailable, Claude performs it directly, read-only,
-using the strategy above.
+The onboarding analysis is delegated to Codex in ONBOARD mode — read-only, targeted
+repository analysis, returning concise structured findings that Claude validates.
+
+It is not a review, and it does not run in review mode. There is no diff, there is
+nothing to pass or fail, and the mode's contract has no verdict field. What comes back is
+`findings`, each with the paths it was established from, and `uncertain` for what the
+repository did not settle. None of it enters the PASS/FAIL/BLOCKED logic, and an analysis
+that returned findings is not a failed review — findings are the product here.
+
+When Codex is unavailable, Claude performs it directly, read-only, using the strategy
+above.
 
 Claude owns the resulting context in both cases. A project Claude built from the start
 needs no onboarding scan; write the context directly.
@@ -120,7 +127,8 @@ the known regression risks. Blind implementation is what this prevents.
 ## Post-implementation impact validation
 
 After implementation, impact is recalculated against the real diff by Codex in REVIEW
-mode. These are the rules it executes.
+mode — correctly so, unlike onboarding: there is a diff, and what this produces is part
+of the review's verdict. These are the rules it executes.
 
 Inputs: the preliminary impact line, the actual Git diff, the AI context, and targeted
 code inspection.

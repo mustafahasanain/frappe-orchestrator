@@ -115,6 +115,14 @@ fourth rule, added to `hooks/guard.py` under the same constraints as the other t
 Later phases that add a component the hook should guard follow the same route: report the
 command shape, and amend Phase 01.5 rather than widening their own scope.
 
+**Amendment: keeping the deny reason accurate.** The bare-agent deny reason states the
+dispatcher invocation an agent should use instead, including the `--mode` values the
+dispatcher accepts. That enumeration is a fact about the dispatcher, so a phase that
+changes the dispatcher's mode set may update that string here, and only that string. A
+stale list is not a cosmetic problem: the reason text is the instruction an agent reads at
+the moment it is blocked, so a mode missing from it is a mode the agent is told does not
+exist. Any change to the hook's *rules* still belongs to Phase 01.5 alone.
+
 ### Phase 02 — Project Context & Impact
 
 Allowed:

@@ -24,7 +24,18 @@ ROUTING = Path(__file__).resolve().parent.parent / "config" / "model-routing.jso
 
 # Which modes each agent may run. Codex is absent from "implement" on purpose: a
 # reviewer that writes the production code it reviews is not an independent reviewer.
-MODES = {"opencode": ("implement",), "codex": ("review", "test")}
+MODES = {"opencode": ("implement",), "codex": ("review", "test", "onboard")}
+
+# Every mode the dispatcher knows, derived from the matrix above so a new row is the only
+# place a mode is declared. `--mode` accepts exactly these, and CONTRACTS and
+# REPORT_DISCRIMINATORS must cover the same set.
+MODE_NAMES = tuple(sorted({mode for modes in MODES.values() for mode in modes}))
+
+# Modes whose contract has a verdict. The others deliberately have none: an onboarding
+# analysis has nothing to pass or fail, and a verdict it never gave is indistinguishable
+# from one it did at the point the orchestrator consumes it. Nothing in this file may
+# invent a verdict for a mode that is not listed here.
+VERDICT_MODES = frozenset({"review", "test"})
 
 
 # --------------------------------------------------------------------------
@@ -182,6 +193,61 @@ correct, run them, and report the outcome.
         },
         indent=2,
     ),
+    "onboard": """## Requested output
+
+You are analysing this repository so that its structure can be documented. There is no
+diff and nothing to judge here: do not review the code, do not rate its quality, and do
+not modify anything.
+
+Establish the project type, the major directories, the entry points, configuration,
+dependencies, tests, the architecture boundaries, and the areas carrying the important
+business behaviour. Read only the code needed to establish those; do not read the
+repository exhaustively.
+
+Reading the repository is the whole task. Do not run the project's test suite, and do not
+execute anything against a database, a site, or a running instance of the application - a
+command that needs a live service is out of scope here even when it looks like the
+quickest way to settle a question. Answer from the repository or record the question as
+unsettled.
+
+Every finding must be checkable against a path you actually read. Anything the repository
+did not settle belongs in "uncertain", not in a finding. An assumption reported as a fact
+is worse here than an admitted gap, because what you return is written into the project's
+own documentation and later tasks are planned from it.
+
+This contract has no verdict field. Report what you found.
+
+"""
+    + _TAIL
+    % json.dumps(
+        {
+            "analysis": "complete | partial",
+            "not_analysed": ["<area you did not reach; only when partial>"],
+            "summary": "<two sentences at most>",
+            "findings": [
+                {
+                    "area": "project | architecture | operations",
+                    "detail": "<what is there, stated so it can be verified>",
+                    "evidence": ["<repository-relative path you read>"],
+                }
+            ],
+            "uncertain": ["<something the repository did not settle>"],
+        },
+        indent=2,
+    )
+    + """
+"analysis" describes your own coverage, not the state of the project. "complete" means you
+established the areas listed above; "partial" means you did not, and "not_analysed" says
+which ones. Neither value is a judgement on the repository, and neither is a pass or a
+fail.
+
+"findings" carries the substance. An analysis that produced none is a real outcome and is
+reported as such, not as a failure.
+
+"area" says which part of the project documentation a finding belongs to: orientation
+("project"), change impact ("architecture"), or how to run, test and verify
+("operations").
+""",
 }
 
 
@@ -203,10 +269,17 @@ def adapt_opencode(*, brief, model_id, effort, mode):
 
 
 def adapt_codex(*, brief, mode, **_):
-    # read-only cannot write or run commands; workspace-write is confined to the
-    # working tree and has no network access, so TEST mode can add tests and run
-    # them but cannot reach a remote.
-    sandbox = "read-only" if mode == "review" else "workspace-write"
+    # Both sandboxes execute model-generated shell commands - the CLI's own help for
+    # --sandbox says so. What they restrict is reach: read-only permits no write and no
+    # network, workspace-write confines writes to the working tree and still has no
+    # network, so TEST mode can add tests and run them but cannot reach a remote.
+    #
+    # The condition names the one mode that needs to write, so a mode added later gets
+    # read-only by default rather than write access by omission. This is the layer that
+    # holds a delegated Codex run inside the boundary - see the OpenCode permission note
+    # above for the same argument on the other agent - and a new mode silently landing on
+    # the write side of an `if mode == "review"` test is exactly how that would lapse.
+    sandbox = "workspace-write" if mode == "test" else "read-only"
     return ["codex", "exec", "--sandbox", sandbox, "-"], dict(os.environ), brief
 
 
@@ -289,6 +362,7 @@ REPORT_DISCRIMINATORS = {
     "implement": ("status", frozenset({"completed", "incomplete"})),
     "review": ("verdict", frozenset({"pass", "fail", "blocked"})),
     "test": ("verdict", frozenset({"pass", "fail", "blocked"})),
+    "onboard": ("analysis", frozenset({"complete", "partial"})),
 }
 
 # Bounds on untrusted output. Parsing happens after the CLI has exited, so the process
@@ -323,6 +397,32 @@ def _reports(text, mode):
             continue
         if isinstance(parsed, dict) and _is_report(parsed, mode):
             yield parsed
+
+
+# Keys that carry a verdict. In a mode whose contract has none, an agent that volunteers
+# one is producing exactly the artefact this separation exists to prevent, so it is
+# removed rather than passed through.
+VERDICT_KEYS = ("verdict", "blocker_reason")
+
+
+def strip_off_contract(report, mode):
+    """Remove volunteered verdict keys from a report in a mode that has no verdict.
+
+    Returns the keys removed, in order, so the caller can record them.
+
+    An agent writes what it writes. A mode without a verdict cannot stop one appearing in
+    the agent's JSON - it can only refuse to hand it on as though the contract had asked
+    for it. A verdict nobody asked for is indistinguishable, at the point the orchestrator
+    reads `agent_report`, from one a reviewer actually reached; that is the whole reason
+    these modes have no verdict field. Removing it loses nothing that was ever asked for,
+    and the rest of the report stays intact because the analysis is still the product.
+    """
+    if report is None or mode in VERDICT_MODES:
+        return []
+    removed = [key for key in VERDICT_KEYS if key in report]
+    for key in removed:
+        del report[key]
+    return removed
 
 
 def extract_report(text, mode):
@@ -367,7 +467,7 @@ def main():
         "The brief is read from stdin.",
     )
     parser.add_argument("--agent", required=True, choices=sorted(MODES))
-    parser.add_argument("--mode", required=True, choices=("implement", "review", "test"))
+    parser.add_argument("--mode", required=True, choices=MODE_NAMES)
     parser.add_argument(
         "--tier", required=True, choices=("FAST", "SMALL", "NORMAL", "DIFFICULT")
     )
@@ -475,6 +575,7 @@ def main():
     (workspace / "agent-output.txt").write_text(out)
     (workspace / "agent-stderr.txt").write_text(err)
     block_state, report = extract_report(out, args.mode)
+    off_contract = strip_off_contract(report, args.mode)
 
     # --variant is the only argument this dispatcher passes whose accepted values are
     # not verified against the CLI; they are provider-specific. A CLI that rejects an
@@ -498,6 +599,7 @@ def main():
         "workspace": str(workspace),
         "transcript": str(workspace / "agent-output.txt"),
         "result_block": block_state,
+        "off_contract_keys": off_contract,
         "agent_report": report,
     }
 
@@ -520,7 +622,7 @@ def main():
     elif status == "timeout":
         # A timeout is a blocker, not a verdict on the implementation.
         result["blocker_reason"] = "timeout"
-        if args.mode in ("review", "test"):
+        if args.mode in VERDICT_MODES:
             result["verdict"] = "BLOCKED"
 
     (workspace / "result.json").write_text(json.dumps(result, indent=2) + "\n")

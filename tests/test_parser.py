@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the delegation dispatcher's result parser.
+"""Tests for the delegation dispatcher's result contracts.
 
     python3 tests/test_parser.py
 
@@ -7,6 +7,14 @@ The parser is the one component of this plugin that fails silently. A missing CL
 malformed routing file, a wrong hook decision - all announce themselves. A parser that
 returns the wrong object hands the orchestrator a plausible-looking report that nobody
 questions, so it is the piece that earns coverage.
+
+Two things beyond the parser earn it for the same reason, and both were added when
+onboarding was given its own mode. The mode matrix is checked here because a mode
+declared in one of the three tables and forgotten in the others fails at the point of use
+rather than at the point of the mistake. And a verdict that no contract asked for is
+checked here because it is the defect that motivated the mode: a FAIL that is a contract
+artefact rather than a judgement is, where the orchestrator reads it, indistinguishable
+from a real one.
 
 Two fixtures are real captured stdout from `codex exec`, not invented samples. The
 inner-fence one is the output that broke the previous parser: its own `detail` string
@@ -18,7 +26,6 @@ No framework and nothing to install: standard library only.
 
 import importlib.machinery
 import importlib.util
-import json
 import time
 from pathlib import Path
 
@@ -48,7 +55,12 @@ FOOTER = "\ntokens used\n10,078\n"
 BLOCK = '```json\n{"verdict": "PASS", "summary": "s", "findings": []}\n```'
 DEEP = '{"a":' * 10000 + "1" + "}" * 10000
 
-# (name, mode, text, expected state, expected discriminator or None)
+ONBOARD = ('{"analysis": "complete", "summary": "s", "findings": [], '
+           '"uncertain": []}')
+
+# (name, mode, text, expected state, expected discriminator value or None)
+# The discriminator compared is the mode's own, read from the dispatcher, so a mode with a
+# different key needs no special case here.
 CASES = [
     # --- real captured output ---------------------------------------------
     ("real codex output", "review", fixture("codex-review-clean.txt"), "present", "PASS"),
@@ -94,6 +106,22 @@ CASES = [
      '{"status":"connected","summary":"s"}', "missing", None),
     ("a review report is not an implement report", "implement", BLOCK, "invalid", None),
 
+    # --- onboard: a contract with no verdict -------------------------------
+    ("onboard report", "onboard", ONBOARD, "present", "complete"),
+    ("partial analysis is a report, not a failure", "onboard",
+     '{"analysis":"partial","not_analysed":["tests"],"findings":[]}', "present", "partial"),
+    ("onboard report in a banner", "onboard", BANNER + "```json\n" + ONBOARD + "\n```" + FOOTER,
+     "present", "complete"),
+    ("onboard discriminator compared casefolded", "onboard", '{"analysis":"COMPLETE"}',
+     "present", "COMPLETE"),
+    ("off-contract analysis value rejected", "onboard", '{"analysis":"PASS","summary":"s"}',
+     "missing", None),
+    ("a review report is not an onboard report", "onboard", BLOCK, "invalid", None),
+    ("an implement report is not an onboard report", "onboard",
+     '{"status":"completed","summary":"s"}', "missing", None),
+    ("an onboard report is not a review report", "review", ONBOARD, "missing", None),
+    ("an onboard report is not an implement report", "implement", ONBOARD, "missing", None),
+
     # --- states ------------------------------------------------------------
     ("fence present but nothing parses", "review", "```json\n{oops}\n```", "invalid", None),
     ("truncated JSON, no fence", "review", '{"verdict":', "missing", None),
@@ -124,6 +152,87 @@ TIMED = [
      '{"x":' * 20000 + "0" + "}" * 20000 + '{"verdict":"PASS","summary":"s"}', 1.0),
 ]
 
+# (name, mode, report in, keys expected removed, keys expected to survive)
+# A verdict key is stripped in every mode whose contract has no verdict, not only in
+# onboard: an implementer volunteering a verdict on its own work is the same defect.
+STRIP = [
+    ("onboard verdict is stripped", "onboard",
+     {"analysis": "complete", "verdict": "FAIL", "findings": []},
+     ["verdict"], ["analysis", "findings"]),
+    ("onboard blocker_reason is stripped", "onboard",
+     {"analysis": "partial", "blocker_reason": "no tests found"},
+     ["blocker_reason"], ["analysis"]),
+    ("both are stripped, and reported in order", "onboard",
+     {"analysis": "complete", "blocker_reason": "x", "verdict": "PASS"},
+     ["verdict", "blocker_reason"], ["analysis"]),
+    ("implement verdict is stripped too", "implement",
+     {"status": "completed", "verdict": "PASS"}, ["verdict"], ["status"]),
+    ("a clean onboard report is untouched", "onboard",
+     {"analysis": "complete", "findings": []}, [], ["analysis", "findings"]),
+    ("review keeps its verdict", "review",
+     {"verdict": "FAIL", "blocker_reason": None}, [], ["verdict", "blocker_reason"]),
+    ("test keeps its verdict", "test", {"verdict": "BLOCKED"}, [], ["verdict"]),
+    ("no report is not an error", "onboard", None, [], []),
+]
+
+
+def check_matrix():
+    """The three mode tables must declare the same modes, mechanically.
+
+    MODES is the matrix; CONTRACTS supplies the brief; REPORT_DISCRIMINATORS identifies
+    the reply. A mode present in one and absent from another does not fail until a run
+    uses it, and then it fails as a KeyError inside a delegated run rather than as a
+    mistake in a table.
+    """
+    failures = []
+    declared = set(d.MODE_NAMES)
+    if declared != {m for modes in d.MODES.values() for m in modes}:
+        failures.append("MODE_NAMES does not match MODES")
+    for table in ("CONTRACTS", "REPORT_DISCRIMINATORS"):
+        missing = declared - set(getattr(d, table))
+        extra = set(getattr(d, table)) - declared
+        if missing or extra:
+            failures.append(
+                "%s: missing %s, extra %s" % (table, sorted(missing), sorted(extra))
+            )
+
+    # VERDICT_MODES is the one list a reader has to trust when deciding whether a result
+    # can carry a verdict. It has to agree with the contracts themselves.
+    by_discriminator = {
+        m for m, (key, _) in d.REPORT_DISCRIMINATORS.items() if key == "verdict"
+    }
+    if by_discriminator != set(d.VERDICT_MODES):
+        failures.append(
+            "VERDICT_MODES %s but verdict discriminators %s"
+            % (sorted(d.VERDICT_MODES), sorted(by_discriminator))
+        )
+    # .get, not [], so a mode missing from CONTRACTS is reported by the check above
+    # rather than raised out of this one.
+    for mode in declared - set(d.VERDICT_MODES):
+        for key in d.VERDICT_KEYS:
+            if '"%s"' % key in d.CONTRACTS.get(mode, ""):
+                failures.append(
+                    '%s contract asks for "%s" but has no verdict' % (mode, key)
+                )
+    for mode in d.VERDICT_MODES:
+        if '"verdict"' not in d.CONTRACTS.get(mode, ""):
+            failures.append(
+                "%s is in VERDICT_MODES but its contract has no verdict" % mode
+            )
+
+    # Read-only is the default for Codex, so a mode added later cannot land on the write
+    # side of the sandbox test by omission.
+    for mode in d.MODES["codex"]:
+        argv, _env, _stdin = d.adapt_codex(brief="b", mode=mode)
+        sandbox = argv[argv.index("--sandbox") + 1]
+        expected = "workspace-write" if mode == "test" else "read-only"
+        if sandbox != expected:
+            failures.append(
+                "codex %s mode: sandbox %s, wanted %s" % (mode, sandbox, expected)
+            )
+    return failures
+
+
 # Behaviour that is known to be wrong and is not yet fixed. Recorded so it is visible
 # rather than mistaken for correctness. Reported by Codex, attempt 3 of the Phase 03
 # review loop, which reached the three-attempt bound. See PHASE_03_REPORT.md.
@@ -143,7 +252,8 @@ def main():
         except Exception as exc:  # a parser of untrusted output must never raise
             failures.append("%s: raised %s" % (name, type(exc).__name__))
             continue
-        got_value = (report or {}).get("verdict") if report else None
+        key = d.REPORT_DISCRIMINATORS[mode][0]
+        got_value = report.get(key) if report else None
         if state != want_state:
             failures.append("%s: state %r, wanted %r" % (name, state, want_state))
         elif want_value is not None and got_value != want_value:
@@ -160,7 +270,23 @@ def main():
         if elapsed > budget:
             failures.append("%s: took %.1fs, budget %.1fs" % (name, elapsed, budget))
 
-    print("%d cases, %d timed" % (len(CASES), len(TIMED)))
+    for name, mode, report, want_removed, want_kept in STRIP:
+        before = dict(report) if report else {}
+        got_removed = d.strip_off_contract(report, mode)
+        if got_removed != want_removed:
+            failures.append(
+                "%s: removed %r, wanted %r" % (name, got_removed, want_removed)
+            )
+        for key in want_kept:
+            if report is None or key not in report or report[key] != before[key]:
+                failures.append("%s: %r did not survive intact" % (name, key))
+
+    failures.extend("mode matrix: " + line for line in check_matrix())
+
+    print(
+        "%d cases, %d timed, %d strip, mode matrix checked"
+        % (len(CASES), len(TIMED), len(STRIP))
+    )
 
     regressed = []
     for name, mode, text, current in KNOWN_GAPS:

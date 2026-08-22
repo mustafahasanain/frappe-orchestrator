@@ -68,7 +68,8 @@ production code it reviews is what preserves reviewer independence.
 Codex also recalculates impact from the real diff after implementation, selects the
 targeted tests that follow from it, checks whether the implementation touched areas the
 plan did not anticipate, and reports AI context it found to be stale or incomplete. In an
-unfamiliar repository it performs the read-only onboarding analysis.
+unfamiliar repository it performs the read-only onboarding analysis — in `onboard` mode,
+not review mode, because there is no diff there and nothing to pass or fail.
 
 ## Workflow
 
@@ -230,9 +231,10 @@ The brief goes in on stdin; the result comes back as JSON on stdout.
 delegate --agent opencode --mode implement --tier <TIER> --model "<name from routing file>"
 delegate --agent codex    --mode review    --tier <TIER>
 delegate --agent codex    --mode test      --tier <TIER>
+delegate --agent codex    --mode onboard   --tier <TIER>
 ```
 
-Those three are the only valid combinations, and the dispatcher refuses the rest.
+Those four are the only valid combinations, and the dispatcher refuses the rest.
 Codex never implements: a reviewer that writes the code it reviews is not independent.
 
 The provider model id, effort, and timeout come from the routing file. `--effort`,
@@ -242,6 +244,26 @@ NORMAL and DIFFICULT timeouts are longer than a foreground command may run, so s
 those in the background and collect the result when it finishes. The dispatcher prints
 its workspace path to stderr immediately, so a run that is cut off short is still
 recoverable there.
+
+### One mode per use
+
+Each mode carries its own result contract, and the contract is what the agent is forced
+to produce. A run therefore uses the mode that matches what it is actually for.
+
+**Never route a non-review use through `review`.** Review's contract requires
+PASS/FAIL/BLOCKED, so an analysis run in review mode returns a verdict it had no basis
+for — an artefact of the contract rather than a judgement. That is worse than no verdict:
+where the orchestrator reads it, a false FAIL is indistinguishable from a real one.
+
+Only `review` and `test` produce a verdict. `implement` and `onboard` have no verdict
+field at all, and the dispatcher removes one from the report if the agent volunteers it,
+naming what it removed in `off_contract_keys`. Do not supply the missing verdict
+yourself: an onboarding analysis that produced findings is not a FAIL, and one that
+produced none is not a PASS. It either produced findings or it did not.
+
+If a use of a delegated agent appears that is not one of these four, it needs its own
+mode and its own contract in the dispatcher. Until it has one, do that work directly or
+stop and ask — do not borrow another mode's contract to get the run out the door.
 
 ### Briefs
 
@@ -265,6 +287,9 @@ claimed. Keep the two apart.
   `cli_missing`, `error`. `completed` means the process exited cleanly and nothing more.
 - `result_block` — `missing` or `invalid` means the agent returned no usable report.
   Read the file at `transcript` before concluding anything.
+- `off_contract_keys` — verdict keys the agent volunteered in a mode that has none, and
+  which were removed. Non-empty means the agent answered a contract it was not given;
+  the rest of its report still stands, but do not go looking for the removed value.
 - `agent_report` — the agent's own account of its work. **An implementation agent's
   self-report is never verification.** Only the actual diff and an independent review
   are.
@@ -287,6 +312,9 @@ before delegating the review.
 None are defined yet, so this step is currently a no-op.
 
 ## Review outcome
+
+These three states belong to `review` and `test`. No other mode produces them, and none
+is ever inferred for a mode whose contract has no verdict.
 
 Codex returns exactly one of three states.
 
@@ -375,6 +403,13 @@ migration risk is affected.
 
 **Maximum one automatic round.** If the disagreement survives it, stop, summarize both
 positions, and let the user decide.
+
+**Debate has no dispatcher mode.** A debate turn is a position, not a verdict, so it must
+not be run as a review to get it delegated — that is the defect described under *One mode
+per use*. Hold the round against the findings Codex already returned in its review; those
+are its position, stated on the record. Do not delegate a fresh turn for it. If that is
+not enough to settle the disagreement, stop and put both positions to the user, which is
+where an unresolved debate ends in any case.
 
 ## Git safety
 

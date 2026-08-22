@@ -1,5 +1,11 @@
 # Phase 03 Report
 
+> **Safety finding from the first end-to-end run.** A delegated Codex run attempted
+> `bench --site masa.local run-tests`, which nothing in its brief had asked for, and the
+> dispatcher's sandbox stopped it before it reached the site. It is the first time an
+> agent has reached past its brief here. Recorded in full under
+> [Safety finding: a delegated agent reached past its brief](#safety-finding-a-delegated-agent-reached-past-its-brief).
+
 ## What was built
 
 - `scripts/delegate` — the delegation dispatcher. One executable that runs either agent
@@ -112,6 +118,10 @@
   inferred from the name) holds.
 - **The illustrative `adapters/` directory in the phase document was not created.** The
   phase permits adjusting exact names and says the dispatcher may contain the adapters.
+- **Onboarding runs in its own `onboard` mode, not REVIEW.** Both phase documents specify
+  REVIEW for it. Deviated on your instruction after the end-to-end run; the reasoning and
+  the exact wording deviated from are under
+  [Deviation from the phase documents](#deviation-from-the-phase-documents).
 
 ## Delegated-agent permissions — how the boundary is held
 
@@ -149,6 +159,12 @@ Denied families: `git push`, `git commit`, blanket `git add`, and live-site exec
 **Codex** needs no equivalent: `read-only` cannot write or run commands, and
 `workspace-write` is confined to the working tree with no network access, so a push from
 inside a TEST run fails structurally.
+
+> Partly wrong, and left as written because it records what was believed here.
+> `read-only` does run commands; what it denies is reach. Corrected under
+> [Safety finding](#correction-read-only-does-execute-commands), where a live run proved
+> it. The conclusion — no OpenCode-style permission map is needed for Codex — still
+> holds.
 
 ## Limitations — named, not solved
 
@@ -217,6 +233,13 @@ Also worth a decision: `--cwd` is not constrained to the current repository.
 4. **Live-run verification.** Every phase so far has needed a real session before anything
    could be called working, and this one adds two external CLIs. Worth testing first: a
    FAST delegated task end to end, and a denied `git push` inside a delegated run.
+5. **Whether debate gets a mode.** It is the one remaining non-review use of a delegated
+   agent and it has no mode, so the only way to delegate a round today would be to run it
+   as a review — the defect just fixed for onboarding. The skill now forbids that and
+   routes an unresolved disagreement to you instead, which leaves debate undelegatable
+   rather than unsafe. Building a `debate` mode means designing a contract for a feature
+   that has never been exercised, so it is your call. See
+   [The other non-review uses, named](#the-other-non-review-uses-named).
 
 ## Not built (correctly out of scope)
 
@@ -649,3 +672,288 @@ model variance. That has not been done and is not something to assert without it
 | `--model "Claude Sonnet 5"` | Still refused as a `claude`-executor model |
 | Routing-file consistency check | Every model named by a tier or ladder rung exists in the `models` map; every `opencode` entry has an id; neither `claude` entry has one |
 | `grep` for model names and `opencode/` outside the routing file | No matches in `skills/`, `scripts/`, or `hooks/` — no skill hardcodes a model, as Phase 01 requires |
+
+## Safety finding: a delegated agent reached past its brief
+
+During the first end-to-end run, the onboarding analysis was delegated to Codex. Nothing
+in the brief mentioned tests, a site, or a database — it asked for a read-only repository
+analysis, and there was no diff. Codex ran:
+
+```
+bench --site masa.local run-tests
+```
+
+The command executed inside the sandbox and its MariaDB connection was refused. Nothing
+reached the site, no site database was read or written, and no test ran against it.
+
+**Recorded because it is the first time an agent has actually reached past its brief.**
+Every boundary in this plugin has until now been argued for rather than exercised. This
+one was exercised.
+
+### What blocked it, precisely
+
+The `--sandbox read-only` flag that `adapt_codex` in `scripts/delegate` passes to
+`codex exec`. That is the layer, and it is worth being exact about which layers were *not*
+involved, because the wrong conclusion here is comfortable and wrong:
+
+| Layer | In the path? | Why |
+| --- | --- | --- |
+| `hooks/guard.py` | **No** | It has a rule for exactly this command shape — any `bench --site` asks, with the live-site reason. It never saw it. The hook binds `PreToolUse` on Claude's own Bash calls; a delegated agent runs its shell inside its own process, so its commands are not tool calls and are invisible to the hook |
+| Delegated OpenCode permission policy | **No** | `OPENCODE_CONFIG_CONTENT` configures OpenCode. This was Codex |
+| Codex sandbox set per mode by the dispatcher | **Yes** | The only layer in the path, and it held |
+
+So the layered design was load-bearing, not belt-and-braces. The section above
+("Delegated-agent permissions") argued that a delegated agent's shell is invisible to the
+hook and that each agent therefore needs its own containment configured by the dispatcher.
+That argument was correct, and this is the first evidence that it was doing real work
+rather than describing a hypothetical.
+
+**The practical rule.** When reasoning about whether a delegated run can reach a live
+site, the hook does not count. For delegated work the dispatcher's per-agent containment
+is not one layer of several — it is the layer.
+
+### Correction: `read-only` does execute commands
+
+The "Delegated-agent permissions" section above states that Codex "needs no equivalent:
+`read-only` cannot write or run commands". The first half is right and the second half is
+wrong, and this event is the proof: the command ran. What `read-only` denies is reach —
+writes and network — not execution. The CLI's own help says so directly:
+
+```
+-s, --sandbox <SANDBOX_MODE>
+        Select the sandbox policy to use when executing model-generated shell commands
+```
+
+Left as written above, since it records what was believed at the time; this is the
+correction. The conclusion it supported still holds — Codex needs no OpenCode-style
+permission map — but for a different reason than the one given, and the difference
+matters: containment here is about what a command can reach, so it must be reasoned about
+per command target, not per mode's ability to run anything at all.
+
+### What this does not establish
+
+- **It does not clear TEST mode.** `workspace-write` was not exercised. It denies network,
+  which stops a TCP connection to a database, but whether it denies a connection over a
+  local unix socket was not tested and is not asserted here.
+- **It does not show the agent misbehaving.** Running the test suite is a plausible thing
+  for an agent asked to understand a repository to do. That is the point: *plausible* and
+  *within brief* are different properties, and only the enforcement layer is in a position
+  to tell them apart. A brief cannot enumerate everything it did not ask for.
+- **It does not show the brief was adequate.** It was not. The onboarding brief never said
+  "do not run the tests", because it was borrowing the review contract, which assumes a
+  diff and a reviewer who is supposed to run tests. The `onboard` contract added in the
+  patch below says it explicitly. That is defence in depth, not the fix — the sandbox is
+  the fix, because a brief is a request and a sandbox is not.
+
+## Patch: onboarding has its own mode, and no verdict
+
+### The defect
+
+The onboarding analysis was delegated in `review` mode, on the phase documents' own
+instruction. Review's contract requires `verdict: PASS | FAIL | BLOCKED`, so the analysis
+returned `FAIL` — not because anything failed, but because the contract demanded a verdict
+and the run had none to give. A contract artefact, shaped exactly like a judgement.
+
+**Why that is worse than returning nothing.** At the point the orchestrator reads
+`agent_report.verdict`, a fabricated FAIL is indistinguishable from a reviewer's FAIL. It
+enters the PASS/FAIL/BLOCKED logic, and FAIL there means "enter the fix loop and consume
+an attempt". A missing verdict is visibly missing; a false one is not visibly false.
+
+The root cause is not the wording of the review contract. It is that one mode was serving
+two purposes with different outputs. A mode is a contract, so two outputs need two modes.
+
+### The mode
+
+`--agent codex --mode onboard` — the fourth valid combination. Read-only, no diff, and a
+contract with **no verdict field at all**:
+
+```json
+{
+  "analysis": "complete | partial",
+  "not_analysed": ["<area you did not reach; only when partial>"],
+  "summary": "<two sentences at most>",
+  "findings": [
+    {
+      "area": "project | architecture | operations",
+      "detail": "<what is there, stated so it can be verified>",
+      "evidence": ["<repository-relative path you read>"]
+    }
+  ],
+  "uncertain": ["<something the repository did not settle>"]
+}
+```
+
+Decisions inside that shape:
+
+- **`analysis` is coverage, not judgement.** `complete` / `partial` describes whether the
+  agent established the areas it was asked about, the way `implement`'s `status` describes
+  whether the agent finished. Neither value says anything about the repository, and the
+  contract text says so in as many words so that the next reader does not re-derive a
+  verdict from it. `not_analysed` carries the gap when it is `partial`.
+- **`findings` is the outcome.** An analysis either produced findings or it did not, and
+  producing none is a real result rather than a failure. Findings here have no
+  `blocking` / `non_blocking` category, because nothing in an analysis blocks anything.
+- **`evidence` per finding.** Claude owns the resulting context and validates what comes
+  back, which is only possible if each claim names the path it came from. This is the
+  anti-invention lever, and it pairs with `uncertain`, which is where anything the
+  repository did not settle goes — Phase 02's "document only verified architecture" rule,
+  expressed as a field instead of a hope.
+- **`area` maps onto the three context files.** `project` / `architecture` / `operations`
+  is what Claude does with a finding, so the agent sorts them rather than Claude
+  re-reading each one to decide where it belongs.
+
+The discriminator is `analysis`, its own key, so an onboarding report is not
+interchangeable with any other mode's report in either direction — tested both ways.
+
+### Read-only became the default rather than the review-mode exception
+
+The Codex sandbox was chosen as:
+
+```python
+sandbox = "read-only" if mode == "review" else "workspace-write"
+```
+
+A mode added to that expression gets **write access by omission**. `onboard` would have
+landed on `workspace-write` — the very run that tried to reach a live site would have been
+given the weaker sandbox, silently, as a side effect of adding a row to a table somewhere
+else. Now:
+
+```python
+sandbox = "workspace-write" if mode == "test" else "read-only"
+```
+
+The condition names the one mode that needs to write, so the fail-safe direction is the
+default. The test suite asserts the resulting sandbox for every mode in `MODES["codex"]`,
+and reverting this line is caught by name (`codex onboard mode: sandbox workspace-write,
+wanted read-only`).
+
+### Volunteered verdicts are removed, not passed through
+
+A contract without a verdict field does not stop an agent from writing one anyway — habit,
+a stale system prompt, or output copied from a review it did earlier. `strip_off_contract`
+removes `verdict` and `blocker_reason` from the report in any mode that has no verdict
+(`onboard` and `implement` today), leaves the rest of the report intact, and records what
+it removed in a new top-level `off_contract_keys`.
+
+The reasoning is the same as the defect's: a verdict nobody asked for is
+indistinguishable, where it is read, from one a reviewer reached. Removing it loses nothing
+that was ever requested, and `off_contract_keys` means the removal is visible rather than
+silent — an agent answering a contract it was not given is worth knowing about. The skill
+tells the orchestrator not to go looking for the removed value.
+
+This is not a parser change; the parser stays pure. It runs on the extracted report in
+`main`.
+
+### The other non-review uses, named
+
+The same question was asked of every other delegated use, since fixing one instance of a
+class is not fixing the class.
+
+| Use | Mode today | Verdict? | Assessment |
+| --- | --- | --- | --- |
+| Diff review | `review` | Yes, legitimately | A judgement on a diff. Correct as is |
+| Post-implementation impact re-check | inside `review` | Part of the review's verdict | Correct. There is a diff, and what it finds belongs to the review outcome |
+| Stale-context reporting | inside `review` | Non-blocking findings | Correct. A side effect of a real review |
+| Fix verification | `review` | Yes | Correct |
+| Writing tests | `test` | Yes, legitimately | The verdict is about the behaviour under test, which is a real judgement |
+| Implementation | `implement` | No, by contract | Correct — and it is now enforced, since a volunteered verdict is stripped there too |
+| **Onboarding analysis** | was `review` | Fabricated | **The defect. Fixed by this patch** |
+| **A debate round** | none exists | n/a | **The remaining one. Named below, not fixed** |
+| Verifying an area in a known project | none exists | n/a | Diff-less analysis; the `onboard` contract already fits it |
+
+**A debate round is the second non-review use, and it has no mode.** Phase 01 and the
+orchestration skill both provide for one automatic debate round with Codex on DIFFICULT or
+high-risk tasks. A debate turn is a *position*, not a verdict, so it has exactly the defect
+just fixed — and worse, because with no mode of its own the only way to delegate one today
+is to run it as a review, which would manufacture a verdict from an argument.
+
+It is not fixed here, deliberately. No debate has ever been run, so a contract for one
+would be invented rather than derived — and this repository has now been bitten twice by
+shapes that looked right before they met a real CLI. What is in place instead is the rule
+that makes the unsafe path unavailable: the skill states that debate has no dispatcher
+mode, that a debate turn must not be run as a review, that the round is held against the
+findings Codex already returned in its review, and that an unresolved disagreement goes to
+the user — which is where Phase 01 already sends it after one round. If debate is ever
+exercised for real, it needs a `debate` mode with a contract of positions and reasoning,
+and no verdict.
+
+The last row is the one naming decision worth flagging: "verify important areas when
+needed" in a known project is diff-less analysis, so the `onboard` contract fits it
+exactly even though the mode's name is narrower than that. If a third diff-less analysis
+use appears, the right move is to rename the mode, not to add a near-duplicate of it.
+
+### What the mode matrix now enforces mechanically
+
+A mode was previously declared in four places — `MODES`, the `--mode` choices, `CONTRACTS`,
+`REPORT_DISCRIMINATORS` — with nothing tying them together. Adding one and forgetting a
+table fails at the point of use, inside a delegated run, as a `KeyError` rather than as a
+mistake in a table.
+
+- `MODE_NAMES` is derived from `MODES`, and `--mode`'s accepted values come from it. The
+  matrix is now the only place a mode is declared.
+- `VERDICT_MODES` names the modes that have a verdict, and the dispatcher's own
+  timeout-to-BLOCKED path reads it instead of a repeated literal tuple — so a new mode
+  cannot acquire a verdict from the timeout branch by accident.
+- `check_matrix()` in the test suite asserts that `MODES`, `CONTRACTS`, and
+  `REPORT_DISCRIMINATORS` declare the same set; that `VERDICT_MODES` agrees with which
+  contracts actually carry a `verdict` discriminator; that no verdict-free contract asks
+  for `verdict` or `blocker_reason` in its own text; and that the Codex sandbox is
+  read-only for every mode but `test`.
+
+That last group is the mechanical enforcement the mode/agent matrix was missing: the
+tables cannot drift apart without the suite naming which one drifted.
+
+### Deviation from the phase documents
+
+Both phase documents specify that onboarding uses REVIEW mode:
+
+- Phase 03, "Codex Modes": "REVIEW covers both diff review and the read-only repository
+  analysis used for project onboarding in Phase 02."
+- Phase 02: "This onboarding analysis uses Codex **REVIEW** mode as defined in Phase 03."
+
+This patch deviates from both, on your instruction, after the end-to-end run showed what
+the shared mode produces. The phase documents are left as written — they are the
+authoritative specs and record what was specified — and this is the deviation entry. The
+intent behind their wording is preserved in full: onboarding is still Codex's job, still
+read-only, still returns structured findings that Claude validates. Only the contract it
+answers has changed, and the change is confined to the half of that instruction that was
+never about onboarding.
+
+### Contract amendment
+
+`docs/BUILD_CONTRACT.md`, Phase 01.5, gained a second amendment: a phase that changes the
+dispatcher's mode set may update the bare-agent deny reason's `--mode` enumeration in
+`hooks/guard.py`, and only that string; the hook's *rules* remain Phase 01.5's alone.
+
+The reason it is not cosmetic: that string is the instruction an agent reads at the moment
+it is blocked, so a mode missing from it is a mode the agent is told does not exist. It
+now reads `--mode <implement|review|test|onboard>`. This is the third instance of the
+duplication recorded as Limitation 3 — the same fact in the skill, the hook, and the
+dispatcher, with nothing keeping them in sync — and the first one where the duplicate is a
+list of the dispatcher's own capabilities rather than a rule.
+
+### Patch verification
+
+| Command | Result |
+| --- | --- |
+| `claude plugin validate . --strict` | `✔ Validation passed` (exit 0) |
+| `python3 tests/test_parser.py` | `38 cases, 3 timed, 8 strip, mode matrix checked` … `ok`, exit 0, 10.2 s |
+| `ruff check --line-length 90` on `scripts/delegate`, `hooks/guard.py`, `tests/test_parser.py` | `All checks passed`. One pre-existing unused import in the test file removed |
+| **Live `--mode onboard` run against the real Codex CLI** | `status=completed`, `exit_code=0`, 120.9 s of a 420 s SMALL timeout, `result_block=present` |
+| Live report shape | Keys exactly `analysis`, `summary`, `findings`, `uncertain`. `analysis=complete`. **No `verdict`, at any level.** `off_contract_keys=[]` — nothing was volunteered and nothing had to be stripped |
+| Live report content | 13 findings, every one carrying `evidence` paths; areas 4 project / 5 architecture / 4 operations, no value outside the enumeration; 4 entries in `uncertain`, all genuinely unsettled by the repository (no README, unpinned tool versions, the unverified `--variant` question) |
+| Live run stayed inside its brief | The transcript's 29 `bench`/`mysql`/`mariadb` matches are all file contents it read — `hooks/guard.py` and the dispatcher's own deny list. No command against a site, a database, or the test suite was attempted |
+| `--dry-run`, `--mode onboard` | `codex exec --sandbox read-only -`, no `env_overrides` |
+| Refusal matrix | `--agent opencode --mode onboard` → exit 2, `--agent opencode supports --mode implement`. `--mode` values in usage now read `{implement,onboard,review,test}` |
+| Regression probe: mode dropped from `CONTRACTS` | `CONTRACTS: missing ['onboard']` — reported, not raised (`.get` in the contract-text checks, so a missing mode is named once by the table check rather than crashing the helper) |
+| Regression probe: `onboard` added to `VERDICT_MODES` | Two failures — the discriminator disagreement and the contract with no verdict |
+| Regression probe: sandbox line reverted to `== "review"` | `codex onboard mode: sandbox workspace-write, wanted read-only` |
+| Regression probe: a fifth mode added to `MODES` alone | `CONTRACTS: missing ['audit']`, `REPORT_DISCRIMINATORS: missing ['audit']` |
+| Regression probe: `strip_off_contract` neutered | 4 failures. Applied to every mode instead, so verdict modes lose theirs: 2 failures. Caught in both directions |
+| Hook regression after the deny-reason edit | `codex exec -` → deny, reason now lists `onboard`. `git add .` deny, `bench --site` ask, `opencode models` pass-through, all unchanged |
+| Working tree | Six files modified, no new file, no delegation artifact in the repository. The live run's workspace is `/tmp/delegate-codex-onboard-*`, outside it, as designed |
+
+Still untested, unchanged from the previous patches: `--mode test` against the real CLI
+(and with it whether `workspace-write` blocks a local-socket database connection — see the
+safety finding), the implement path against the real OpenCode CLI, deny enforcement under
+`--auto` at runtime, and the accepted `--variant` values.
