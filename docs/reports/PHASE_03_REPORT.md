@@ -559,3 +559,93 @@ Still untested, unchanged from the previous patch: `--mode test` against the rea
 implement path against the real OpenCode CLI (Limitation 6 — its stdout shape is still
 unobserved, and the Codex lesson applies to it directly), deny enforcement under `--auto`
 at runtime, and the accepted `--variant` values.
+
+## Patch: provider corrected, GLM-5.3 restored, effort unverifiable
+
+Three corrections from live provider testing, all confined to
+`config/model-routing.json`. That they are confined to it is the Phase 01 rule holding:
+`grep` for the model names and the provider prefix finds nothing in any skill, the
+dispatcher, or the hook.
+
+### Wrong provider prefix
+
+The subscription is **OpenCode Go**, not Zen. The `opencode/` prefix is Zen and fails with
+"Insufficient balance"; `opencode-go/` works. Every delegated id changed:
+
+| Model | id | executor |
+| --- | --- | --- |
+| Kimi K2.6 | `opencode-go/kimi-k2.6` | opencode |
+| Kimi K2.7 Code | `opencode-go/kimi-k2.7-code` | opencode |
+| Kimi K3 | `opencode-go/kimi-k3` | opencode |
+| GLM-5.3 | `opencode-go/glm-5.3` | opencode |
+| Claude Sonnet 5 | — | claude |
+| Claude Opus | — | claude |
+
+Confirmed against `opencode models`: all four exist under `opencode-go/`.
+
+### GLM-5.3 restored, and why the original deviation was wrong
+
+Phase 01 recorded a deviation replacing the spec's GLM-5.3 with GLM-5.2, on the grounds
+that GLM-5.3 "does not exist on my provider". That deviation is now withdrawn and the
+routing file matches the spec again.
+
+The observation behind it was accurate but was generalised past what it supported. It was
+true of the Zen catalogue; it was read as a fact about the model. The catalogues differ:
+
+```
+opencode/glm-5      opencode-go/glm-5.1
+opencode/glm-5.1    opencode-go/glm-5.2
+opencode/glm-5.2    opencode-go/glm-5.3
+```
+
+Zen genuinely has no 5.3. Go has it. The model existed the whole time, on a provider that
+was not being listed.
+
+Worth keeping as a pattern, because it is not specific to this model: **"not in the
+catalogue I looked at" is not "does not exist", and a spec should not be deviated from on
+the weaker claim.** The check that separates them is listing the other providers, which
+costs one command. The cost of not doing it was a deviation carried across three phases,
+recorded each time as settled.
+
+Nothing else in the deviation's handling was wrong — it was flagged in the Phase 01
+report rather than applied silently, which is why it was findable and reversible now. The
+Phase 01 report's Deviations entry is left as written, since it records what was believed
+at the time; this section is the correction.
+
+### `--variant` is accepted without validation
+
+`--variant bogusvalue` was accepted silently and the run completed normally. Two
+consequences, both recorded rather than papered over:
+
+1. **The `usage_error` detection built for variant rejection will never fire on this
+   provider.** It is kept because it is correct for a CLI that does reject values, and
+   because it costs nothing when it does not fire. It is not dead code, but on OpenCode Go
+   it is unreachable.
+2. **Effort is unverifiable here, and may be a no-op.** A provider that accepts any string
+   without complaint gives no evidence that it honours the ones we send. `low`, `medium`,
+   and `high` are passed through as `--variant` and may do nothing at all.
+
+**Effort routing must not be described as working.** The routing file's `effort` values
+are passed to the CLI; whether they change the model's behaviour on this provider is
+unknown and, absent provider documentation or a measurable behavioural difference, cannot
+be settled from here. Anything downstream that reasons about effort should treat it as
+unconfirmed. The escalation ladder does not depend on it — escalation changes the model,
+which is verifiable, not the variant.
+
+Distinguishing a no-op from a working knob would need a controlled comparison: the same
+task at `low` and at `high`, repeated enough to separate a real difference from ordinary
+model variance. That has not been done and is not something to assert without it.
+
+### Patch verification
+
+| Command | Result |
+| --- | --- |
+| `claude plugin validate . --strict` | `✔ Validation passed` (exit 0) |
+| `python3 tests/test_parser.py` | `ok`, exit 0 |
+| `python3 -c "json.load(...)"` | valid; 6 models, 4 with ids |
+| `opencode models` | All four `opencode-go/` ids present. Zen lists `glm-5`, `glm-5.1`, `glm-5.2`; Go lists `glm-5.1`, `glm-5.2`, `glm-5.3` |
+| Dispatcher `--dry-run`, all four delegated models | Each resolves to its `opencode-go/` id |
+| Stale `--model "GLM-5.2"` | Refused, exit 2, error lists the valid names |
+| `--model "Claude Sonnet 5"` | Still refused as a `claude`-executor model |
+| Routing-file consistency check | Every model named by a tier or ladder rung exists in the `models` map; every `opencode` entry has an id; neither `claude` entry has one |
+| `grep` for model names and `opencode/` outside the routing file | No matches in `skills/`, `scripts/`, or `hooks/` — no skill hardcodes a model, as Phase 01 requires |

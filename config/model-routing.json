@@ -3,19 +3,19 @@
   "models": {
     "Kimi K2.6": {
       "executor": "opencode",
-      "id": "opencode/kimi-k2.6"
+      "id": "opencode-go/kimi-k2.6"
     },
     "Kimi K2.7 Code": {
       "executor": "opencode",
-      "id": "opencode/kimi-k2.7-code"
+      "id": "opencode-go/kimi-k2.7-code"
     },
     "Kimi K3": {
       "executor": "opencode",
-      "id": "opencode/kimi-k3"
+      "id": "opencode-go/kimi-k3"
     },
-    "GLM-5.2": {
+    "GLM-5.3": {
       "executor": "opencode",
-      "id": "opencode/glm-5.2"
+      "id": "opencode-go/glm-5.3"
     },
     "Claude Sonnet 5": {
       "executor": "claude"
@@ -74,7 +74,7 @@
     },
     {
       "stage": "fallback",
-      "model": "GLM-5.2",
+      "model": "GLM-5.3",
       "effort": "medium"
     },
     {
