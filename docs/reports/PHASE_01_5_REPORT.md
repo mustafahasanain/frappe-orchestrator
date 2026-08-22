@@ -221,3 +221,59 @@ dispatcher run end to end against a stub CLI still executed its child and return
 
 Not verified: the rule firing inside a live session. Open question 3 above stood for the
 original three rules and stands for this one.
+
+## Patch: informational agent invocations pass through
+
+The bare-agent rule denied `codex exec --help`. The rule matches on the subcommand, and
+`exec` is the subcommand, so it fired exactly as written — on a command that starts no
+run, contacts no provider, and executes nothing. It just prints usage text.
+
+**Why that is worth a patch rather than a shrug.** A deny that fires on nothing dangerous
+teaches the reader that the rule is noise. The next deny it issues is the one that
+matters, and it arrives with the credibility the false one spent. The rule's own reason
+text tells the agent to go through the dispatcher instead — advice that makes no sense for
+`--help`, which the dispatcher does not offer, so the only available next move is to work
+around the hook. Every part of that is worse than the rule not firing.
+
+### The rule
+
+`--help`, `-h`, or `--version` anywhere in the segment now exempts an agent-CLI
+invocation. Two constraints on that, both load-bearing:
+
+**Whole tokens, not a substring of the segment.** The brief is an argument to these CLIs,
+so `codex exec "explain the --help output"` mentions the flag without carrying it. A
+substring test over the raw segment would exempt a real delegated run for quoting a word,
+which converts a false positive into a bypass — a strictly worse trade. `INFO_FLAGS`
+is intersected with the token list `shlex` already produced for the rule.
+
+**Scoped to this rule alone.** The live-site rules deliberately do not take the same
+exemption, because there the flag can be inert rather than suppressing:
+
+```
+python3 -c "frappe.connect()" --help
+```
+
+The interpreter ignores the extra argument and the snippet still runs. `--help` suppresses
+execution only for a program that parses it, and a rule cannot know which those are. For
+the two agent CLIs it can: both are argument-parsing programs whose subcommand is the
+thing being matched. That reasoning does not transfer, so neither does the exemption —
+`git push --help` still asks, `git add -A --help` is still denied, and
+`bench --site … console --help` still asks.
+
+### Patch verification
+
+| Check | Result |
+| --- | --- |
+| `claude plugin validate . --strict` | `✔ Validation passed` (exit 0) |
+| `ruff check --line-length 90 hooks/guard.py` | `All checks passed` |
+| 21 payloads through `check()`, 0 failures | See the three groups below |
+| Newly exempt, 5 payloads | Silent: `codex exec --help`, `codex exec -h`, `codex exec --version`, `opencode run --help`, `opencode run -h` |
+| Real runs still denied, 6 payloads | `codex exec -`, `codex exec --sandbox read-only -`, `opencode run --agent build --auto --model x '…'`, and the three quoting cases — `codex exec "explain the --help output"`, `opencode run --agent build 'add -h to the parser'`, `codex exec -c model="x" "run --version somewhere"` |
+| Exemption is not global, 6 payloads | `git push --help` → ask; `git add -A --help` → deny; `bench --site masa.local console --help` → ask; `mysql --help` and `mysql --version` → ask; `python3 -c "frappe.connect()" --help` → ask |
+| Pre-existing pass-throughs | Unchanged: `codex --version`, `opencode --help`, `opencode models`, `git status --porcelain` |
+| End to end through `main()` | `codex exec --help` → no stdout at all (allowed); `codex exec -` → `deny` with the reason string |
+
+Neither `-h` nor `--help` appears in `OPENCODE_OPTS_WITH_ARG` or `CODEX_OPTS_WITH_ARG`, so
+`subcommand()` does not consume either as an option's value and the token survives to be
+matched. That is checked by the `codex exec -h` and `opencode run -h` cases rather than by
+inspection.

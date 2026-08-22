@@ -42,6 +42,21 @@ AGENT_CLIS = {
     "codex": ("exec", CODEX_OPTS_WITH_ARG),
 }
 
+# Flags that make an agent CLI print text and exit instead of starting a run, so there is
+# nothing to route through the dispatcher. `codex exec --help` was denied before this,
+# which is a deny that fires on nothing dangerous - and a rule that cries wolf is a rule
+# people learn to work around.
+#
+# Matched as whole tokens, never as a substring of the segment: the brief is an argument,
+# so `codex exec "explain the --help output"` mentions the flag without being one, and a
+# substring test would exempt a real run for quoting a word.
+#
+# Scoped to this rule alone on purpose. The live-site rules must not take the same
+# exemption, because there `--help` can be inert rather than suppressing: an extra
+# argument on `python -c "frappe.connect()"` is ignored by the interpreter and the snippet
+# still runs.
+INFO_FLAGS = {"--help", "-h", "--version"}
+
 DELEGATE = os.path.join(os.environ.get("CLAUDE_PLUGIN_ROOT", ""), "scripts", "delegate")
 
 PUSH_REASON = (
@@ -116,7 +131,7 @@ def check(segment):
 
     if name in AGENT_CLIS:
         target, opts = AGENT_CLIS[name]
-        if subcommand(tokens, opts) == target:
+        if subcommand(tokens, opts) == target and not INFO_FLAGS.intersection(tokens):
             return "deny", AGENT_REASON
 
     if name in DATABASE_CLIENTS:
