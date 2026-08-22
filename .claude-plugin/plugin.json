@@ -1,10 +1,10 @@
 {
   "name": "frappe-orchestrator",
   "description": "Claude-orchestrated delegation of coding work to external coding-agent CLIs, with task classification, central model routing, bounded review loops, and Git safety rules.",
-  "version": "0.1.0",
   "author": {
     "name": "Mustafa Hasanain"
   },
+  "homepage": "https://github.com/mustafahasanain/frappe-orchestrator",
   "keywords": [
     "orchestration",
     "delegation",

@@ -1,0 +1,14 @@
+{
+  "name": "frappe-orchestrator",
+  "description": "Single-plugin catalogue for this repository, so the orchestrator installs from the working tree rather than a session flag.",
+  "owner": {
+    "name": "Mustafa Hasanain"
+  },
+  "plugins": [
+    {
+      "name": "frappe-orchestrator",
+      "source": "./",
+      "description": "Claude-orchestrated delegation of coding work to external coding-agent CLIs, with task classification, central model routing, bounded review loops, and Git safety rules."
+    }
+  ]
+}
