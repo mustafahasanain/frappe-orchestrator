@@ -277,3 +277,101 @@ Neither `-h` nor `--help` appears in `OPENCODE_OPTS_WITH_ARG` or `CODEX_OPTS_WIT
 `subcommand()` does not consume either as an option's value and the token survives to be
 matched. That is checked by the `codex exec -h` and `opencode run -h` cases rather than by
 inspection.
+
+## Patch: a bench command with no `--site` still acts on a site
+
+Phase 04 asked which Frappe operations a change requires, and the question exposed a hole
+on the side of the live-site rule the hook was already guarding.
+
+`bench --site dev.local migrate` asked. `bench migrate` passed through untouched. The
+second is not a site-free command — it is the same command with the site left unstated,
+and frappe's CLI supplies one from configuration: `default_site` in
+`common_site_config.json`, then `currentsite.txt`
+(`frappe/utils/bench_helper.py:49`). So it acts on whichever site the bench was last
+pointed at.
+
+That is worse than the case already covered. `bench --site x migrate` at least says which
+site it means and is wrong only if `x` is wrong. `bench migrate` names no site at all, and
+the one it acts on is invisible in the command, in the transcript, and in any later reading
+of what happened. It is the No-Site-Guessing failure with nothing on screen to guess from.
+
+Ten shapes that passed through before this patch, each of which acts on a configured site:
+
+```
+bench migrate            bench install-app <app>   bench restore <file>
+bench clear-cache        bench uninstall-app <app> bench reinstall
+bench backup             bench trim-tables         bench set-admin-password <pw>
+bench run-tests
+```
+
+### The rule
+
+`SITE_SUBCOMMANDS` was four entries (`console`, `mariadb`, `execute`, `run`) and is now
+the full set of bench subcommands that resolve a site. The bench branch splits in two:
+
+```python
+if name == "bench":
+    if "--site" in tokens:
+        return "ask", SITE_REASON
+    if subcommand(tokens, BENCH_OPTS_WITH_ARG) in SITE_SUBCOMMANDS:
+        return "ask", UNNAMED_SITE_REASON
+```
+
+**Ask, not deny.** The `--site` form asks, and the no-flag form is the same operation with
+less information on the command line. Making it deny would have been a stricter rule for
+the weaker case; making it pass through — the previous behaviour — was a rule that was
+quietly weaker exactly where it had least to go on. It asks, uniformly.
+
+**The set is derived, not judged.** Every `@click.command` in `frappe/commands/*.py` whose
+body calls `get_site(context)` or reads `context.sites` — 75 subcommands. The test is
+*does bench resolve a site for this command*, not *does this command look dangerous*.
+Those come apart: `bench list-apps` is harmless and `bench trim-tables` is not, and they
+pick their site by the identical mechanism. A set filtered by apparent danger would have
+kept the hole open for whichever command the filter underrated. The comment in the file
+records how to re-derive it against a newer frappe, so it is refreshed rather than
+appended to by hand.
+
+**A separate reason, because it is a different mistake.** `SITE_REASON` tells the caller to
+confirm which single site to target. `UNNAMED_SITE_REASON` says what is actually wrong —
+the site is being resolved from configuration rather than named — and gives the correction:
+`bench --site <site> <subcommand>`, with the site taken from the project's
+`OPERATIONS.md` or the user. A reason that named the wrong problem would send the agent to
+re-check a site it never chose.
+
+### Deliberately not covered
+
+Three adjacent classes fail the stated test and were left alone rather than swept in:
+
+- **Positional-site commands** — `bench drop-site <site>`, `bench new-site <site>`. Both
+  destructive, neither able to act on a site chosen by configuration, because the site is
+  an argument. This rule is about an unnamed site; a wrong named site is a different
+  problem and this is not the place to pretend otherwise.
+- **Bench-level multi-site commands** — `bench update`, `bench backup-all-sites`. These
+  act on every site in the bench rather than resolving one, so they belong to the
+  broad-multi-site question, not this one.
+- **`bench build`, `bench start`, `bench setup …`** — genuinely site-free. Still pass
+  through, which is the point: `bench build` is the one Frappe operation Phase 04 can run
+  without resolving a site at all, and a rule that stopped it would make the hook noise.
+
+Each is named here so the gap is on the record rather than discovered again later.
+
+### Patch verification
+
+| Check | Result |
+| --- | --- |
+| `claude plugin validate . --strict` | `✔ Validation passed` (exit 0) |
+| `python3 -c "ast.parse(...)"` on `hooks/guard.py` | parses |
+| 51 payloads through `check()` | 0 failures — decision *and* reason identity asserted, so a right decision with the wrong reason text fails |
+| New rule, 17 payloads | All ask with `UNNAMED_SITE_REASON`: `migrate`, `clear-cache`, `install-app`, `list-apps`, `backup`, `restore`, `reinstall`, `trim-tables`, `uninstall-app`, `set-admin-password`, `run-tests`, `console`, `mariadb`, `execute`, `bench migrate --skip-failing`, `cd … && bench migrate`, and `bench -s dev.local migrate` |
+| `bench -s dev.local migrate` | Asks as unnamed, correctly: `bench` has no `-s` option (`Error: No such option: -s`), so that command names no site |
+| `--site` form, 5 payloads | Unchanged: still ask, still `SITE_REASON`, including `--site all` |
+| Site-free bench commands, 7 payloads | Still pass through: `build`, `build --app`, `start`, `setup requirements`, `version`, `--help`, `init` |
+| Regression, the four existing rules, 20 payloads | Unchanged: push → ask; blanket add → deny; `mysql`/`mariadb`/inline `frappe.get_all` → ask + `SITE_REASON`; bare `opencode run` / `codex exec` → deny; `--help` forms and `opencode models` → pass through; `scripts/delegate …` → pass through |
+| Precedence | `bench migrate && git push` → ask; `bench migrate; git add .` → deny (deny still outranks ask) |
+| 4 malformed payloads | Exit 0, no stdout, no stderr |
+| End to end through `main()` | `bench migrate` → `ask` with the full reason string |
+| Timing, 10 invocations | 22 ms each |
+| `git ls-files -s hooks/guard.py` | `100755` — exec bit retained |
+
+Not verified: the rule firing inside a live session, which has stood open for every rule in
+this hook since the first one.

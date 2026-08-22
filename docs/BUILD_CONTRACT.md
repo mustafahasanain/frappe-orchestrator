@@ -115,6 +115,21 @@ fourth rule, added to `hooks/guard.py` under the same constraints as the other t
 Later phases that add a component the hook should guard follow the same route: report the
 command shape, and amend Phase 01.5 rather than widening their own scope.
 
+**Amendment after Phase 04.** Phase 04 established which Frappe operations a change
+requires, and found that the live-site rule had a hole on the side the hook could not see:
+a bench subcommand that acts on a site but is given no `--site` does not stop acting on a
+site — it resolves one from bench configuration, `default_site` and then `currentsite.txt`.
+`bench --site x migrate` asked; `bench migrate` passed through, and acted on whichever site
+the bench was last pointed at. The rule that closes it belongs here for the same reason the
+fourth did, and Phase 04 is forbidden from touching `hooks/`. This phase entry therefore
+also allows that fifth rule, under the same constraints:
+
+- It **asks**, matching the `--site` form rather than being quietly weaker than it. The
+  live-site boundary is not relaxed to save a keystroke.
+- Its subcommand set is **derived, not judged**: every command in frappe's own CLI that
+  resolves a site from configuration. "Looks dangerous" is not the test, because the
+  failure being prevented is acting on a site nobody named, whatever the command does.
+
 **Amendment: keeping the deny reason accurate.** The bare-agent deny reason states the
 dispatcher invocation an agent should use instead, including the `--mode` values the
 dispatcher accepts and the arguments it requires. That invocation is a fact about the
