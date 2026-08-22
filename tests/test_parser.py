@@ -29,6 +29,10 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
+import shlex
+import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -504,6 +508,206 @@ def check_command_boundaries():
     return problems
 
 
+def check_agent_path_record(tmp):
+    """The result must say which binary actually ran, and it must be the child's PATH.
+
+    A CLI name is not a build. `opencode` on the machine this was developed against is a
+    Linux binary in nvm's bin directory, with a Windows shim second on PATH; the Windows
+    one never received the permission policy and ran a delegated `bench migrate`
+    unrefused. Which of the two a run got is decided by PATH order, which nothing in this
+    plugin controls and which changes without announcing itself, so the result records the
+    resolved path - otherwise a result measured against the wrong build cannot be told
+    apart from one measured against the right one, and the record cannot settle it later.
+
+    Checked end to end rather than by inspecting the function, because the failure this
+    guards against is the field quietly not reaching `result.json`. A stub CLI on a PATH
+    the test controls stands in for the real one: it makes the correct answer known in
+    advance, which no real agent run does.
+    """
+    problems = []
+    routing = json.loads((ROOT / "config" / "model-routing.json").read_text())
+    model = next(
+        (name for name, entry in routing["models"].items()
+         if entry.get("executor") == "opencode" and entry.get("id")),
+        None,
+    )
+    if model is None:
+        return ["no delegable model in the routing file to drive the dispatcher with"]
+
+    bin_dir, repo, work = tmp / "bin", tmp / "repo", tmp / "work"
+    for path in (bin_dir, repo / ".git", work):
+        path.mkdir(parents=True)
+    # A symlink, because the real one is: nvm installs `opencode` as a link to a file in
+    # node_modules named `opencode.exe` that is an ELF binary. A stub that is a plain file
+    # makes "follows the link" trivially true and checks nothing.
+    target = bin_dir / "opencode-real"
+    target.write_text(
+        '#!/bin/sh\n'
+        'echo \'{"status": "completed", "summary": "stub", "touched_files": []}\'\n'
+    )
+    target.chmod(0o755)
+    stub = bin_dir / "opencode"
+    stub.symlink_to(target)
+
+    env = dict(os.environ)
+    env["PATH"] = "%s:/usr/bin:/bin" % bin_dir
+    env["TMPDIR"] = str(work)   # so the run's workspace is cleaned up with the test
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "delegate"),
+         "--agent", "opencode", "--mode", "implement", "--tier", "FAST",
+         "--cwd", str(repo), "--model", model],
+        input="stub brief", capture_output=True, text=True, env=env, timeout=60,
+    )
+    if proc.returncode != 0:
+        return ["the dispatcher exited %s: %s" % (proc.returncode, proc.stderr[-200:])]
+    try:
+        result = json.loads(proc.stdout)
+    except ValueError as exc:
+        return ["the dispatcher's stdout is not JSON: %s" % exc]
+
+    if result.get("agent_path") != str(stub):
+        problems.append(
+            "agent_path is %r; the CLI on the child's PATH was %s"
+            % (result.get("agent_path"), stub)
+        )
+    if result.get("agent_real_path") != str(target):
+        problems.append(
+            "agent_real_path is %r; the link on PATH points at %s"
+            % (result.get("agent_real_path"), target)
+        )
+    if result.get("result_block") != "present":
+        problems.append("the stub's report was not parsed out of its stdout")
+
+    # Which PATH is consulted cannot be established through the subprocess above: Popen
+    # hands the child that same env as its os.environ, so the two agree whatever the code
+    # reads. In process they can be made to disagree, which is the only way to show the
+    # lookup follows the environment the child will actually get rather than this one.
+    elsewhere = tmp / "elsewhere"
+    elsewhere.mkdir()
+    decoy = elsewhere / "opencode"
+    decoy.write_text("#!/bin/sh\nexit 0\n")
+    decoy.chmod(0o755)
+    found = d.resolve_program("opencode", {"PATH": str(elsewhere)})
+    if found is None or found[0] != str(decoy):
+        problems.append(
+            "resolve_program returned %r for a PATH containing only %s - it is not "
+            "reading the environment it was passed" % (found, elsewhere)
+        )
+    if d.resolve_program("no-such-agent-cli", {"PATH": str(elsewhere)}) is not None:
+        problems.append("resolve_program invented a path for a CLI that is not installed")
+
+    # The same record has to survive into the workspace copy, which is what is left behind
+    # for anyone reading the run afterwards.
+    written = Path(result["workspace"]) / "result.json"
+    if not written.exists():
+        problems.append("no result.json was written to the workspace")
+    elif json.loads(written.read_text()).get("agent_path") != result.get("agent_path"):
+        problems.append("the workspace's result.json disagrees about which binary ran")
+    return problems
+
+
+def check_dispatcher_invocation():
+    """The copies that say how to invoke the dispatcher, checked against the dispatcher.
+
+    Three places outside `scripts/delegate` state its invocation, and none of them can be
+    generated from it: the hook's deny reason, which is the only instruction a blocked
+    agent gets; the orchestration skill's delegation block, which is what Claude follows;
+    and the dispatcher's own `--help`. A mode added to `MODES` updates none of them.
+
+    The failure is quiet, which is why it is checked here. A stale deny reason sends a
+    blocked agent to re-run an invocation the dispatcher then refuses, and a stale skill
+    block does the same to Claude - in both cases the mistake surfaces one layer away from
+    where it was made, as a usage error about an argument the reader was told to pass.
+
+    The prose stays hand-written; what is asserted is that it still describes this
+    dispatcher, the same way each boundary rule asserts that the skill section documenting
+    it exists. The skill's invocations get the stronger form that is available for them:
+    each one is run through `validate_invocation`, the function a real run goes through,
+    so a documented combination the dispatcher would refuse fails here rather than at the
+    point of use.
+    """
+    problems = []
+    parser = d.build_parser()
+    by_parser = [a.option_strings[0] for a in parser._actions if a.required]
+    options = {opt for a in parser._actions for opt in a.option_strings}
+
+    # --cwd is required by resolve_working_directory rather than by argparse, so it is
+    # invisible to the introspection above and has to be declared. Both halves are
+    # checked:
+    # that it is a real option, and that it is not one argparse already requires - either
+    # would make the declaration a stale copy of its own.
+    for option in d.REQUIRED_OUTSIDE_PARSER:
+        if option not in options:
+            problems.append(
+                "REQUIRED_OUTSIDE_PARSER names %s, which is not an option" % option
+            )
+        if option in by_parser:
+            problems.append(
+                "%s is required by the parser, so REQUIRED_OUTSIDE_PARSER should not "
+                "name it" % option
+            )
+    required = by_parser + [o for o in d.REQUIRED_OUTSIDE_PARSER if o in options]
+
+    # --- the hook's deny reason -------------------------------------------
+    reason = g.AGENT_REASON
+    for option in required:
+        if option not in reason:
+            problems.append(
+                "the hook's bare-agent reason does not name %s, and an agent that reads "
+                "it will be refused for leaving it out" % option
+            )
+    for option, accepted in (("--agent", set(d.MODES)), ("--mode", set(d.MODE_NAMES))):
+        found = re.search(re.escape(option) + r" <([^>]+)>", reason)
+        if not found:
+            problems.append(
+                "the hook's bare-agent reason does not enumerate %s" % option
+            )
+            continue
+        listed = {value.strip() for value in found.group(1).split("|")}
+        if listed != accepted:
+            problems.append(
+                "the hook's bare-agent reason offers %s %s; the dispatcher accepts %s"
+                % (option, sorted(listed), sorted(accepted))
+            )
+
+    # --- the orchestration skill's delegation block ------------------------
+    skill = (ROOT / "skills" / "orchestration" / "SKILL.md").read_text()
+    documented = set()
+    lines = [line.strip() for line in skill.splitlines()
+             if line.strip().startswith("delegate --")]
+    if not lines:
+        return problems + [
+            "the orchestration skill documents no delegate invocation at all"
+        ]
+    for line in lines:
+        tokens = shlex.split(line)
+        given = {}
+        for token, following in zip(tokens, tokens[1:] + [""]):
+            if token.startswith("--"):
+                given[token] = "" if following.startswith("--") else following
+        for option in required:
+            if option not in given:
+                problems.append("skill: %r does not pass %s" % (line, option))
+        agent, mode = given.get("--agent"), given.get("--mode")
+        if agent not in d.MODES:
+            problems.append("skill: %r names an agent the dispatcher does not run" % line)
+            continue
+        documented.add((agent, mode))
+        try:
+            d.validate_invocation(agent, mode, given.get("--model"), refuse)
+        except Refused as exc:
+            problems.append(
+                "skill: the dispatcher refuses %r - %s" % (line, str(exc)[:80])
+            )
+
+    supported = {(agent, mode) for agent, modes in d.MODES.items() for mode in modes}
+    for pair in sorted(supported - documented):
+        problems.append(
+            "skill: --agent %s --mode %s is supported and undocumented" % pair
+        )
+    return problems
+
+
 def main():
     failures = []
 
@@ -545,12 +749,17 @@ def main():
     failures.extend("boundaries: " + line for line in check_command_boundaries())
     failures.extend("mode matrix: " + line for line in check_matrix())
     failures.extend("working directory: " + line for line in check_working_directory())
+    failures.extend("invocation: " + line for line in check_dispatcher_invocation())
+    with tempfile.TemporaryDirectory() as tmp:
+        failures.extend(
+            "agent path: " + line for line in check_agent_path_record(Path(tmp))
+        )
     with tempfile.TemporaryDirectory() as tmp:
         failures.extend("--cwd: " + line for line in check_cwd_validation(Path(tmp)))
 
     print(
-        "%d cases, %d timed, %d strip, %d boundary rules, mode matrix, adapters "
-        "and --cwd checked"
+        "%d cases, %d timed, %d strip, %d boundary rules, mode matrix, invocation, "
+        "agent path, adapters and --cwd checked"
         % (len(CASES), len(TIMED), len(STRIP), len(BOUNDARIES["rules"]))
     )
 

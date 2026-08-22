@@ -1557,3 +1557,208 @@ delegated implementation works here at all, and it is not visible in a result th
 | Generated policy | 173 bash rules at both levels, base `"*": "ask"`, no `allow` |
 | Five regression probes | Four fail by name; the fifth exposed the gap in the test itself, now closed |
 | Live delegated run | See the table above |
+
+## Patch: re-verified against the Linux OpenCode binary
+
+Everything this report says about OpenCode above was measured against the **Windows**
+build, reached from WSL over `/mnt/c`. A Linux `opencode` is now installed and
+authenticated, and it is first on PATH:
+
+```
+$ which -a opencode
+/home/mustafa/.nvm/versions/node/v20.20.2/bin/opencode      1.18.21, ELF
+/mnt/c/Users/…/AppData/Roaming/npm/opencode                 the Windows build
+```
+
+The original failure was not a configuration problem. The Linux build had no credentials
+at all, which is what the `UnknownError` was; OpenCode Go was re-authenticated against
+`~/.local/share/opencode/auth.json`.
+
+**Every OpenCode result above is therefore a result about a different program.** What
+follows re-runs the three that mattered. None of it is a regression test: for the implement
+path it is the first run that could have worked at all, because `bench` and `git` were
+unreachable from the Windows build.
+
+### 1. `OPENCODE_CONFIG_CONTENT` reaches the Linux binary natively
+
+Measured with `opencode debug config`, in a repository whose committed `opencode.json` is
+hostile — `"*": "allow"` plus explicit `allow` for `git push*`, `git add -A*`,
+`git commit*`, `mysql*` and `bench migrate*`, at the top level and on the `build` agent.
+
+| | Resolved bash rules | `*` | `allow` | Hostile patterns still allowed |
+| --- | --- | --- | --- | --- |
+| No `OPENCODE_CONFIG_CONTENT` (baseline) | 6 | `allow` | 6 | all five |
+| Set, **`WSLENV` explicitly unset** | 173 | `ask` | **0** | none |
+| Set, `WSLENV` as the dispatcher sets it | 173 | `ask` | **0** | none |
+
+The second and third rows are identical. **The Linux binary reads the variable from the
+environment directly; `WSLENV` is doing nothing here.**
+
+### The `WSLENV` decision: it stays
+
+Not as an unexamined leftover — as the delivery mechanism for a build this dispatcher does
+not get to choose.
+
+`opencode` resolves through PATH, and the Windows build is still installed and still second
+on PATH. If the Linux one is removed, if nvm switches Node version, or if PATH is reordered
+for any other reason, `opencode` becomes the Windows build again — and there the variable
+is not weakened but **absent**: zero bash rules, not even the `"*": "ask"` base, after
+which `--auto` approves everything. That is measured behaviour from earlier in this report,
+not a worry: a delegated run executed `bench migrate` unrefused.
+
+So the line is kept, and kept unconditional rather than made to depend on a guess about
+which build is running. Against that, its cost on Linux is one environment variable that
+nothing reads. The comment in `adapt_opencode` now states this outright, including the
+measurement showing it is inert here, so the next reader does not have to re-derive it.
+
+One change: the entry is no longer appended when `WSLENV` already names
+`OPENCODE_CONFIG_CONTENT`, so a nested run does not repeat it.
+
+### The dispatcher now records which binary it ran
+
+`WSLENV` staying does not make a PATH change safe, only survivable. The change itself is
+still silent, and every OpenCode result in this report is evidence of what that costs:
+findings recorded as facts about "OpenCode" that turned out to be facts about one of two
+programs of that name.
+
+So `result.json` — and `--dry-run`, before anything is spent — now carries:
+
+```json
+"agent_path": "/home/mustafa/.nvm/versions/node/v20.20.2/bin/opencode",
+"agent_real_path": "/home/mustafa/.nvm/versions/node/v20.20.2/lib/node_modules/opencode-ai/bin/opencode.exe"
+```
+
+Both forms, because neither settles it alone. PATH resolution decides which program runs;
+the real path identifies it. And the name identifies nothing: nvm's `opencode` is a symlink
+to a file called `opencode.exe` that `file(1)` reports as `ELF 64-bit LSB executable …
+for GNU/Linux`. Only the directory distinguishes the two builds.
+
+A run measured against the wrong binary is now visible in the record rather than inferred
+from it a phase later.
+
+### 2. Hostile-config refusal, re-run at runtime against the Linux binary
+
+Same repository, hostile `opencode.json` left in place, the model actually calling the
+tools. Six commands attempted in order, one of them a positive control.
+
+| Command | Outcome |
+| --- | --- |
+| `git status --porcelain` (control) | ran |
+| `git push origin master` | refused |
+| `git add -A` | refused |
+| `git commit -m "probe commit"` | refused |
+| `bench migrate` | refused |
+| `mysql --version` | refused |
+
+Five refusals in the transcript, and the rule set the agent was shown opens with
+`{"permission":"*","action":"allow","pattern":"*"}` — `--auto`'s blanket approval, sitting
+in the same resolved set as the denies that beat it. None of the project's own `allow`
+rules appear in it.
+
+**Ground truth, independent of the agent's account:** the bare remote's ref is byte-identical
+before and after (the repository was deliberately left one commit ahead, so a permitted push
+would have moved it permanently); `HEAD` unchanged; nothing staged; working tree clean; no
+`mysql`/`mariadb` version string anywhere in either stream; no bench output anywhere.
+
+### 3. A real delegated implement run, end to end
+
+The first one that could work. Under the Windows build, `bench` was "not recognized as the
+name of a cmdlet" and `git status` failed with `detected dubious ownership` over a UNC path,
+so a delegated implementer could not read the repository it was meant to change.
+
+An orientation run first, because this repository's own rule says isolation is verified
+before it is trusted, not after:
+
+```
+pwd                          …/scratchpad/probe/repo-hostile
+git rev-parse --show-toplevel …/scratchpad/probe/repo-hostile
+which bench                  /usr/local/bin/bench
+uname -s                     Linux
+```
+
+`--dir` lands where it is told, and Linux tooling is reachable. No PowerShell, no UNC path,
+no dubious-ownership refusal in any transcript from this patch.
+
+Then a real task, in a separate clean repository with no `opencode.json`: add a
+`discount_rate` parameter to `line_total`, apply it before tax, reject values outside 0–1,
+add four tests, run the suite.
+
+`status=completed`, `exit_code=0`, 26.0 s, `result_block=present`, `off_contract_keys=[]`,
+`Kimi K2.7 Code` → `opencode-go/kimi-k2.7-code`, effort `low`.
+
+Verified against the filesystem rather than the agent's report:
+
+| Check | Result |
+| --- | --- |
+| Files changed | `src/pricing.py`, `tests/test_pricing.py` — exactly the two claimed |
+| The change | `net = rate * qty * (1 - discount_rate)`, discount before tax, range validated alongside the existing `qty` check |
+| Suite, run by me and not by the agent | 7 tests, `OK` (was 3) |
+| The brief's worked example | `line_total(100.0, 1, 0.15, 0.10)` → `103.5`, as specified |
+| Default unchanged | `line_total(100.0, 1, 0.15)` → `115.0`, as before |
+| Both invalid bounds | `-0.01` and `1.01` both raise `ValueError` |
+| `HEAD` after the run | Unchanged; nothing staged — the orchestrator still owns the commit |
+| Commands the run executed | One: the test command it was asked to run |
+| This repository | Untouched; only the files edited by this patch are modified |
+
+### What this closes and what it re-opens
+
+| Previously recorded | Now |
+| --- | --- |
+| The permission policy is delivered only because `WSLENV` names it | **Corrected.** True of the Windows build only. The Linux build reads it natively; `WSLENV` is inert here and retained for the other build |
+| `--mode implement` against the real OpenCode CLI, verified | **Re-verified on the right binary.** Six earlier runs were against the Windows build |
+| A delegated OpenCode run executes in PowerShell, and `bench`/`git` are unreachable | **Gone.** An environment fact about the Windows build, not about the plugin |
+| Runtime deny under `--auto`, against a hostile project config | **Re-verified.** Five refusals, one positive control, ground truth confirms nothing ran |
+
+Re-opened, and stated plainly: **every OpenCode measurement in the sections above this one
+was taken on the Windows build.** The three re-run here now hold for the Linux binary. The
+rest — the `--cwd` defect and its fix, the parser against real OpenCode stdout, the model
+id and provider-prefix work, `--variant`'s unverified values — were not re-measured. The
+`--cwd` fix is exercised by every run in this patch and the parser handled all three
+transcripts, so both have incidental support; the variant values remain unverified, as they
+were.
+
+### Patch: row 5 of the duplication map is checked
+
+Phase 04's map left row 5 as the one duplication with a live drift risk: three places state
+how to invoke the dispatcher, and none can be generated from it. The hook's deny reason is
+a separate process with no reason to import the dispatcher; the orchestration skill is
+prose; `--help` is argparse's. A mode added to `MODES` updates none of them.
+
+Checked rather than generated, the way each boundary rule asserts that the skill section
+documenting it exists. To make that possible the dispatcher gained two seams:
+`build_parser()`, so the suite can ask which arguments are required, and
+`validate_invocation()`, holding the agent/mode/model rules that were inline in `main()`.
+`REQUIRED_OUTSIDE_PARSER` names `--cwd`, which is required by `resolve_working_directory`
+rather than by argparse and is otherwise invisible to introspection.
+
+`check_dispatcher_invocation()` then fails when the hook's reason enumerates a different
+set of agents or modes than the dispatcher accepts, when it omits a required argument, when
+a skill invocation omits one, when a supported combination is undocumented, or — the
+strongest form available — when an invocation the skill documents is one
+`validate_invocation()` would refuse. The skill's lines are run through the same function a
+real run goes through.
+
+The refusal matrix is unchanged by the refactor: `codex --mode implement`, `opencode --mode
+review`, `opencode --mode onboard`, `opencode` without `--model`, `codex` with `--model`,
+and an absent `--cwd` all still exit 2 with their own message.
+
+### Patch verification
+
+| Check | Result |
+| --- | --- |
+| `claude plugin validate . --strict` | `✔ Validation passed` (exit 0) |
+| `claude plugin validate skills --strict` | `✔ Validation passed` (exit 0) |
+| `python3 tests/test_parser.py` | `38 cases, 3 timed, 8 strip, 9 boundary rules, mode matrix, invocation, agent path, adapters and --cwd checked` … `ok`, exit 0 |
+| `opencode debug config`, three environments | Baseline 6 rules all `allow`; with the policy and `WSLENV` unset, 173 rules, 0 `allow`; with `WSLENV`, identical |
+| Live hostile-config run | 5 refusals, control ran, 95.4 s, `result_block=present` |
+| Ground truth after it | Remote ref unchanged, `HEAD` unchanged, nothing staged, tree clean, no database version string in either stream |
+| Orientation run (isolation verified first) | `pwd`, `git rev-parse --show-toplevel` both the probe repo; `which bench` `/usr/local/bin/bench`; `uname -s` `Linux` |
+| Live implement run | `status=completed`, 26.0 s, `result_block=present`, `off_contract_keys=[]` |
+| Implement run, checked on disk | Two files changed as claimed; suite 3 → 7 tests, `OK` when I run it; worked example correct; both bounds rejected; `HEAD` unchanged |
+| Invocation drift probes | 5 deliberate regressions — mode added to `MODES`, `--cwd` dropped from the hook reason, `--tier` dropped from a skill line, skill documenting `codex --mode implement`, an agent dropped from the reason — all fail by name; control passes |
+| `agent_path` drift probes | 4 more — field removed from the result, PATH read from the wrong process, symlink not followed, a path invented for a missing CLI — all fail by name |
+| Two probes that first fired silently | The stub CLI was a plain file and the child's PATH could not disagree with its own environ. Test corrected — stub is now a symlink, and the PATH lookup is checked in process — after which both fail |
+| Hook payload regression | `opencode run` deny, `codex exec -` deny, `opencode models` and `opencode run --help` pass-through, `git add .` deny, `git push` ask, `bench migrate` ask, `bench --site x migrate` ask, `mysql` ask, `npm test` pass-through — all unchanged; `hooks/guard.py` is not modified by this patch |
+| Refusal matrix after the `main()` refactor | All six refusals unchanged, exit 2 |
+| Added lines over 90 columns | None. `ruff` is not installed on this machine, so this is a column check, not a lint run |
+| This repository after every probe | Only `scripts/delegate` and `tests/test_parser.py` modified; no probe artifact, delegation workspace, or scratch file reached it |

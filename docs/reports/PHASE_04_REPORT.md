@@ -269,6 +269,15 @@ neither side of it was in force. Both are now. The fix is one variable
 (`WSLENV=…:OPENCODE_CONFIG_CONTENT/w`), and the live run afterwards refuses `bench migrate`
 by name with a hostile project config in place.
 
+**Amended.** Everything in this section is true of the **Windows** OpenCode build, which is
+what `opencode` resolved to when it was measured. A Linux `opencode` is now installed and
+first on PATH, and it reads `OPENCODE_CONFIG_CONTENT` from the environment directly:
+`WSLENV` set or unset, the resolved config is identical — 173 bash rules, base `"*": "ask"`,
+zero `allow`, with a hostile project config in place. `WSLENV` is inert on this build. It is
+kept anyway, because the Windows build is still installed and still second on PATH, and
+there its absence is not a weakened policy but no policy at all. See the Phase 03 report for
+the measurement, the decision, and its reasoning.
+
 ## The duplication map
 
 Every rule that exists in more than one place, **after** the mechanical rules were
@@ -288,6 +297,7 @@ patterns, and neither owns a rule.
 | 3 | Live-site execution | rules `site-named`, `site-unnamed`, `database-client`, `frappe-connection` | hook (ask), delegated (deny except the snippet rule, which states why) | same, plus all 76 bench subcommands checked through both engines |
 | 4 | Agent CLIs run through the dispatcher | rules `bare-agent-run`, `bare-agent-exec` | hook (deny) | same |
 | 7 | The orchestrator owns the commit | rule `commit-inside-delegated-run` | delegated (deny); the hook deliberately does not, and says why | same |
+| 5 | The dispatcher's own invocation — agents, modes, required arguments | `scripts/delegate` (`MODES`, `build_parser`, `REQUIRED_OUTSIDE_PARSER`) | `guard.py`'s bare-agent deny reason · `orchestration:231-234` · `--help` | `check_dispatcher_invocation()` — see below |
 
 Three things are asserted that prose could not: that both translations catch each rule's
 examples and leave its counter-examples alone, that the two engines agree wherever both
@@ -302,7 +312,6 @@ documents it, and the suite fails if that section disappears.
 
 | # | Rule | Copies | Kept in sync by |
 | --- | --- | --- | --- |
-| 5 | The dispatcher's own invocation — modes, `--cwd`, `--model` | `orchestration:231-234` · `guard.py` (inside the bare-agent deny reason) · `delegate` (`MODES`, `--cwd` validation) | the contract permits updating the hook's reason string; nothing checks it |
 | 6 | Codex never implements | `orchestration:61,238` · `delegate:26` and its refusal message | nothing |
 | 8 | BLOCKED is not a failed attempt | `orchestration:363-381` · `delegate` review contract text · `frappe-operations:211-221` (defers, does not restate) | nothing |
 | 9 | Context and impact rules | `orchestration:181-205` (4 rules) · `skills/project-context/SKILL.md` (full) | nothing — deliberate, so the rules survive the second skill not loading |
@@ -317,9 +326,9 @@ The remaining rows are of three kinds, and only one is a candidate for the same 
 
 - **Prose stating what a mechanism enforces** (5, 6, 8). These could be checked the way
   rule 3 now checks its skill sections — assert the sentence exists, not generate it. Row
-  5 is the one with a live drift risk, because the hook's deny reason enumerates the
-  dispatcher's modes and required arguments, and a mode added to `MODES` will not update
-  that string.
+  5 was the one with a live drift risk, because the hook's deny reason enumerates the
+  dispatcher's modes and required arguments, and a mode added to `MODES` would not update
+  that string. **Row 5 is now checked** — see below. Rows 6 and 8 are left as they were.
 - **Deliberate redundancy** (9, 10, 11's guidance half). These exist because a skill may
   not load. Collapsing them would remove the property they were built for.
 - **A copy of someone else's source** (12). Nothing in this repository can hold that in
@@ -328,6 +337,71 @@ The remaining rows are of three kinds, and only one is a candidate for the same 
 My recommendation, for what it is worth: row 5 is worth a check, the rest are not worth
 touching. Rows 9 and 10 are load-bearing duplication and rows 12 and 13 are not really
 duplication at all.
+
+**Acted on.** Row 5 is checked; rows 9, 10 and 12 stay as they are, by decision rather
+than by omission.
+
+### Row 5, checked
+
+Three places state how to invoke the dispatcher and none can be generated from it: the
+hook's deny reason lives in a separate process with no reason to import the dispatcher,
+the orchestration skill is prose, and `--help` is argparse's own. The prose stays
+hand-written; what is enforced is that it still describes the dispatcher.
+
+Two seams made that checkable. `build_parser()` lets the suite ask which arguments the
+parser requires. `validate_invocation()` holds the agent/mode/model rules that were inline
+in `main()`. `REQUIRED_OUTSIDE_PARSER` names `--cwd`, required by
+`resolve_working_directory` rather than by argparse and otherwise invisible to
+introspection — and the suite checks that declaration both ways, so it cannot become a
+stale copy of itself.
+
+`check_dispatcher_invocation()` fails when the hook's reason enumerates a different set of
+agents or modes than the dispatcher accepts, when it omits a required argument, when a
+skill invocation omits one, when a supported combination is undocumented, or when the
+skill documents an invocation `validate_invocation()` would refuse. That last one is the
+strongest form available here: the skill's lines are run through the same function a real
+run goes through, so a documented-but-refused invocation fails as a test rather than as a
+usage error one layer away from the mistake.
+
+Five deliberate regressions confirm it fails loudly — a mode added to `MODES`, `--cwd`
+dropped from the deny reason, `--tier` dropped from a skill line, the skill documenting
+`codex --mode implement`, an agent dropped from the reason enumeration. Each fails by
+name; the control passes. `hooks/guard.py` needed no change: its reason string was already
+correct, and is now held that way.
+
+The full write-up is in the Phase 03 report, where the dispatcher lives.
+
+## OpenCode binary note
+
+The `opencode` this phase and Phase 03 measured was the **Windows** build, reached from WSL
+over `/mnt/c`. A Linux build is now installed, authenticated, and first on PATH:
+
+```
+/home/mustafa/.nvm/versions/node/v20.20.2/bin/opencode      1.18.21, ELF
+/mnt/c/Users/…/AppData/Roaming/npm/opencode                 the Windows build
+```
+
+Three things change for this phase's record:
+
+- **The `WSLENV` finding is build-specific.** The Linux binary receives the permission
+  policy without it. Amended in place above.
+- **The PowerShell/UNC observation is gone.** A delegated run now executes in `/bin/bash`
+  on Linux, `bench` resolves to `/usr/local/bin/bench`, and `git` reads the work tree
+  without the dubious-ownership refusal. That was an environment fact about the Windows
+  build, not about the plugin — but it was the reason a delegated implementer could not run
+  this project's own commands, and it no longer applies.
+- **The delegated implement path now works end to end**, verified against the filesystem
+  rather than the agent's report. It had never been exercised successfully before.
+
+The re-runs are in the Phase 03 report, which is where the OpenCode findings were recorded.
+
+**PATH order is the standing risk.** Both builds are installed. Nothing in this plugin
+chooses between them, and a change of PATH order is silent — which is exactly how the
+earlier findings came to be about a program nobody realised they were measuring. The
+dispatcher now writes `agent_path` and `agent_real_path` into every `result.json` and every
+`--dry-run`, so a run measured against the wrong build is visible in the record instead of
+being reconstructed a phase later. The name alone does not settle it: nvm's `opencode` is a
+symlink to a file called `opencode.exe` that is an ELF executable. Only the directory does.
 
 ## Codex version note
 
@@ -361,8 +435,14 @@ expired between the two, which cost this phase its first probe attempt.
 | `ls -A .claude-plugin` | `plugin.json` only — layout rule holds |
 | `find . -type f` | `skills/frappe-operations/` is at the repository root alongside the others |
 | Boundary single-sourcing, drift probes, live deny run | See the Phase 03 report — 51 hook payloads unchanged, five regression probes, `bench migrate` refused live with a hostile project config in place |
+| **Re-verified on the Linux OpenCode binary** | `OPENCODE_CONFIG_CONTENT` delivered natively (`WSLENV` set and unset are identical); hostile-config refusal re-run live, 5 refusals and a positive control; delegated implement run end to end, checked on disk. Full detail in the Phase 03 report |
+| Row 5 checked | `check_dispatcher_invocation()`; five drift regressions each fail by name, control passes |
+| `agent_path` in every result | Recorded and tested end to end against a stub CLI on a controlled PATH; four drift regressions fail by name |
+| `python3 tests/test_parser.py`, after this patch | `38 cases, 3 timed, 8 strip, 9 boundary rules, mode matrix, invocation, agent path, adapters and --cwd checked` … `ok`, exit 0 |
 | `git status --porcelain` before starting | Empty — clean working tree; nothing pre-existing was staged or reverted |
 | Working tree after the probes | No probe artifact, delegation workspace, or scratch file reached this repository |
 
 Not verified: the skill under a live session — see Open question 3. Nothing in this phase
-was run against a real Frappe site, by design.
+was run against a real Frappe site, by design — and that is unchanged by the Linux binary
+being reachable: a delegated run can now execute `bench`, and every bench subcommand that
+resolves a site is denied inside one.

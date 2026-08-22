@@ -324,21 +324,31 @@ def adapt_opencode(*, brief, model_id, effort, mode, cwd, rules=()):
     env = dict(os.environ)
     env["OPENCODE_CONFIG_CONTENT"] = json.dumps(opencode_permissions(rules))
     env["PWD"] = cwd
-    # WSL only hands a variable to a Windows process if WSLENV names it, so on a machine
-    # where the opencode on PATH is the Windows build - which is the case wherever this
-    # plugin runs under WSL against a Windows npm install - the permission policy above
-    # was set in an environment the CLI never saw. It was not weakened, it was absent:
-    # the resolved config had zero bash rules, not even the "*": "ask" base, and --auto
-    # then approves everything. A delegated run executed `bench migrate` unrefused.
+    # A Linux opencode reads OPENCODE_CONFIG_CONTENT from the environment directly, and
+    # measurement says so: with WSLENV unset, the resolved config is this policy - 173
+    # bash rules, base "*": "ask", no allow - and the hostile project config contributes
+    # nothing. WSLENV is not what makes delivery work here.
+    #
+    # It stays anyway, for the build this dispatcher does not choose. WSL hands a variable
+    # to a *Windows* process only if WSLENV names it, and without that the policy is not
+    # weakened but absent: zero bash rules, not even the "*": "ask" base, after which
+    # --auto approves everything. That is not hypothetical - a delegated run executed
+    # `bench migrate` unrefused - and a Windows opencode is still on PATH one position
+    # behind the Linux one on the machine this was measured on. Which one `opencode`
+    # resolves to is a property of PATH, which nothing here controls, so the line is kept
+    # unconditional rather than made to depend on a guess about the build. It is inert
+    # when the CLI is a Linux process, and `agent_path` in the result records which one
+    # actually ran.
     #
     # /w is the direction that matters here (WSL -> Win32); /u is the opposite one and
     # does nothing for this. No path translation: the value is JSON, and /p would mangle
-    # it. Appending is harmless on a pure-Linux machine, where WSLENV is simply unused.
+    # it. Already-named is left alone so a nested run does not repeat the entry.
     existing = env.get("WSLENV")
-    env["WSLENV"] = (
-        "%s:OPENCODE_CONFIG_CONTENT/w" % existing if existing
-        else "OPENCODE_CONFIG_CONTENT/w"
-    )
+    if "OPENCODE_CONFIG_CONTENT/" not in (existing or ""):
+        env["WSLENV"] = (
+            "%s:OPENCODE_CONFIG_CONTENT/w" % existing if existing
+            else "OPENCODE_CONFIG_CONTENT/w"
+        )
     return argv, env, None
 
 
@@ -469,6 +479,30 @@ def resolve_working_directory(raw, fail):
 # --------------------------------------------------------------------------
 # Execution
 # --------------------------------------------------------------------------
+
+
+def resolve_program(name, env):
+    """Which file the CLI name resolves to -> (path on PATH, symlinks followed), or None.
+
+    Recorded in the result because a CLI name is not a build. On the machine this plugin
+    was developed against, `opencode` is a Linux binary in nvm's bin directory and a
+    Windows shim under /mnt/c is second on PATH; they behave differently enough that a
+    result measured against one says little about the other - the Windows build did not
+    receive the permission policy at all, and ran a delegated `bench migrate` unrefused.
+    PATH order is not this dispatcher's to control, and a change to it is silent. Writing
+    the resolved path into every result makes a run measured against the wrong build
+    visible in the record rather than inferred from it afterwards.
+
+    Both forms are kept: PATH resolution is what determines which program runs, and the
+    real path is what identifies it. Neither alone is enough - nvm's `opencode` is a
+    symlink, and the file it points at is named `opencode.exe` while being an ELF
+    executable, so the name settles nothing and the directory settles it.
+
+    PATH is read from the child's environment, not this process's, so what is recorded is
+    what the child will actually resolve.
+    """
+    found = shutil.which(name, path=env.get("PATH"))
+    return (found, os.path.realpath(found)) if found else None
 
 
 def execute(argv, env, stdin_text, cwd, timeout):
@@ -603,7 +637,25 @@ def extract_report(text, mode):
 # --------------------------------------------------------------------------
 
 
-def main():
+# --------------------------------------------------------------------------
+# The invocation
+#
+# Three places outside this file tell someone how to call the dispatcher: the hook's
+# deny reason, which a blocked agent reads instead of running the CLI itself; the
+# orchestration skill, which is what Claude follows; and this module's own --help.
+# None of them can be generated from here - the hook is a separate process with no
+# reason to import this one, and the skill is prose - so all three are copies, and a
+# mode added to MODES updates none of them.
+#
+# What follows is therefore arranged to be checkable rather than merely correct. The
+# parser is built by a function so the suite can ask it which arguments are required,
+# and the combination rules are a function so the suite can run every invocation the
+# skill documents through the same code a real run goes through. The copies stay
+# hand-written; what is enforced is that they still describe this.
+# --------------------------------------------------------------------------
+
+
+def build_parser():
     parser = argparse.ArgumentParser(
         prog="delegate",
         description="Run one coding-agent CLI against the current repository. "
@@ -629,11 +681,19 @@ def main():
         action="store_true",
         help="print the command that would run, and do not run it",
     )
-    args = parser.parse_args()
-    fail = parser.error  # exits 2
+    return parser
 
-    if args.mode not in MODES[args.agent]:
-        if args.agent == "codex" and args.mode == "implement":
+
+# Required, but not by the parser: resolve_working_directory refuses an absent --cwd with
+# an explanation argparse has no room for. Named here so "the required arguments" is a
+# question this file answers, rather than one three copies each answer from memory.
+REQUIRED_OUTSIDE_PARSER = ("--cwd",)
+
+
+def validate_invocation(agent, mode, model, fail):
+    """Reject an agent/mode/model combination the dispatcher does not support."""
+    if mode not in MODES[agent]:
+        if agent == "codex" and mode == "implement":
             fail(
                 "Codex does not implement. It reviews the production code it did not "
                 "write, which is what makes the review independent. Delegate "
@@ -642,8 +702,24 @@ def main():
             )
         fail(
             "--agent %s supports --mode %s"
-            % (args.agent, " or ".join(MODES[args.agent]))
+            % (agent, " or ".join(MODES[agent]))
         )
+    if agent == "opencode":
+        if not model:
+            fail("--model is required for --agent opencode")
+    elif model:
+        fail(
+            "--model is not accepted for --agent %s; %s is not pinned to a model and "
+            "uses its own CLI default." % (agent, agent.capitalize())
+        )
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    fail = parser.error  # exits 2
+
+    validate_invocation(args.agent, args.mode, args.model, fail)
 
     routing = load_routing(fail)
     boundaries = load_boundaries(fail)
@@ -656,16 +732,9 @@ def main():
         fail('tier "%s" has no timeout_seconds in %s' % (args.tier, ROUTING))
 
     if args.agent == "opencode":
-        if not args.model:
-            fail("--model is required for --agent opencode")
         model_id = resolve_model(routing, args.model, fail)
         effort = args.effort if args.effort is not None else tier.get("effort")
     else:
-        if args.model:
-            fail(
-                "--model is not accepted for --agent codex; Codex is not pinned to a "
-                "model and uses its own CLI default."
-            )
         model_id, effort = None, None
 
     brief = "" if sys.stdin.isatty() else sys.stdin.read()
@@ -690,11 +759,14 @@ def main():
     )
 
     if args.dry_run:
+        executable = resolve_program(argv[0], env)
         json.dump(
             {
                 "dry_run": True,
                 "argv": argv,
                 "cwd": cwd,
+                "agent_path": executable[0] if executable else None,
+                "agent_real_path": executable[1] if executable else None,
                 "timeout_seconds": timeout,
                 "stdin": "brief" if stdin_text is not None else None,
                 "env_overrides": {
@@ -715,7 +787,8 @@ def main():
     # Echoed early so the workspace is recoverable if this process is killed.
     print("workspace: %s" % workspace, file=sys.stderr)
 
-    if shutil.which(argv[0]) is None:
+    executable = resolve_program(argv[0], env)
+    if executable is None:
         status, code, out, err, seconds = "cli_missing", None, "", "", 0.0
     else:
         status, code, out, err, seconds = execute(argv, env, stdin_text, cwd, timeout)
@@ -744,6 +817,8 @@ def main():
         "duration_seconds": round(seconds, 1),
         "timeout_seconds": timeout,
         "cwd": cwd,
+        "agent_path": executable[0] if executable else None,
+        "agent_real_path": executable[1] if executable else None,
         "workspace": str(workspace),
         "transcript": str(workspace / "agent-output.txt"),
         "result_block": block_state,
