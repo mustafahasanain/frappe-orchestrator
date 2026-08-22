@@ -329,10 +329,24 @@ diff is what happened.
 ## Environment operations
 
 Some projects need local environment commands to run after implementation before a
-review means anything. If any ran and changed the working tree, inspect the diff again
-before delegating the review.
+review means anything. In a Frappe/ERPNext repository these are the bench operations the
+change actually requires, and which ones those are is decided in:
 
-None are defined yet, so this step is currently a no-op.
+```text
+${CLAUDE_PLUGIN_ROOT}/skills/frappe-operations/SKILL.md
+```
+
+Read it before running any bench command. Four rules hold even when it is not read:
+
+1. The default is no operation. Run what this change requires, never the four by reflex.
+2. A site-dependent command names its site with `--site`, and that site is one
+   `OPERATIONS.md` or the user identified as a development site. An unnamed site is not
+   no site — bench resolves one from configuration.
+3. Run them yourself, as local commands. A Frappe operation is never delegated and never
+   goes in a brief: the hook does not see a delegated agent's shell, and no delegated
+   containment decides which site an operation should touch.
+4. If any operation changed the working tree, inspect the diff again before delegating
+   the review.
 
 ## Review outcome
 

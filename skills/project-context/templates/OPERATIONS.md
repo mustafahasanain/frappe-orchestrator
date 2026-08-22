@@ -6,8 +6,12 @@
 
 ## Setup assumptions
 
-<!-- What must already exist for commands here to work: bench path, site names, package
-     manager, required services. -->
+<!-- What must already exist for commands here to work: bench path, package manager,
+     required services.
+     Name the development site explicitly — "Development site: dev.local". Operations
+     that target a site refuse to guess one, and this file is where that answer lives;
+     without it every migrate and clear-cache stops to ask. Say so plainly for each site
+     listed: a site name alone does not make a site a development site. -->
 
 ## Development
 

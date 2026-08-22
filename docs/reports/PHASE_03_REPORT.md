@@ -172,6 +172,12 @@ inside a TEST run fails structurally.
 > [Safety finding](#correction-read-only-does-execute-commands), where a live run proved
 > it. The conclusion — no OpenCode-style permission map is needed for Codex — still
 > holds.
+>
+> The second half is wrong too, in the other direction. "No network access" does not
+> describe what the sandbox refuses: a network namespace leaves unix sockets untouched,
+> and a Frappe database is reachable over one. Measured in Phase 04, the sandbox is
+> *stronger* than this claim and for a different reason — see
+> [Correction: what the Codex sandbox refuses, and why](#correction-what-the-codex-sandbox-refuses-and-why).
 
 ## Limitations — named, not solved
 
@@ -755,6 +761,10 @@ per command target, not per mode's ability to run anything at all.
 - **It does not clear TEST mode.** `workspace-write` was not exercised. It denies network,
   which stops a TCP connection to a database, but whether it denies a connection over a
   local unix socket was not tested and is not asserted here.
+
+  > Closed by measurement in Phase 04, and this was the right call to leave open — the
+  > reasoning offered for it does not hold, even though the answer came out favourable.
+  > See [Correction: what the Codex sandbox refuses, and why](#correction-what-the-codex-sandbox-refuses-and-why).
 - **It does not show the agent misbehaving.** Running the test suite is a plausible thing
   for an agent asked to understand a repository to do. That is the point: *plausible* and
   *within brief* are different properties, and only the enforcement layer is in a position
@@ -1315,3 +1325,86 @@ inconvenient.
 | Guard matrix after the deny-reason edit | 12 payloads, 0 failures; the reason now states `--cwd <repository root>` |
 | Contract amendment | The Phase 01.5 amendment covered the `--mode` enumeration; widened to what the dispatcher accepts or requires, since `--cwd` is now part of the invocation it states |
 | Working tree | Five files modified, no new file, no delegation artifact in the repository |
+
+
+## Correction: what the Codex sandbox refuses, and why
+
+Written during Phase 04, which exercised `--mode test` against the real CLI for the first
+time. The original text above is left as written; this is the correction.
+
+### What this report claimed
+
+Two things, in two places:
+
+- "`workspace-write` is confined to the working tree with no network access, so a push
+  from inside a TEST run fails structurally."
+- That the sandbox refused the delegated run's MariaDB connection — recorded as the layer
+  that "held", with the mechanism never established.
+
+The conclusions are right. The reason given for the first is wrong, and no reason was ever
+established for the second.
+
+### What was measured
+
+A test-mode run through the dispatcher, in a throwaway repository, writing and running a
+probe that recorded five reachability attempts. Ground truth read from the file the test
+wrote, not from the agent's summary:
+
+| Probe under `codex exec --sandbox workspace-write` | Result |
+| --- | --- |
+| write inside the work tree | ok — the positive control, so the run really executed |
+| AF_UNIX connect to `/run/mysqld/mysqld.sock` | blocked — `PermissionError: [Errno 1] Operation not permitted` |
+| TCP `127.0.0.1:3306` | blocked — same `EPERM` |
+| TCP `1.1.1.1:443` | blocked — same `EPERM` |
+| write to `$HOME` | blocked — read-only file system |
+
+**One identical errno across three address families is the correction.** `EPERM` from
+`connect()` is a syscall-level refusal — the `--apply-seccomp-then-exec` layer, which this
+report never mentioned. A network namespace produces different errors entirely, and the
+difference is what separates the two explanations.
+
+That was checked rather than assumed. Codex's sandbox on Linux is bubblewrap; its flags
+were captured by putting a logging wrapper in front of `bwrap`:
+
+```
+--tmpfs / --dev /dev --unshare-user --unshare-pid --unshare-net --proc /proc
+--permission-profile {…} --apply-seccomp-then-exec
+```
+
+Running the same probe under those namespace flags **without** the seccomp layer gives
+`ECONNREFUSED` for loopback TCP, `ENETUNREACH` for public TCP — and **a successful AF_UNIX
+connection**, complete with the MariaDB server greeting. So the namespace half of the
+sandbox, which is all "no network access" describes, does not close a local socket. The
+seccomp half does.
+
+### Why the wrong reason mattered more than the right conclusion
+
+"No network access" is the reason a later phase would have reasoned from, and it is
+false in a way that points the wrong direction on a Frappe machine: the database's
+primary local route is a unix socket, which is exactly what a network namespace does not
+touch. Anyone extending this — a new mode, a different agent, a relaxed sandbox — would
+have been reasoning from a property the sandbox does not have, about the one connection
+that matters here.
+
+### And the read-only run's refusal is still unexplained
+
+`bench --site masa.local run-tests` was refused, and this report attributed that to the
+sandbox. Which part of the sandbox was never measured, and cannot now be recovered from
+the recorded evidence, because no errno was captured.
+
+One thing that is established: it was not a socket connection. `frappe/__init__.py:369`
+defaults `db_host` to `127.0.0.1` and this bench sets none, so Frappe connected over
+**TCP**. Both the seccomp filter and the empty loopback in the network namespace refuse
+that, and either would produce a refusal. So the run demonstrated that the sandbox stops a
+site connection; it demonstrated nothing about which layer did it, and — this is the part
+worth keeping — it never touched the unix-socket path at all. The decision to leave TEST
+mode explicitly unresolved was correct, and it was correct for a reason the report did not
+know it had.
+
+### The rule this leaves
+
+**A conclusion that turns out right does not make its reason verified.** Both claims here
+survived review, a live run, and three readings of this report, because the outcome kept
+agreeing with them. What separated them was a probe that recorded an errno instead of a
+verdict — the same shape of check as reading stdout and stderr separately rather than
+trusting the terminal.

@@ -170,8 +170,22 @@ Allowed:
 
 - a Frappe operations skill under `skills/`
 - any local operation helper the phase explicitly requires
+- integration edits to earlier skills and to the context templates where the phase
+  requires them
 
 Forbidden: anything that touches a remote host.
+
+**Amendment during Phase 04.** The third item was missing, and Phases 02 and 03 both
+carry it. Without it this phase can only add a skill nothing points at: the orchestration
+skill's environment-operations step would go on saying "None are defined yet, so this
+step is currently a no-op" after the phase that defines them, and `OPERATIONS.md` would
+have nowhere to record which site is the development site — the fact the whole
+no-site-guessing rule depends on. A shipped statement that a step does nothing is worse
+than no section at all, because it is read as current.
+
+The edits stay integration-shaped: a pointer to the new skill plus the rules that must
+hold when it is not read, and one hint comment in a template. This is not licence to
+rewrite earlier phases' work.
 
 ---
 
