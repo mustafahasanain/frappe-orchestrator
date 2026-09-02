@@ -3,7 +3,11 @@
 live-site execution.
 
 Reads a PreToolUse payload on stdin. Prints a JSON permission decision when a rule
-matches, and prints nothing otherwise. Anything it does not recognise is allowed.
+matches, and prints nothing otherwise. A payload carrying no Bash command is allowed -
+there is nothing there to decide about. A failure *inside* this hook is not allowed
+through. Once a command has been extracted, a fault in this hook blocks it: Claude Code
+treats a crashed hook as a *non-blocking* error and runs the command anyway, so a
+traceback here would authorise exactly what the hook failed to look at.
 
 The rules themselves are not here. They live in config/command-boundaries.json, which
 scripts/delegate reads as well - the same boundaries have to hold whether Claude runs a
@@ -103,42 +107,141 @@ REASONS["bare-agent-run"] = AGENT_REASON
 REASONS["bare-agent-exec"] = AGENT_REASON
 
 # Last resort, and deliberately not a second copy of the rules: the programs any rule has
-# ever been about. If the boundary data cannot be read there are no rules to apply, and
+# ever been about. If the boundary data cannot be loaded there are no rules to apply, and
 # silently enforcing nothing is the one failure mode this hook must not have. Asking on
 # these programs turns a total, invisible lapse into a visible degraded one.
 GUARDED_PROGRAMS = frozenset({"git", "bench", "mysql", "mariadb", "opencode", "codex"})
 
-UNREADABLE_REASON = (
-    "The command boundaries could not be read from %s, so none of them are being "
-    "enforced right now, and this command is one they cover. Check that file before "
-    "continuing - a hook that cannot read its rules is not protecting anything."
-) % BOUNDARIES
+# The match kinds this hook implements, and the fields each needs in order to be matched
+# at all. Checked when the data is loaded, because "unreadable" and "unusable" amount to
+# the same thing here: a rule set this file cannot match enforces nothing, and enforcing
+# nothing while looking installed is the failure this hook must not have. Reading the file
+# successfully was never the property that mattered.
+MATCH_FIELDS = {
+    "segment_text": {"lists": ("identifiers",)},
+    "program": {"lists": ("programs",)},
+    "program_option": {"names": ("program",), "lists": ("options",)},
+    "program_subcommand": {"names": ("program",), "lists": ("subcommands",)},
+}
+
+# Not required by any kind, but matched against wherever they appear, so they are checked
+# on the same terms as the required ones.
+OPTIONAL_LISTS = ("any_argument", "unless_flags")
+
+# What this hook can decide. `null` is a decision too - the data stating that a rule is
+# not the hook's to enforce - and is the only other value accepted.
+HOOK_DECISIONS = frozenset({"ask", "deny"})
+
+
+def _string_list(value):
+    """A non-empty list of non-empty strings, the only shape these fields can match on."""
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(item, str) and item for item in value)
+    )
+
+
+def rule_fault(rule, index):
+    """Why this rule cannot be enforced as written, or None if it can be."""
+    if not isinstance(rule, dict):
+        return "rule %d is a %s, not an object" % (index, type(rule).__name__)
+    name = rule.get("name")
+    if not isinstance(name, str) or not name:
+        return "rule %d has no name" % index
+    decision = rule.get("hook")
+    if decision is not None and decision not in HOOK_DECISIONS:
+        return "%s: hook decision %r is not ask, deny or null" % (name, decision)
+    match = rule.get("match")
+    if not isinstance(match, dict):
+        return "%s: match is not an object" % name
+    fields = MATCH_FIELDS.get(match.get("kind"))
+    if fields is None:
+        return "%s: match kind %r is not one this hook implements" % (
+            name, match.get("kind")
+        )
+    for field in fields.get("names", ()):
+        value = match.get(field)
+        if not isinstance(value, str) or not value:
+            return "%s: match.%s is %r, not a program name" % (name, field, value)
+    for field in fields.get("lists", ()):
+        if not _string_list(match.get(field)):
+            return "%s: match.%s is not a non-empty list of strings" % (name, field)
+    for field in OPTIONAL_LISTS:
+        if field in match and not _string_list(match[field]):
+            return "%s: match.%s is not a non-empty list of strings" % (name, field)
+    return None
 
 
 def load_rules():
-    """Rules this hook enforces, in precedence order. None if the data is unusable."""
+    """(rules this hook enforces, in precedence order, None), or (None, why it cannot).
+
+    One faulty entry invalidates the whole set rather than being skipped, because rule
+    order is precedence: a rule this hook cannot match is not merely inert, the next rule
+    matches in its place and decides something else. Skipping it would silently move a
+    command from one rule's decision to another's.
+
+    A rule the data itself excludes - `hook: null`, meaning it is not this hook's to
+    enforce - is a different thing, and is still dropped. That exclusion is stated in the
+    data and is the answer, not a gap in it.
+    """
     try:
-        rules = json.loads(BOUNDARIES.read_text())["rules"]
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
+        data = json.loads(BOUNDARIES.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError) as exc:
+        return None, "%s could not be read (%s: %s)" % (
+            BOUNDARIES, type(exc).__name__, exc
+        )
+    if not isinstance(data, dict):
+        return None, "%s holds a %s, not an object" % (BOUNDARIES, type(data).__name__)
+    rules = data.get("rules")
+    if not isinstance(rules, list):
+        return None, "%s has no rules list (found %s)" % (
+            BOUNDARIES, type(rules).__name__
+        )
+    if not rules:
+        return None, "%s declares no rules at all" % BOUNDARIES
     usable = []
-    for rule in rules:
-        if not isinstance(rule, dict) or not rule.get("hook"):
+    for index, rule in enumerate(rules):
+        fault = rule_fault(rule, index)
+        if fault is not None:
+            return None, "%s cannot be enforced as written - %s" % (BOUNDARIES, fault)
+        if not rule.get("hook"):
             continue
-        match = rule.get("match") or {}
-        if match.get("kind") == "segment_text":
+        match = rule["match"]
+        if match["kind"] == "segment_text":
             # Word-bounded so `frappe.db` does not fire on `frappe.database`. Built here
             # rather than stored as a regex: the data says which identifiers matter, and
             # this is the one engine that expresses that as a pattern.
-            idents = match.get("identifiers") or []
-            rule = dict(rule, _pattern=re.compile(
-                "(?:%s)\\b" % "|".join(re.escape(i) for i in idents)
-            ))
+            try:
+                pattern = re.compile(
+                    "(?:%s)\\b" % "|".join(re.escape(i) for i in match["identifiers"])
+                )
+            except re.error as exc:
+                return None, "%s cannot be enforced as written - %s: identifiers do " \
+                             "not compile (%s)" % (BOUNDARIES, rule["name"], exc)
+            rule = dict(rule, _pattern=pattern)
         usable.append(rule)
-    return usable
+    if not usable:
+        return None, "no rule in %s declares a decision for this hook" % BOUNDARIES
+    return usable, None
 
 
-RULES = load_rules()
+RULES, RULES_FAULT = load_rules()
+
+
+def degraded_reason():
+    """What a caller is told when the rules could not be loaded at all.
+
+    Built when it is needed rather than at import, so it always reports the fault this
+    process actually hit.
+    """
+    return (
+        "The command boundaries are not being enforced right now, and this command is "
+        "one they cover. %s. Until that file loads, nothing in this hook is guarding the "
+        "push, staging, live-site or agent-CLI boundaries - so treat this command as "
+        "unreviewed, and fix the file before continuing. A hook that cannot load its "
+        "rules is not protecting anything."
+    ) % (RULES_FAULT or "The reason was not recorded")
 
 
 def split_tokens(segment):
@@ -224,7 +327,7 @@ def check(segment):
     if RULES is None:
         # Degraded: no rules loaded. Ask on the programs the rules are about rather than
         # enforcing nothing at all.
-        return ("ask", UNREADABLE_REASON) if program(
+        return ("ask", degraded_reason()) if program(
             split_tokens(segment)
         ) in GUARDED_PROGRAMS else None
 
@@ -234,21 +337,26 @@ def check(segment):
     return rule["hook"], REASONS.get(rule["name"]) or rule.get("intent", "")
 
 
-def main():
-    try:
-        payload = json.load(sys.stdin)
-    except ValueError:
-        return
+INTERNAL_FAILURE_REASON = (
+    "Blocked by an internal failure in the enforcement hook, not by a rule: it faulted "
+    "while deciding whether this command crosses a command boundary, so it never "
+    "established whether one applies (%s). Blocked rather than put to the user, because "
+    "a prompt would ask for approval of a command nobody has evaluated. Report the fault "
+    "- while the hook is faulting, no boundary is being enforced for any command - and "
+    "do not work around it by rephrasing the command."
+)
 
-    command = (payload.get("tool_input") or {}).get("command")
-    if not isinstance(command, str):
-        return
+# Claude Code's blocking exit status for a PreToolUse hook. Any other non-zero status is
+# a *non-blocking* error there: the command runs.
+BLOCKED_EXIT = 2
 
-    matches = [m for m in (check(s) for s in SEPARATORS.split(command)) if m]
-    if not matches:
-        return
 
-    decision, reason = next((m for m in matches if m[0] == "deny"), matches[0])
+def emit(decision, reason):
+    """Write the one permission decision this hook is allowed to produce.
+
+    The only place this JSON shape is written. A second copy is how the field names drift
+    apart from what Claude Code parses.
+    """
     json.dump(
         {
             "hookSpecificOutput": {
@@ -261,5 +369,108 @@ def main():
     )
 
 
+def fail_closed(detail):
+    """Block the command this hook failed to evaluate. Does not return.
+
+    Both signalling layers, deliberately, because this runs precisely when something in
+    the hook is already not working: `deny` is the decision Claude Code acts on, and exit
+    2 blocks on its own with stderr fed back, which covers the case where the JSON never
+    arrived - a half-written stdout, a closed pipe, a decision that could not be parsed.
+    Either alone is enough while the hook is healthy, which is not the situation here.
+    """
+    reason = INTERNAL_FAILURE_REASON % detail
+    try:
+        emit("deny", reason)
+        sys.stdout.flush()
+    except Exception:
+        pass   # not a silent failure: the exit status below blocks without stdout
+    try:
+        print(reason, file=sys.stderr)
+    except Exception:
+        pass   # same - stderr is the diagnostic, not the mechanism
+    raise SystemExit(BLOCKED_EXIT)
+
+
+def read_command():
+    """The Bash command in a PreToolUse payload, or None. Never raises.
+
+    None means there is nothing here to decide about: no payload, no `tool_input`, no
+    `command`, or a `command` that is not a usable string. That case passes through, which
+    is this hook's existing protocol for input it does not recognise.
+
+    It is deliberately not the same as "deciding failed". Every failure this function
+    swallows happened before a command was in hand, so there is nothing it could have
+    authorised. A failure with a command in hand is main()'s to handle, and is not an
+    allow.
+    """
+    try:
+        payload = json.load(sys.stdin)
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return None
+    command = tool_input.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return None
+    return command
+
+
+def decide(command):
+    """(decision, reason) for a whole command, or None when no rule covers it.
+
+    A deny outranks an ask whichever segment each came from: the command is submitted as
+    one unit, so the strongest decision any part of it earns is the decision for all of
+    it. Among equals the first segment wins.
+    """
+    matches = [m for m in (check(segment) for segment in SEPARATORS.split(command)) if m]
+    if not matches:
+        return None
+    return next((m for m in matches if m[0] == "deny"), matches[0])
+
+
+def main():
+    """Read one payload, emit one decision, or block. Raises only SystemExit."""
+    command = read_command()
+    if command is None:
+        return
+
+    try:
+        outcome = decide(command)
+    except Exception as exc:
+        # A command is in hand and is about to run unless this hook stops it, and the
+        # hook has just established that it cannot say whether a boundary applies. Not an
+        # allow, and not an ask either: asking hands that question to someone with
+        # strictly less information than the code that failed to answer it, and an
+        # approved-anyway command is the same outcome as never having checked.
+        detail = ("%s: %s" % (type(exc).__name__, exc))[:400]
+        fail_closed(detail)
+        return   # unreachable; kept so a future edit to fail_closed cannot fall through
+
+    if outcome is None:
+        return
+
+    try:
+        emit(*outcome)
+    except Exception as exc:
+        # A decision was reached and could not be delivered. For an ask or a deny that is
+        # indistinguishable, at the far end, from no decision at all - so it blocks rather
+        # than returning, which is what this used to do.
+        detail = "the decision could not be written - %s: %s" % (type(exc).__name__, exc)
+        fail_closed(detail[:400])
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise   # fail_closed's blocking status, on its way out
+    except BaseException as exc:
+        # main() is written to raise nothing else. Kept because the cost of being wrong is
+        # an uncaught traceback, which exits 1, which Claude Code reports as a
+        # non-blocking error before running the command. BaseException rather than
+        # Exception for the same reason: a hook killed mid-evaluation has not evaluated
+        # anything, and exit 130 is as non-blocking as exit 1.
+        fail_closed(("%s: %s" % (type(exc).__name__, exc))[:400])

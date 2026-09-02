@@ -16,6 +16,13 @@ checked here because it is the defect that motivated the mode: a FAIL that is a 
 artefact rather than a judgement is, where the orchestrator reads it, indistinguishable
 from a real one.
 
+The hook earns coverage for the opposite reason to the one first assumed here. A hook
+that denies the wrong command does announce itself. A hook that *allows* the wrong command
+announces nothing at all - and it can do that because its rule data became unusable, or
+because it faulted and Claude Code treats a crashed hook as a non-blocking error and runs
+the command anyway. Both were reachable and neither was visible, so the hook's real entry
+point is exercised here as a process, payload on stdin, exactly as Claude Code runs it.
+
 Two fixtures are real captured stdout from `codex exec`, not invented samples. The
 inner-fence one is the output that broke the previous parser: its own `detail` string
 contains a fenced example, and a regex delimiting a block on triple backticks truncates
@@ -27,10 +34,12 @@ No framework and nothing to install: standard library only.
 import fnmatch
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -67,6 +76,8 @@ def fixture(name):
 d = load_dispatcher()
 g = load_module(ROOT / "hooks" / "guard.py", "guard")
 BOUNDARIES = json.loads((ROOT / "config" / "command-boundaries.json").read_text())
+BOUNDARY_FILE = ROOT / "config" / "command-boundaries.json"
+GUARD = ROOT / "hooks" / "guard.py"
 extract = d.extract_report
 
 BANNER = "OpenAI Codex v0.149.0\n--------\nmodel: gpt-5.6-sol\n--------\n"
@@ -708,6 +719,623 @@ def check_dispatcher_invocation():
     return problems
 
 
+# --------------------------------------------------------------------------
+# The hook's entry point
+#
+# Everything below runs `hooks/guard.py` as a process with a payload on stdin, which is
+# what Claude Code does. Calling `check()` in process, which the boundary checks above do,
+# cannot see any of it: not the payload contract, not the JSON that Claude Code parses,
+# not what happens when the rule data will not load, and not what happens when the hook
+# faults. Three of those were failing open before this was written.
+# --------------------------------------------------------------------------
+
+
+def payload(command):
+    """A PreToolUse payload shaped the way Claude Code delivers one."""
+    return json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+
+
+def run_hook(stdin_text, guard=None):
+    """One hook process, payload on stdin. Returns the finished process."""
+    return subprocess.run(
+        [sys.executable, str(guard or GUARD)],
+        input=stdin_text, capture_output=True, text=True, timeout=60,
+    )
+
+
+def outcome(proc):
+    """(decision, reason) for a finished hook run.
+
+    "allow" is the absence of a decision, which is how this hook permits a command - so a
+    run that produced no output is an allow, and must be read as one. Anything that is not
+    a clean exit with either no output or exactly one well-formed decision is reported as
+    a fault, because that is what Claude Code would be left to interpret: a non-zero exit
+    is a non-blocking error there, after which the command runs.
+    """
+    if proc.returncode != 0:
+        return "exit%d" % proc.returncode, proc.stderr.strip()[-160:]
+    if not proc.stdout.strip():
+        return "allow", ""
+    try:
+        block = json.loads(proc.stdout)["hookSpecificOutput"]
+        decision, reason = block["permissionDecision"], block["permissionDecisionReason"]
+    except (ValueError, KeyError, TypeError) as exc:
+        return "unparseable", "%s: %r" % (type(exc).__name__, proc.stdout[:100])
+    # A decision Claude Code cannot act on is not a decision. Reported rather than
+    # returned as-is, so a caller comparing it never has to be defensive about the type -
+    # and so a hook that emits one fails by name instead of raising out of a test.
+    if not isinstance(decision, str):
+        return "invalid(%r)" % (decision,), reason if isinstance(reason, str) else ""
+    return decision, reason if isinstance(reason, str) else ""
+
+
+# (name, raw stdin, expected decision)
+# The shapes that are not dictionaries all the way down are here because every one of them
+# raised AttributeError out of main() and exited 1, which Claude Code reports as a
+# non-blocking error - so the command ran. "allow" is the correct answer for them, but it
+# has to be an allow the hook decided, not one a traceback produced.
+HOOK_PAYLOADS = [
+    # --- payloads carrying a real command ------------------------------------
+    ("valid payload, ask rule", payload("git push"), "ask"),
+    ("valid payload, deny rule", payload("git add ."), "deny"),
+    ("valid payload, no rule", payload("ls -la"), "allow"),
+    ("command with unknown sibling fields", json.dumps(
+        {"tool_name": "Bash", "session_id": "s", "cwd": "/x",
+         "tool_input": {"command": "git push", "timeout": 120}}), "ask"),
+
+    # --- nothing to decide about ---------------------------------------------
+    ("empty stdin", "", "allow"),
+    ("invalid JSON", "not json", "allow"),
+    ("truncated JSON", '{"tool_input":', "allow"),
+    ("JSON null", "null", "allow"),
+    ("top-level array", "[]", "allow"),
+    ("top-level string", '"hello"', "allow"),
+    ("top-level number", "5", "allow"),
+    ("top-level bool", "true", "allow"),
+    ("empty object", "{}", "allow"),
+    ("no tool_input", '{"tool_name": "Bash"}', "allow"),
+    ("tool_input null", '{"tool_input": null}', "allow"),
+    ("tool_input array", '{"tool_input": ["git push"]}', "allow"),
+    ("tool_input string", '{"tool_input": "git push"}', "allow"),
+    ("tool_input number", '{"tool_input": 7}', "allow"),
+    ("tool_input empty object", '{"tool_input": {}}', "allow"),
+    ("no command key", '{"tool_input": {"bash_id": "x"}}', "allow"),
+    ("command null", '{"tool_input": {"command": null}}', "allow"),
+    ("command number", '{"tool_input": {"command": 123}}', "allow"),
+    ("command array", '{"tool_input": {"command": ["git", "push"]}}', "allow"),
+    ("command object", '{"tool_input": {"command": {"run": "git push"}}}', "allow"),
+    ("command empty string", '{"tool_input": {"command": ""}}', "allow"),
+    ("command whitespace only", '{"tool_input": {"command": "   \\n  "}}', "allow"),
+    ("nested past the recursion limit", "[" * 20000 + "]" * 20000, "allow"),
+]
+
+
+def check_hook_payloads():
+    """Every payload shape produces a decision, and none produces a traceback."""
+    problems = []
+    for name, stdin_text, want in HOOK_PAYLOADS:
+        proc = run_hook(stdin_text)
+        got, reason = outcome(proc)
+        if "Traceback" in proc.stderr:
+            problems.append(
+                "%s: the hook raised - %s" % (name, proc.stderr.strip()[-120:])
+            )
+        if proc.returncode != 0:
+            problems.append(
+                "%s: exit %d. Claude Code treats a non-zero hook exit as a non-blocking "
+                "error and runs the command, so this is an allow the hook did not decide"
+                % (name, proc.returncode)
+            )
+            continue
+        if got != want:
+            problems.append("%s: decided %r, wanted %r" % (name, got, want))
+        if got != "allow" and not reason.strip():
+            problems.append("%s: decided %r with an empty reason" % (name, got))
+    return problems
+
+
+def check_hook_response_shape():
+    """The JSON Claude Code parses, checked as a contract rather than as non-empty text.
+
+    Every field name here was verified against the hooks reference when the hook was
+    written and none of them is guessable: a typo in `hookSpecificOutput` or in
+    `permissionDecision` is a decision Claude Code silently does not act on, which looks
+    exactly like a hook that chose to allow.
+    """
+    problems = []
+    want_keys = ["hookEventName", "permissionDecision", "permissionDecisionReason"]
+    for command, want in (("git push", "ask"), ("git add .", "deny")):
+        proc = run_hook(payload(command))
+        if proc.returncode != 0:
+            problems.append("%r: exit %d" % (command, proc.returncode))
+            continue
+        try:
+            body = json.loads(proc.stdout)
+        except ValueError as exc:
+            problems.append("%r: stdout is not JSON (%s)" % (command, exc))
+            continue
+        if not isinstance(body, dict) or list(body) != ["hookSpecificOutput"]:
+            problems.append(
+                "%r: top level is %r, wanted exactly hookSpecificOutput"
+                % (command, sorted(body) if isinstance(body, dict) else type(body).__name__)
+            )
+            continue
+        block = body["hookSpecificOutput"]
+        if not isinstance(block, dict):
+            problems.append("%r: hookSpecificOutput is a %s" % (command, type(block).__name__))
+            continue
+        if sorted(block) != want_keys:
+            problems.append(
+                "%r: hookSpecificOutput carries %r, wanted %r"
+                % (command, sorted(block), want_keys)
+            )
+        if block.get("hookEventName") != "PreToolUse":
+            problems.append(
+                "%r: hookEventName is %r" % (command, block.get("hookEventName"))
+            )
+        if block.get("permissionDecision") != want:
+            problems.append(
+                "%r: permissionDecision is %r, wanted %r"
+                % (command, block.get("permissionDecision"), want)
+            )
+        reason = block.get("permissionDecisionReason")
+        if not isinstance(reason, str) or not reason.strip():
+            problems.append("%r: permissionDecisionReason is %r" % (command, reason))
+        if proc.stdout.count("hookSpecificOutput") != 1:
+            problems.append("%r: more than one decision was written" % command)
+    return problems
+
+
+# (name, command, expected decision, the rule whose reason text must come back)
+# A command is submitted as one unit, so the strongest decision any segment earns is the
+# decision for all of it. The reason is asserted too: a right decision carrying another
+# rule's explanation sends the reader to check the wrong thing.
+PRECEDENCE = [
+    ("deny outranks an earlier ask", "bench migrate; git add .", "deny", "blanket-staging"),
+    ("deny outranks a later ask", "git add .; bench migrate", "deny", "blanket-staging"),
+    ("two asks: the first segment wins", "bench migrate && git push", "ask", "site-unnamed"),
+    ("ask beside a pass-through", "ls -la; git push", "ask", "push"),
+    ("pipe is a separator", "git status | git push", "ask", "push"),
+    ("newline is a separator, so a heredoc body is seen",
+     "bash <<'EOF'\ngit add -A\nEOF", "deny", "blanket-staging"),
+    ("nothing matches", "ls -la; npm test", "allow", None),
+]
+
+
+def check_decision_precedence():
+    """deny > ask > allow, across the segments of one command."""
+    problems = []
+    for name, command, want, rule in PRECEDENCE:
+        got, reason = outcome(run_hook(payload(command)))
+        if got != want:
+            problems.append("%s: %r decided %r, wanted %r" % (name, command, got, want))
+            continue
+        if rule is None:
+            continue
+        expected = g.REASONS.get(rule) or ""
+        if reason != expected:
+            problems.append(
+                "%s: %r decided %r but with %s's reason, not %s's"
+                % (name, command, got,
+                   next((n for n, t in g.REASONS.items() if t == reason), "an unknown rule"),
+                   rule)
+            )
+    return problems
+
+
+ABSENT = object()   # the mutation that removes the file rather than rewriting it
+
+
+def _rules(data, name, **overrides):
+    """The rule set with one named rule's fields replaced."""
+    return dict(data, rules=[
+        dict(rule, **overrides) if rule["name"] == name else rule
+        for rule in data["rules"]
+    ])
+
+
+def _match(data, name, **overrides):
+    """The rule set with one named rule's match fields replaced."""
+    return _rules(data, name, match=dict(
+        next(r for r in data["rules"] if r["name"] == name)["match"], **overrides
+    ))
+
+
+def _drop(data, name, key):
+    """The rule set with one key removed from one named rule."""
+    return dict(data, rules=[
+        {k: v for k, v in rule.items() if k != key} if rule["name"] == name else rule
+        for rule in data["rules"]
+    ])
+
+
+# (name, mutation) - each returns what to write in place of the boundary data.
+# Every entry here silently disabled the hook entirely, or crashed it on every command,
+# before load_rules() validated its input. The four that only fail to *read* were already
+# handled and are kept as the control group: the fix is that the rest behave like them.
+BOUNDARY_FAULTS = [
+    # --- unreadable: already degraded correctly, kept so that stays true -----
+    ("file absent", lambda data: ABSENT),
+    ("empty file", lambda data: ""),
+    ("invalid JSON", lambda data: "{not json"),
+    ("not UTF-8", lambda data: b"\xff\xfe{\x00}\x00"),
+    # --- structurally wrong above the rules ---------------------------------
+    ("top level is an array", lambda data: [data]),
+    ("top level is a string", lambda data: '"rules"'),
+    ("no rules key", lambda data: {k: v for k, v in data.items() if k != "rules"}),
+    # --- rules present but not a usable collection ---------------------------
+    ("rules: []", lambda data: dict(data, rules=[])),
+    ("rules: {}", lambda data: dict(data, rules={})),
+    ("rules: 'x'", lambda data: dict(data, rules="x")),
+    ("rules: 42", lambda data: dict(data, rules=42)),
+    ("rules holds strings", lambda data: dict(data, rules=["push", "blanket-staging"])),
+    ("rules holds objects and a string",
+     lambda data: dict(data, rules=[data["rules"][0], "blanket-staging"] + data["rules"][2:])),
+    ("rules holds a null", lambda data: dict(data, rules=[None] + data["rules"])),
+    ("every rule hook: null",
+     lambda data: dict(data, rules=[dict(r, hook=None) for r in data["rules"]])),
+    # --- a rule the hook cannot match ---------------------------------------
+    ("unsupported match kind", lambda data: _match(data, "push", kind="regex")),
+    ("match kind absent",
+     lambda data: _rules(data, "push", match={"program": "git", "subcommands": ["push"]})),
+    ("match is not an object", lambda data: _rules(data, "push", match="git push")),
+    ("rule missing match", lambda data: _drop(data, "push", "match")),
+    ("rule missing name", lambda data: _drop(data, "push", "name")),
+    # --- match data the hook cannot use -------------------------------------
+    ("subcommands is a string", lambda data: _match(data, "push", subcommands="push")),
+    ("subcommands is empty", lambda data: _match(data, "push", subcommands=[])),
+    ("subcommands holds a number", lambda data: _match(data, "push", subcommands=["push", 5])),
+    ("program is not a string", lambda data: _match(data, "site-named", program=5)),
+    ("options is empty", lambda data: _match(data, "site-named", options=[])),
+    ("programs is a string", lambda data: _match(data, "database-client", programs="mysql")),
+    ("identifiers is empty", lambda data: _match(data, "frappe-connection", identifiers=[])),
+    ("any_argument is a string", lambda data: _match(data, "blanket-staging", any_argument=".")),
+    ("unless_flags holds a number",
+     lambda data: _match(data, "bare-agent-run", unless_flags=["--help", 5])),
+    # --- a decision the hook cannot make ------------------------------------
+    ("hook decision is allow", lambda data: _rules(data, "push", hook="allow")),
+    ("hook decision is a number", lambda data: _rules(data, "push", hook=5)),
+    ("hook decision is an empty string", lambda data: _rules(data, "push", hook="")),
+]
+
+# What a degraded hook must do. Protected commands are asked about - never allowed - and
+# an unrelated command still passes through, because a hook that stopped every command
+# would be removed, which is the outcome degrading exists to avoid.
+DEGRADED_EXPECTED = (
+    ("git push", "ask"),
+    ("git add .", "ask"),
+    ("bench migrate", "ask"),
+    ("mysql -u root", "ask"),
+    ("ls -la", "allow"),
+)
+
+# What the same commands get when the data is intact. The control: it runs against a copy
+# of the tree, so a degraded answer everywhere cannot be the copying.
+INTACT_EXPECTED = (
+    ("git push", "ask"),
+    ("git add .", "deny"),
+    ("bench migrate", "ask"),
+    ("mysql -u root", "ask"),
+    ("ls -la", "allow"),
+)
+
+
+def check_shipped_rules_load():
+    """The rule data in this repository must satisfy the validation, rule by rule.
+
+    Checked separately from the fault table so that a real edit to the boundary data that
+    the hook cannot enforce fails here by rule name, rather than as four commands
+    mysteriously degrading.
+    """
+    problems = []
+    if g.RULES is None:
+        problems.append("the shipped boundary data does not load: %s" % g.RULES_FAULT)
+    if g.RULES_FAULT is not None:
+        problems.append("load_rules reported a fault: %s" % g.RULES_FAULT)
+    for index, rule in enumerate(BOUNDARIES["rules"]):
+        fault = g.rule_fault(rule, index)
+        if fault is not None:
+            problems.append(fault)
+    enforced = [r["name"] for r in BOUNDARIES["rules"] if r.get("hook")]
+    if g.RULES is not None and [r["name"] for r in g.RULES] != enforced:
+        problems.append(
+            "the hook loaded %r, but the data declares a hook decision for %r"
+            % ([r["name"] for r in g.RULES], enforced)
+        )
+    return problems
+
+
+def check_boundary_config_faults(tmp):
+    """Unusable rule data must degrade visibly, never enforce nothing silently.
+
+    `load_rules` used to return an empty list for most of these, which is not `None`, so
+    the degraded path never ran and every command was allowed with no output and exit 0 -
+    a hook that looked installed, said nothing, and guarded nothing. Two others raised on
+    every command instead, which exits non-zero, which Claude Code reports as a
+    non-blocking error before running the command anyway. Same outcome, louder.
+
+    Each mutation gets its own copy of the plugin's two runtime files. The repository's own
+    boundary data is read but never written.
+    """
+    problems = []
+    data = json.loads(BOUNDARY_FILE.read_text())
+
+    def guard_for(slot, written):
+        root = tmp / slot
+        (root / "hooks").mkdir(parents=True)
+        (root / "config").mkdir()
+        shutil.copy(GUARD, root / "hooks" / "guard.py")
+        target = root / "config" / "command-boundaries.json"
+        if written is ABSENT:
+            pass
+        elif isinstance(written, bytes):
+            target.write_bytes(written)
+        elif isinstance(written, str):
+            target.write_text(written)
+        else:
+            target.write_text(json.dumps(written))
+        return root / "hooks" / "guard.py"
+
+    # The control first: the same copying, with the data intact.
+    control = guard_for("control", data)
+    for command, want in INTACT_EXPECTED:
+        got, _reason = outcome(run_hook(payload(command), control))
+        if got != want:
+            problems.append(
+                "control (data intact, in a copied tree): %r decided %r, wanted %r - the "
+                "copies below prove nothing if this one is already degraded"
+                % (command, got, want)
+            )
+
+    for slot, (name, mutate) in enumerate(BOUNDARY_FAULTS):
+        guard = guard_for("fault-%02d" % slot, mutate(data))
+        for command, want in DEGRADED_EXPECTED:
+            proc = run_hook(payload(command), guard)
+            got, reason = outcome(proc)
+            if "Traceback" in proc.stderr:
+                problems.append(
+                    "%s: %r raised - %s" % (name, command, proc.stderr.strip()[-100:])
+                )
+            if got == want:
+                continue
+            if want == "ask" and got == "allow":
+                problems.append(
+                    "%s: %r was ALLOWED. Unusable rule data must never silently enforce "
+                    "nothing" % (name, command)
+                )
+            elif want == "ask" and got.startswith("exit"):
+                problems.append(
+                    "%s: %r exited non-zero (%s), which Claude Code treats as a "
+                    "non-blocking error - the command would run" % (name, command, got)
+                )
+            else:
+                problems.append("%s: %r decided %r, wanted %r" % (name, command, got, want))
+        # The reason has to say what is wrong, or the degraded state is undiagnosable.
+        _got, reason = outcome(run_hook(payload("git push"), guard))
+        if "not being enforced" not in reason:
+            problems.append(
+                "%s: the degraded reason does not say the boundaries are unenforced: %r"
+                % (name, reason[:80])
+            )
+        elif "command-boundaries.json" not in reason and "declares no rules" not in reason:
+            problems.append(
+                "%s: the degraded reason names neither the file nor the fault: %r"
+                % (name, reason[:80])
+            )
+    return problems
+
+
+# Injected into a copy of the hook so the fault can be observed end to end, at the
+# process boundary, where the exit status lives. `check` is redefined after the real one,
+# and `decide` resolves it as a global at call time, so the copy faults exactly where a
+# real engine fault would.
+INJECT_FAULT = (
+    'def check(segment):   # noqa: F811 - injected fault\n'
+    '    raise RuntimeError("injected: rule engine fault")\n'
+    '\n'
+    '\n'
+    'def decide(command):'
+)
+
+
+INJECT_LATE_FAULT = (
+    '    raise MemoryError("injected: fault after the command was read")'
+)
+
+
+def check_internal_failure_is_fail_closed(tmp):
+    """A fault inside the matching engine must block the command, not ask about it.
+
+    No payload and no configuration can reach this path from outside - the validation
+    above exists to prevent it - which is exactly why the fault is injected. The property
+    under test does not depend on having predicted the fault: once a command has been
+    extracted, a hook that cannot say whether a boundary applies does not let the command
+    run, and does not put the question to a user who knows less about it than the code
+    that just failed to answer it.
+
+    `ls -la` is the probe on purpose. The working hook passes it through, so a block here
+    can only have come from the failure path, and an allow would be indistinguishable
+    from the hook working correctly.
+
+    Both layers are checked, because either one alone can be mishandled: the `deny`
+    decision on stdout, and the exit status, which blocks even when the JSON does not
+    arrive.
+    """
+    problems = []
+
+    # --- at the process boundary: decision, exit status and stderr -----------
+    faulted = tmp / "faulted-guard.py"
+    text = GUARD.read_text()
+    if text.count("def decide(command):") != 1:
+        return ["cannot inject a fault: decide() is not where this test expects it"]
+    faulted.write_text(text.replace("def decide(command):", INJECT_FAULT, 1))
+
+    proc = run_hook(payload("ls -la"), faulted)
+    if "Traceback" in proc.stderr:
+        problems.append(
+            "the fault escaped as a traceback: %s" % proc.stderr.strip()[-120:]
+        )
+    if proc.returncode != g.BLOCKED_EXIT:
+        problems.append(
+            "exit %d on an internal failure, wanted %d. Every other non-zero status is a "
+            "non-blocking error to Claude Code, after which the command runs"
+            % (proc.returncode, g.BLOCKED_EXIT)
+        )
+    # outcome() reads a non-zero exit as a fault, which it is, so the decision is read
+    # off stdout directly here - both layers have to be checked separately.
+    try:
+        decision = json.loads(proc.stdout)["hookSpecificOutput"]["permissionDecision"]
+    except (ValueError, KeyError, TypeError) as exc:
+        decision = None
+        problems.append(
+            "no usable decision on stdout (%s): %r" % (type(exc).__name__, proc.stdout[:100])
+        )
+    if decision in ("allow", "ask"):
+        problems.append(
+            "an internal failure decided %r. Once a command has been extracted, a hook "
+            "that could not evaluate it must not authorise it or ask for it to be "
+            "authorised" % decision
+        )
+    elif decision is not None and decision != "deny":
+        problems.append("an internal failure decided %r, wanted deny" % decision)
+    if "internal failure" not in proc.stderr:
+        problems.append(
+            "stderr does not identify an internal guard failure, and it is the only "
+            "channel left when stdout is not read: %r" % proc.stderr.strip()[:100]
+        )
+
+    # --- in process, so the emitted reason can be inspected directly ---------
+    original = g.check
+
+    def exploding(_segment):
+        raise RuntimeError("injected: rule engine fault")
+
+    captured = io.StringIO()
+    stdin, stdout, stderr = sys.stdin, sys.stdout, sys.stderr
+    status = None
+    g.check = exploding
+    try:
+        sys.stdin = io.StringIO(payload("ls -la"))
+        sys.stdout = captured
+        sys.stderr = io.StringIO()
+        g.main()
+    except SystemExit as exc:
+        status = exc.code
+    except BaseException as exc:
+        problems.append(
+            "main() raised %s rather than exiting. An uncaught exception exits 1, which "
+            "Claude Code reports as a non-blocking error before running the command"
+            % type(exc).__name__
+        )
+    finally:
+        sys.stdin, sys.stdout, sys.stderr = stdin, stdout, stderr
+        g.check = original
+
+    if status != g.BLOCKED_EXIT:
+        problems.append("main() exited %r on an internal failure, wanted %r"
+                        % (status, g.BLOCKED_EXIT))
+    written = captured.getvalue()
+    if not written.strip():
+        problems.append(
+            "a fault while evaluating a command wrote no decision at all - the exit "
+            "status blocks, but nothing tells the reader why"
+        )
+    else:
+        try:
+            block = json.loads(written)["hookSpecificOutput"]
+        except (ValueError, KeyError, TypeError) as exc:
+            problems.append("the failure decision is not usable JSON (%s): %r"
+                            % (type(exc).__name__, written[:100]))
+            block = {}
+        if block.get("permissionDecision") != "deny":
+            problems.append("in process, an internal failure decided %r, wanted deny"
+                            % block.get("permissionDecision"))
+        reason = block.get("permissionDecisionReason") or ""
+        if "internal failure" not in reason:
+            problems.append(
+                "the failure reason does not identify itself as an internal guard "
+                "failure: %r" % reason[:90]
+            )
+        if "not by a rule" not in reason:
+            problems.append(
+                "the failure reason does not separate itself from a rule decision, which "
+                "is what the reader has to be able to tell apart: %r" % reason[:90]
+            )
+        if "Traceback" in reason or "RuntimeError" not in reason:
+            problems.append(
+                "the reason should name the exception without pasting a traceback: %r"
+                % reason[:120]
+            )
+        if written.count("hookSpecificOutput") != 1:
+            problems.append("more than one decision was written for one payload")
+
+    # --- the outer belt, which is the only thing covering read_command() -----
+    # A fault there escapes main() entirely, so neither branch checked above can catch
+    # it. The fault is injected after the command has been read, so a command really was
+    # in hand: "we could not tell whether there was a command" has to block for the same
+    # reason "we could not evaluate it" does.
+    late = tmp / "late-fault-guard.py"
+    text = GUARD.read_text()
+    if text.count("\n    return command\n") != 1:
+        return problems + [
+            "cannot inject a late fault: read_command() does not end where this test "
+            "expects it"
+        ]
+    late.write_text(text.replace("\n    return command\n",
+                                 "\n" + INJECT_LATE_FAULT + "\n", 1))
+
+    proc = run_hook(payload("ls -la"), late)
+    if "Traceback" in proc.stderr:
+        problems.append(
+            "a fault outside main()'s own handling escaped as a traceback, which exits 1 "
+            "and lets the command run: %s" % proc.stderr.strip()[-110:]
+        )
+    if proc.returncode != g.BLOCKED_EXIT:
+        problems.append(
+            "a fault outside main()'s own handling exited %d, wanted %d - the outer belt "
+            "in __main__ must block rather than return" % (proc.returncode, g.BLOCKED_EXIT)
+        )
+    try:
+        late_decision = json.loads(proc.stdout)["hookSpecificOutput"]["permissionDecision"]
+    except (ValueError, KeyError, TypeError):
+        late_decision = None
+    if late_decision != "deny":
+        problems.append(
+            "the outer belt decided %r, wanted deny" % late_decision
+        )
+    if "MemoryError" not in (proc.stdout + proc.stderr):
+        problems.append("the outer belt does not name the exception it caught")
+
+    # ...and the same injected copy still passes a payload with no command through, so
+    # the belt is firing on the fault rather than on everything.
+    proc = run_hook('{"tool_name": "Bash"}', late)
+    if proc.returncode != 0 or proc.stdout.strip():
+        problems.append(
+            "with the late fault injected, a payload carrying no command exited %d and "
+            "wrote %r - the no-command pass-through must survive"
+            % (proc.returncode, proc.stdout[:60])
+        )
+
+    # --- the control ---------------------------------------------------------
+    # Without any injected fault the same command still passes through. Without this, a
+    # hook that blocked everything would satisfy every assertion above.
+    proc = run_hook(payload("ls -la"))
+    if proc.returncode != 0 or proc.stdout.strip():
+        problems.append(
+            "with the engine intact, 'ls -la' exited %d and wrote %r - the injected-fault "
+            "case proves nothing if the hook blocks this anyway"
+            % (proc.returncode, proc.stdout[:60])
+        )
+    for command, want in (("git push", "ask"), ("git add .", "deny")):
+        got, _reason = outcome(run_hook(payload(command)))
+        if got != want:
+            problems.append(
+                "with the engine intact, %r decided %r, wanted %r - failing closed must "
+                "not have changed a normal rule decision" % (command, got, want)
+            )
+    return problems
+
+
 def main():
     failures = []
 
@@ -750,6 +1378,20 @@ def main():
     failures.extend("mode matrix: " + line for line in check_matrix())
     failures.extend("working directory: " + line for line in check_working_directory())
     failures.extend("invocation: " + line for line in check_dispatcher_invocation())
+    failures.extend("hook payload: " + line for line in check_hook_payloads())
+    failures.extend("hook response: " + line for line in check_hook_response_shape())
+    failures.extend("hook precedence: " + line for line in check_decision_precedence())
+    failures.extend("shipped rules: " + line for line in check_shipped_rules_load())
+    with tempfile.TemporaryDirectory() as tmp:
+        failures.extend(
+            "hook fault: " + line
+            for line in check_internal_failure_is_fail_closed(Path(tmp))
+        )
+    with tempfile.TemporaryDirectory() as tmp:
+        failures.extend(
+            "boundary faults: " + line
+            for line in check_boundary_config_faults(Path(tmp))
+        )
     with tempfile.TemporaryDirectory() as tmp:
         failures.extend(
             "agent path: " + line for line in check_agent_path_record(Path(tmp))
@@ -758,9 +1400,11 @@ def main():
         failures.extend("--cwd: " + line for line in check_cwd_validation(Path(tmp)))
 
     print(
-        "%d cases, %d timed, %d strip, %d boundary rules, mode matrix, invocation, "
-        "agent path, adapters and --cwd checked"
-        % (len(CASES), len(TIMED), len(STRIP), len(BOUNDARIES["rules"]))
+        "%d cases, %d timed, %d strip, %d boundary rules, %d hook payloads, "
+        "%d precedence, %d boundary faults, mode matrix, invocation, hook response, "
+        "hook fault, agent path, adapters and --cwd checked"
+        % (len(CASES), len(TIMED), len(STRIP), len(BOUNDARIES["rules"]),
+           len(HOOK_PAYLOADS), len(PRECEDENCE), len(BOUNDARY_FAULTS))
     )
 
     regressed = []
