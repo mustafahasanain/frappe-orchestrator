@@ -62,6 +62,67 @@ REASONS = {
         "`git status --porcelain` to see what changed, then stage only the files this task "
         "created or changed, by path."
     ),
+    "discard-tracked-changes": (
+        "`git reset --hard` (and --merge/--keep) throws away every uncommitted change in "
+        "the tree, not only the ones belonging to this task, and unstaged work has no "
+        "reflog entry to recover from. Run `git status --porcelain` and confirm with the "
+        "user what may be discarded. To move HEAD without touching file contents use "
+        "`git reset --soft`; to unstage, `git reset <path>`."
+    ),
+    "discard-pathspec-changes": (
+        "This overwrites working-tree files from the index or a commit, and unstaged "
+        "content in those paths is not recoverable afterwards. Confirm with the user "
+        "which files may be reverted, then revert them by path rather than with `.`. To "
+        "see what would be lost first, run `git diff -- <path>`."
+    ),
+    "discard-worktree": (
+        "`git restore` overwrites working-tree files and `git clean` deletes untracked "
+        "files, which Git keeps no copy of. Confirm with the user which paths may be "
+        "discarded and name them explicitly. To find out what is there without removing "
+        "anything, run `git status --porcelain`."
+    ),
+    "drop-stash": (
+        "This deletes stashed work permanently, and a stash is where interrupted work was "
+        "put to keep it safe. Run `git stash list` and `git stash show -p` first, and "
+        "confirm with the user before dropping anything. To use a stash without "
+        "destroying it, `git stash apply` leaves the entry in place."
+    ),
+    "force-branch-ref": (
+        "This deletes an unmerged branch or moves an existing branch onto another commit, "
+        "abandoning commits nothing else points at. Confirm the branch and the target with "
+        "the user first. `git branch -d` deletes only what is already merged, and Git "
+        "refuses when it is not - use it instead of `-D` unless the loss is intended."
+    ),
+    "expire-recovery-refs": (
+        "The reflog is what makes a bad reset or a bad rebase survivable, and this drops it "
+        "along with the objects it keeps reachable. Do not run it to tidy up. If a "
+        "repository genuinely needs pruning, that is the user's decision to make with the "
+        "reflog in front of them."
+    ),
+    "rewrite-repository-history": (
+        "This rewrites commits or writes a ref directly, with none of the checks a "
+        "porcelain command applies. Confirm the operation and its scope with the user "
+        "before continuing. To read the same data without changing it, use `git log`, "
+        "`git rev-parse` or `git show-ref`."
+    ),
+    "recursive-delete": (
+        "A recursive delete takes everything below the path, tracked or not, and Git holds "
+        "no copy of untracked content. Confirm the path with the user, or delete the "
+        "specific files this task is responsible for by name. To see what would go, list "
+        "the tree first with `find <path> -maxdepth 2`."
+    ),
+    "mass-delete": (
+        "`find ... -delete` removes every path the traversal matched, and a traversal "
+        "usually reaches wider than intended. Run the same search without `-delete` first, "
+        "read the list, and then remove what belongs to this task by name."
+    ),
+    "overwrite-file-contents": (
+        "shred, truncate and dd overwrite bytes in place, with no staging step and nothing "
+        "to restore an untracked file from. None of them is the tool for editing source: "
+        "edit the file, or write the intended contents with a normal editor operation. If "
+        "the byte-level operation really is what is wanted, the user should confirm the "
+        "exact target path."
+    ),
     "site-named": (
         "This runs against a live site database or a running Frappe instance. Confirm with "
         "the user which single site to target before continuing, and do not repeat it across "
@@ -110,7 +171,14 @@ REASONS["bare-agent-exec"] = AGENT_REASON
 # ever been about. If the boundary data cannot be loaded there are no rules to apply, and
 # silently enforcing nothing is the one failure mode this hook must not have. Asking on
 # these programs turns a total, invisible lapse into a visible degraded one.
-GUARDED_PROGRAMS = frozenset({"git", "bench", "mysql", "mariadb", "opencode", "codex"})
+GUARDED_PROGRAMS = frozenset({
+    "git", "bench", "mysql", "mariadb", "opencode", "codex",
+    # The destructive filesystem programs. Listed for the same reason as the rest: with
+    # the rule data unloadable there is nothing to narrow `rm` down to its recursive
+    # forms, and asking on every `rm` for as long as the file is broken is the failure
+    # this list exists to prefer.
+    "rm", "find", "shred", "truncate", "dd",
+})
 
 # The match kinds this hook implements, and the fields each needs in order to be matched
 # at all. Checked when the data is loaded, because "unreadable" and "unusable" amount to

@@ -106,6 +106,395 @@
       }
     },
     {
+      "name": "discard-tracked-changes",
+      "intent": "`git reset --hard` throws away every uncommitted change in the tree, including work this task never touched, and unstaged work leaves no reflog entry to recover from. --merge and --keep discard the same way on a dirty tree. The index-only forms are left alone: `git reset`, `--soft` and `--mixed` move HEAD or unstage, and the file contents survive.",
+      "match": {
+        "kind": "program_subcommand",
+        "program": "git",
+        "subcommands": [
+          "reset"
+        ],
+        "any_argument": [
+          "--hard",
+          "--merge",
+          "--keep"
+        ]
+      },
+      "hook": "ask",
+      "delegated": "deny",
+      "documented_in": [
+        {
+          "file": "skills/orchestration/SKILL.md",
+          "heading": "## Git safety"
+        }
+      ],
+      "examples": [
+        "git reset --hard",
+        "git reset --hard HEAD~1",
+        "git reset --hard origin/main",
+        "git reset --merge",
+        "git reset --keep HEAD~1",
+        "git -C /repo reset --hard",
+        "git reset HEAD~1 --hard"
+      ],
+      "not_examples": [
+        "git reset",
+        "git reset HEAD~1",
+        "git reset --soft HEAD~1",
+        "git reset --mixed",
+        "git reset src/file.py"
+      ]
+    },
+    {
+      "name": "discard-pathspec-changes",
+      "intent": "`git checkout -- <path>` and `git checkout .` overwrite working-tree files from the index or a commit. There is no reflog for unstaged content, so whatever the user had uncommitted in those paths is gone. Branch operations are untouched: the rule fires on the pathspec forms only. A bare `git checkout <path>` with no `--` is not caught, because at this layer it is indistinguishable from a branch name.",
+      "match": {
+        "kind": "program_subcommand",
+        "program": "git",
+        "subcommands": [
+          "checkout"
+        ],
+        "any_argument": [
+          ".",
+          "--"
+        ]
+      },
+      "hook": "ask",
+      "delegated": "deny",
+      "documented_in": [
+        {
+          "file": "skills/orchestration/SKILL.md",
+          "heading": "## Git safety"
+        }
+      ],
+      "examples": [
+        "git checkout -- .",
+        "git checkout -- src/file.py",
+        "git checkout .",
+        "git checkout HEAD -- .",
+        "git checkout HEAD -- src/file.py"
+      ],
+      "not_examples": [
+        "git checkout feature-branch",
+        "git checkout -b new-branch",
+        "git checkout --track origin/feature",
+        "git checkout --detach HEAD",
+        "git switch feature"
+      ]
+    },
+    {
+      "name": "discard-worktree",
+      "intent": "`git restore` overwrites working-tree files from the index by default, and `git clean` deletes untracked files outright - the one category Git itself cannot give back. Every form is covered rather than only the forced ones: `git clean -n` and `--dry-run` are safe, but `git status --porcelain` answers the same question, and a decision that the hook applies and the delegated policy cannot is the divergence this file exists to prevent. `git restore --staged` is included for the same reason.",
+      "match": {
+        "kind": "program_subcommand",
+        "program": "git",
+        "subcommands": [
+          "restore",
+          "clean"
+        ]
+      },
+      "hook": "ask",
+      "delegated": "deny",
+      "documented_in": [
+        {
+          "file": "skills/orchestration/SKILL.md",
+          "heading": "## Git safety"
+        }
+      ],
+      "examples": [
+        "git restore .",
+        "git restore src/file.py",
+        "git restore --worktree .",
+        "git restore --staged --worktree .",
+        "git clean -f",
+        "git clean -fd",
+        "git clean -fdx",
+        "git clean -xdf",
+        "git clean -n",
+        "git clean --dry-run",
+        "git -C /repo clean -fdx"
+      ],
+      "not_examples": [
+        "git status --porcelain",
+        "git diff --stat",
+        "git stash list"
+      ]
+    },
+    {
+      "name": "drop-stash",
+      "intent": "`git stash clear` and `git stash drop` delete stash entries permanently - and a dropped stash is exactly where the user's interrupted work was put for safekeeping. Creating a stash is not covered: `git stash` and `git stash push` move changes out of the tree but preserve them, and `git stash pop` puts them back, so they are disruptive rather than destructive.",
+      "match": {
+        "kind": "program_subcommand",
+        "program": "git",
+        "subcommands": [
+          "stash"
+        ],
+        "any_argument": [
+          "clear",
+          "drop"
+        ]
+      },
+      "hook": "ask",
+      "delegated": "deny",
+      "documented_in": [
+        {
+          "file": "skills/orchestration/SKILL.md",
+          "heading": "## Git safety"
+        }
+      ],
+      "examples": [
+        "git stash clear",
+        "git stash drop",
+        "git stash drop stash@{1}",
+        "git -C /repo stash clear"
+      ],
+      "not_examples": [
+        "git stash",
+        "git stash push -m wip",
+        "git stash list",
+        "git stash show -p",
+        "git stash pop",
+        "git stash apply"
+      ]
+    },
+    {
+      "name": "force-branch-ref",
+      "intent": "`git branch -D` deletes a branch Git has established is not merged anywhere, and `-f`/`--force`/`-M` move an existing branch ref onto a different commit. Both abandon commits that nothing else points at. Reading and listing branches is untouched, and so is `git branch -d`, which Git already refuses when the branch would be lost.",
+      "match": {
+        "kind": "program_subcommand",
+        "program": "git",
+        "subcommands": [
+          "branch"
+        ],
+        "any_argument": [
+          "-D",
+          "-M",
+          "-f",
+          "--force"
+        ]
+      },
+      "hook": "ask",
+      "delegated": "deny",
+      "documented_in": [
+        {
+          "file": "skills/orchestration/SKILL.md",
+          "heading": "## Git safety"
+        }
+      ],
+      "examples": [
+        "git branch -D feature",
+        "git branch -M main",
+        "git branch -f main HEAD~5",
+        "git branch --force main origin/main"
+      ],
+      "not_examples": [
+        "git branch",
+        "git branch --show-current",
+        "git branch -a",
+        "git branch -d merged-feature",
+        "git branch new-feature"
+      ]
+    },
+    {
+      "name": "expire-recovery-refs",
+      "intent": "The reflog is what makes a bad reset survivable. `git reflog expire`, `git reflog delete` and `git gc --prune=now` drop it and the unreachable objects it points at, which turns a recoverable mistake into a permanent one - and they are most tempting immediately after the mistake. Reading the reflog and ordinary housekeeping are untouched.",
+      "match": {
+        "kind": "program_subcommand",
+        "program": "git",
+        "subcommands": [
+          "reflog",
+          "gc"
+        ],
+        "any_argument": [
+          "expire",
+          "delete",
+          "--prune=now"
+        ]
+      },
+      "hook": "ask",
+      "delegated": "deny",
+      "documented_in": [
+        {
+          "file": "skills/orchestration/SKILL.md",
+          "heading": "## Git safety"
+        }
+      ],
+      "examples": [
+        "git reflog expire --expire=now --all",
+        "git reflog delete HEAD@{2}",
+        "git gc --prune=now"
+      ],
+      "not_examples": [
+        "git reflog",
+        "git reflog show",
+        "git gc",
+        "git gc --auto"
+      ]
+    },
+    {
+      "name": "rewrite-repository-history",
+      "intent": "`git filter-branch` and `git filter-repo` rewrite every commit they are pointed at, and `git update-ref` writes or deletes a ref directly with none of the safety a porcelain command applies. None of the three has a read-only form - `git log`, `git rev-parse` and `git show-ref` read the same data without touching it.",
+      "match": {
+        "kind": "program_subcommand",
+        "program": "git",
+        "subcommands": [
+          "filter-branch",
+          "filter-repo",
+          "update-ref"
+        ]
+      },
+      "hook": "ask",
+      "delegated": "deny",
+      "documented_in": [
+        {
+          "file": "skills/orchestration/SKILL.md",
+          "heading": "## Git safety"
+        }
+      ],
+      "examples": [
+        "git filter-branch --all",
+        "git filter-repo --path src",
+        "git update-ref -d refs/heads/main",
+        "git update-ref refs/heads/feature HEAD"
+      ],
+      "not_examples": [
+        "git log --oneline",
+        "git rev-parse HEAD",
+        "git show-ref"
+      ]
+    },
+    {
+      "name": "rebase-inside-delegated-run",
+      "intent": "A rebase rewrites the commits on the branch it was handed. Claude rebases with the user present and the reflog behind it, so the hook leaves it alone; a delegated implementer has no reason to reach for one, and nothing is watching the branch it rewrites.",
+      "match": {
+        "kind": "program_subcommand",
+        "program": "git",
+        "subcommands": [
+          "rebase"
+        ]
+      },
+      "hook": null,
+      "delegated": "deny",
+      "documented_in": [
+        {
+          "file": "skills/orchestration/SKILL.md",
+          "heading": "## Git safety"
+        }
+      ],
+      "examples": [
+        "git rebase -i HEAD~3",
+        "git rebase main",
+        "git rebase --onto main topic feature"
+      ],
+      "not_examples": [
+        "git log --oneline",
+        "git status --porcelain"
+      ],
+      "not_enforced_because": {
+        "hook": "Claude rebases as an ordinary local operation, with the user present and the reflog available to undo it. The boundary that matters here is the unattended one, which only a delegated run crosses."
+      }
+    },
+    {
+      "name": "recursive-delete",
+      "intent": "Recursion is what turns deleting a file into deleting a tree: `rm -rf .` and `rm -rf <dir>` take everything below the path, tracked or not, with no Git copy of untracked content to restore from. Deleting a named file is left alone - an implementation task legitimately removes a file it was asked to remove. Both matchers compare whole tokens, so the option spellings are enumerated here rather than decomposed; an unlisted cluster is a gap in this rule, not a decision.",
+      "match": {
+        "kind": "program_option",
+        "program": "rm",
+        "options": [
+          "-r",
+          "-R",
+          "-rf",
+          "-fr",
+          "-Rf",
+          "-fR",
+          "--recursive"
+        ]
+      },
+      "hook": "ask",
+      "delegated": "deny",
+      "documented_in": [
+        {
+          "file": "skills/orchestration/SKILL.md",
+          "heading": "## Autonomy boundary"
+        }
+      ],
+      "examples": [
+        "rm -rf .",
+        "rm -rf node_modules",
+        "rm -r build",
+        "rm -R dist",
+        "rm -fr /tmp/scratch",
+        "rm -Rf vendor",
+        "rm --recursive docs/old"
+      ],
+      "not_examples": [
+        "rm temporary-file",
+        "rm build/output.js",
+        "rm -f stale.lock",
+        "rm docs/old-report.md",
+        "rmdir empty-dir"
+      ]
+    },
+    {
+      "name": "mass-delete",
+      "intent": "`find ... -delete` removes every path the traversal matched, and the traversal is usually wider than the author pictured. The same search without -delete prints what it found, which is the step that should come first.",
+      "match": {
+        "kind": "program_option",
+        "program": "find",
+        "options": [
+          "-delete"
+        ]
+      },
+      "hook": "ask",
+      "delegated": "deny",
+      "documented_in": [
+        {
+          "file": "skills/orchestration/SKILL.md",
+          "heading": "## Autonomy boundary"
+        }
+      ],
+      "examples": [
+        "find . -delete",
+        "find . -name '*.pyc' -delete",
+        "find build -type f -delete"
+      ],
+      "not_examples": [
+        "find . -name '*.py'",
+        "find . -type f -print",
+        "find src -name conftest.py"
+      ]
+    },
+    {
+      "name": "overwrite-file-contents",
+      "intent": "shred, truncate and dd exist to overwrite bytes in place. There is no staging step and no Git copy of an untracked file, so a wrong path is unrecoverable, and none of the three is a normal tool for editing source. Matching is by program name, so a command whose name merely starts with one of these - ddrescue, for instance - is caught too; that is stated here rather than discovered later.",
+      "match": {
+        "kind": "program",
+        "programs": [
+          "shred",
+          "truncate",
+          "dd"
+        ]
+      },
+      "hook": "ask",
+      "delegated": "deny",
+      "documented_in": [
+        {
+          "file": "skills/orchestration/SKILL.md",
+          "heading": "## Autonomy boundary"
+        }
+      ],
+      "examples": [
+        "shred -u README.md",
+        "truncate -s 0 config.json",
+        "dd if=/dev/zero of=data.img"
+      ],
+      "not_examples": [
+        "cat config.json",
+        "head -c 0 config.json",
+        "stat data.img"
+      ]
+    },
+    {
       "name": "site-named",
       "intent": "A bench command carrying --site runs against that live site's database or a running Frappe instance. Confirm the single target site first.",
       "match": {

@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -36,6 +37,51 @@ MODE_NAMES = tuple(sorted({mode for modes in MODES.values() for mode in modes}))
 # from one it did at the point the orchestrator consumes it. Nothing in this file may
 # invent a verdict for a mode that is not listed here.
 VERDICT_MODES = frozenset({"review", "test"})
+
+
+# --------------------------------------------------------------------------
+# The byte/text boundary
+#
+# An agent's stdout is untrusted byte data, not text. The parser below is hardened
+# against hostile structure - bounded three ways, never raises, fails closed - and
+# none of that was reachable while a single stray byte could end the run before the
+# parser was called: `text=True` alone decodes with the locale's encoding and
+# errors="strict", so `communicate()` raised UnicodeDecodeError, the dispatcher
+# exited 1 outside its own contract, and the transcript of work that had already
+# finished was never written.
+#
+# A stray byte is an ordinary event, not an exotic one. An agent that cats a binary
+# file, a multi-byte character split across a read boundary, or a progress renderer
+# emitting raw terminal bytes all produce one.
+#
+# So the policy is declared once, here, and applied at every crossing: the child's
+# pipes, the salvage path a timeout reads, and every artifact written to the
+# workspace. UTF-8 because that is what the agents emit and what the JSON in the
+# result must be, never the locale's encoding, which is one LC_ALL away from ASCII
+# and would fail on the write side for a transcript that decoded perfectly.
+# Replacement because availability wins here: a transcript with U+FFFD where a bad
+# byte was is worth having, and an undecodable byte is not worth a lost run.
+# --------------------------------------------------------------------------
+
+TEXT_ENCODING = "utf-8"
+
+# "replace" and never "strict": every use below sits on a path whose job is to
+# produce a result, and a decode error on any of them costs the result entirely.
+TEXT_ERRORS = "replace"
+
+
+def write_artifact(path, text):
+    """Write one delegation artifact under the file policy. Returns the path.
+
+    `Path.write_text(text)` encodes with the locale's encoding and errors="strict",
+    which is the write-side half of BUG-003: under an ASCII locale a transcript that
+    decoded perfectly raises UnicodeEncodeError on the way to disk, and the artifact
+    the run exists to leave behind is lost at the last step. Every artifact goes
+    through here so that the encoding is a property of the dispatcher rather than of
+    the environment it happened to be started in.
+    """
+    path.write_text(text, encoding=TEXT_ENCODING, errors=TEXT_ERRORS)
+    return path
 
 
 # --------------------------------------------------------------------------
@@ -66,7 +112,7 @@ BOUNDARIES = Path(__file__).resolve().parent.parent / "config" / "command-bounda
 
 def load_boundaries(fail):
     try:
-        return json.loads(BOUNDARIES.read_text())["rules"]
+        return json.loads(BOUNDARIES.read_text(encoding=TEXT_ENCODING))["rules"]
     except (OSError, ValueError, KeyError, TypeError) as exc:
         # Refused, not degraded. The hook can fall back to asking because a human is
         # there to answer; nothing is watching a delegated run, so a run without its
@@ -112,8 +158,23 @@ def rule_patterns(rule):
                 continue
             for argument in arguments:
                 for prefix in prefixes:
-                    if argument.startswith("-"):
-                        patterns.append("%s %s*" % (prefix, argument))
+                    if argument == "--":
+                        # The end-of-options separator, not an option, and the one
+                        # argument whose glob is not the option form. `--*` reads the
+                        # two dashes as the start of a long option, so it denies
+                        # `git checkout --track origin/x`, which switches branch and
+                        # destroys nothing; `-- *` requires the space and the pathspec
+                        # that actually follow a separator. The second form carries a
+                        # revision before it: `git checkout HEAD -- .`.
+                        patterns += ["%s -- *" % prefix, "%s * -- *" % prefix]
+                    elif argument.startswith("-"):
+                        # Both placements. An option is not required to follow its
+                        # subcommand immediately - `git reset HEAD~1 --hard` is the same
+                        # command as `git reset --hard HEAD~1` - and the hook matches
+                        # tokens wherever they sit, so a single prefix form would deny
+                        # one spelling here and the other nowhere.
+                        patterns += ["%s %s*" % (prefix, argument),
+                                     "%s * %s*" % (prefix, argument)]
                     else:
                         patterns += [
                             "%s %s" % (prefix, argument),
@@ -382,7 +443,7 @@ ADAPTERS = {"opencode": adapt_opencode, "codex": adapt_codex}
 
 def load_routing(fail):
     try:
-        return json.loads(ROUTING.read_text())
+        return json.loads(ROUTING.read_text(encoding=TEXT_ENCODING))
     except (OSError, ValueError) as exc:
         fail("cannot read %s: %s" % (ROUTING, exc))
 
@@ -505,8 +566,222 @@ def resolve_program(name, env):
     return (found, os.path.realpath(found)) if found else None
 
 
+# --------------------------------------------------------------------------
+# Containing a timed-out run
+#
+# `--timeout N` has to mean "the dispatcher returns", not "a signal was sent at N
+# seconds". Two things stood between those, in three lines of the old timeout path.
+#
+# `proc.kill()` reaches the process named in argv and nothing it started. Live
+# children are the normal case for a coding agent, not the exotic one - a shell per
+# tool call, an LSP, an MCP server - and they inherit the stdout pipe. Killing the
+# CLI leaves them running against the repository.
+#
+# The recovery read then had no bound. `communicate()` returns when the pipes close,
+# and a surviving grandchild holds them open, so a 2-second timeout was measured
+# still hanging past 20 seconds. That is the shape that matters here: the routing
+# file gives DIFFICULT 1800 seconds and the orchestration skill says to start those
+# in the background, so a dispatcher that never returns is a result nobody is
+# waiting at a terminal to notice the absence of.
+#
+# So the run is given its own session at spawn, the timeout path signals that
+# process group rather than one pid, and every wait after the deadline carries its
+# own bound. The worst case is the timeout plus the three constants below.
+# --------------------------------------------------------------------------
+
+# Process groups are POSIX. This dispatcher is developed and run on Linux and WSL;
+# elsewhere the timeout still returns a result on schedule, but it can only reach
+# the direct child, and _terminate_process_tree says so in the run's stderr rather
+# than leaving the gap to be inferred.
+POSIX = os.name == "posix"
+
+# Between SIGTERM and SIGKILL to the group. A CLI that traps SIGTERM to flush a
+# transcript should get the chance; one that ignores it does not get to decide how
+# long the dispatcher waits.
+TERM_GRACE_SECONDS = 2.0
+
+# Bound on reading what the killed tree left in its pipes. This is the read that
+# used to be unbounded. If something outlives SIGKILL and holds the pipes open, this
+# expires and the run is reported with whatever had been buffered: a partial
+# transcript is worth more than a dispatcher that never returns.
+DRAIN_SECONDS = 5.0
+
+# Bound on collecting the exit status afterwards. SIGKILL has already been
+# delivered, so this is a formality - but a formality on the timeout path still gets
+# a bound.
+REAP_SECONDS = 1.0
+
+
+def delegated_group(proc):
+    """The process group belonging to this run alone, or None if there is not one.
+
+    None means "nothing here is safe to signal as a group", never "no group exists":
+    without `start_new_session` the child shares the dispatcher's own group, and
+    `killpg` on that takes down the dispatcher, the orchestrator above it and the
+    shell they were started from. That is not a hypothetical - writing this the
+    obvious way, against a child spawned without a new session, killed the session it
+    was being developed in. Hence the comparison against our own group id, which is
+    the one check in this file that must not be dropped as redundant.
+
+    Also None once the child has been reaped, because a group id is a pid and a
+    reaped pid can belong to something else by the time it is signalled.
+    """
+    if not POSIX:
+        return None
+    try:
+        pgid = os.getpgid(proc.pid)
+        ours = os.getpgid(0)
+    except (ProcessLookupError, PermissionError, OSError):
+        return None
+    return pgid if pgid > 0 and pgid != ours else None
+
+
+def group_alive(pgid):
+    """Whether the delegated run's group still has any member.
+
+    Signal 0 delivers nothing and only reports deliverability. Checked before the
+    second signal rather than assumed: if the group has emptied, its id is free for
+    the kernel to hand to something unrelated, and SIGKILL is not a signal to send
+    on an assumption.
+    """
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # cannot tell; treat as alive so the SIGKILL below still goes
+    return True
+
+
+def signal_group(pgid, sig, notes):
+    """Send one signal to the delegated run's group. False if it did not land."""
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        return False  # the group is already gone, which is what was wanted
+    except OSError as exc:
+        notes.append(
+            "%s to the delegated run's process group %s failed: %s"
+            % (signal.Signals(sig).name, pgid, exc)
+        )
+        return False
+    return True
+
+
+def terminate_process_tree(proc, grace=TERM_GRACE_SECONDS):
+    """End the delegated run and everything it spawned. Returns cleanup notes.
+
+    Two stages, to the group rather than to one pid. The processes that keep a
+    timed-out run alive are its descendants, and the child exiting says nothing
+    about them, so the SIGKILL stage is decided by whether the group still has
+    members - not by whether the CLI itself went.
+
+    Never raises. It is called on the one path whose entire purpose is to produce a
+    result, so a process-control surprise is recorded and returned, not propagated.
+    """
+    notes = []
+    pgid = delegated_group(proc)
+    if pgid is None:
+        if not POSIX:
+            notes.append(
+                "this run's descendants were not contained: process groups are POSIX "
+                "and os.name is %r, so only the CLI itself could be signalled" % os.name
+            )
+        try:
+            proc.kill()  # a no-op if it has already been reaped
+        except (ProcessLookupError, PermissionError, OSError) as exc:
+            notes.append("could not signal the timed-out run: %s" % exc)
+        return notes
+
+    signal_group(pgid, signal.SIGTERM, notes)
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        pass  # it is ignoring SIGTERM, which is what the second stage is for
+    except OSError as exc:
+        notes.append("waiting out the SIGTERM grace failed: %s" % exc)
+    if group_alive(pgid):
+        signal_group(pgid, signal.SIGKILL, notes)
+        if group_alive(pgid):
+            notes.append(
+                "part of the delegated run's process group %s survived SIGKILL" % pgid
+            )
+    return notes
+
+
+def as_text(buffered):
+    """Anything an output path can hand back -> str, under the one policy above.
+
+    The single conversion for output that did not come back through a completed
+    `communicate()`. Popen's `encoding`/`errors` do not reach a TimeoutExpired:
+    CPython fills `.output` and `.stderr` with the raw chunks it had joined at the
+    moment it gave up, so they arrive as bytes even though `communicate()` would
+    have returned str - while the bounded drain, which does complete, returns str.
+    Both shapes reach here and both leave as str, so no caller has to know which
+    path its text came from and nothing downstream decodes twice.
+
+    Decoded leniently for the same reason as the child's pipes: this is the salvage
+    path of a timeout, and an exception raised while reporting one would cost the
+    result the timeout exists to produce.
+
+    Newlines are translated the way `text=True` translates them on the normal path.
+    Without it a partial transcript would keep the \r\n that a complete one has
+    had removed, which is the same output differing by which path read it.
+    """
+    if buffered is None:
+        return ""
+    if isinstance(buffered, bytes):
+        buffered = buffered.decode(TEXT_ENCODING, TEXT_ERRORS)
+        return buffered.replace("\r\n", "\n").replace("\r", "\n")
+    return buffered
+
+
+def drain_after_timeout(proc, expired, seconds=DRAIN_SECONDS):
+    """Collect what the killed run left behind, under a bound. (out, err, notes).
+
+    The first `communicate()` kept everything it had read when it gave up, and
+    CPython carries those buffers into the next call on the same process, so this
+    call returns the whole transcript rather than only the tail. That is why the
+    partial output already sitting on `expired` is not added to it: it is the same
+    bytes, and concatenating would duplicate the head of the transcript.
+
+    When even this call cannot finish, the exception it raises carries that same
+    accumulated buffer, so the fallback reads the newer exception - the one passed in
+    is only reached if the read fails some other way.
+    """
+    notes = []
+    try:
+        out, err = proc.communicate(timeout=seconds)
+        return as_text(out), as_text(err), notes
+    except subprocess.TimeoutExpired as later:
+        expired = later
+        notes.append(
+            "the timed-out run's output could not be read within %gs of killing it; "
+            "what follows is what had been buffered by then" % seconds
+        )
+    except (OSError, ValueError) as exc:
+        notes.append("reading the timed-out run's output failed: %s" % exc)
+    # The drain reaps the child when it completes; when it gives up it does not, and
+    # exit_code would be left null for a process that has certainly been killed.
+    if proc.returncode is None:
+        try:
+            proc.wait(timeout=REAP_SECONDS)
+        except subprocess.TimeoutExpired:
+            notes.append("the timed-out run had not been reaped %gs after SIGKILL"
+                         % REAP_SECONDS)
+        except OSError as exc:
+            notes.append("could not collect the timed-out run's exit status: %s" % exc)
+    return as_text(expired.output), as_text(expired.stderr), notes
+
+
 def execute(argv, env, stdin_text, cwd, timeout):
-    """Run the CLI. Returns (status, exit_code, stdout, stderr, seconds)."""
+    """Run the CLI. Returns (status, exit_code, stdout, stderr, seconds).
+
+    On timeout the returned stderr is prefixed with any `delegate:` line describing
+    something the cleanup could not confirm. Those lines are absent from an ordinary
+    timeout; they exist so that a containment failure is in the record rather than
+    silently indistinguishable from a clean one.
+    """
     started = time.monotonic()
     try:
         proc = subprocess.Popen(
@@ -517,17 +792,36 @@ def execute(argv, env, stdin_text, cwd, timeout):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            # Not the locale's encoding, and not errors="strict": see the byte/text
+            # boundary above. This is the crossing BUG-003 was reported against.
+            encoding=TEXT_ENCODING,
+            errors=TEXT_ERRORS,
+            # The run gets a session of its own, which is what makes the timeout
+            # path able to signal everything it spawned instead of only argv[0].
+            start_new_session=POSIX,
         )
     except OSError as exc:
         return "error", None, "", str(exc), time.monotonic() - started
 
     try:
         out, err = proc.communicate(input=stdin_text, timeout=timeout)
+        out, err = as_text(out), as_text(err)
         status = "completed" if proc.returncode == 0 else "failed"
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        out, err = proc.communicate()
+    except subprocess.TimeoutExpired as expired:
+        notes = terminate_process_tree(proc)
+        out, err, drained = drain_after_timeout(proc, expired)
+        notes += drained
+        if notes:
+            err = "\n".join(["delegate: " + note for note in notes]
+                             + ([err] if err else []))
         status = "timeout"
+    except KeyboardInterrupt:
+        # The new session is why this is here: it detaches the run from this
+        # process's session, so a Ctrl-C at the terminal no longer reaches the agent
+        # the way it did before that change. Pass it on rather than leaving the agent
+        # orphaned and still writing to the repository.
+        terminate_process_tree(proc)
+        raise
     return status, proc.returncode, out, err, time.monotonic() - started
 
 
@@ -556,24 +850,147 @@ def _is_report(obj, mode):
     return isinstance(value, str) and value.strip().casefold() in allowed
 
 
-def _reports(text, mode):
-    """Report objects in `text`, scanned from the end."""
+class _Budget:
+    """The two cumulative bounds on one extraction, shared by every scan it runs.
+
+    Shared rather than per-scan. An extraction now makes a second, narrower pass to
+    establish whether the candidate it found is a field inside a larger report, and
+    per-scan limits would multiply: what these bound is the whole extraction, not each
+    traversal of it. `exhausted` is the difference between "scanned it all and found
+    nothing" and "ran out", which the caller has to tell apart - one is an answer and the
+    other is a question that was never settled.
+    """
+
+    def __init__(self):
+        self.attempts = MAX_DECODE_ATTEMPTS
+        self.deadline = time.monotonic() + MAX_SCAN_SECONDS
+        self.exhausted = False
+
+    def spend(self):
+        """Take one decode attempt. False once either bound is reached."""
+        self.attempts -= 1
+        if self.attempts < 0 or time.monotonic() > self.deadline:
+            self.exhausted = True
+            return False
+        return True
+
+
+def _reports(text, mode, budget, floor=0, ceiling=None):
+    """Report objects in text[floor:ceiling], scanned from the end.
+
+    Yields (start, end, parsed): the span as well as the object, because whether one
+    candidate sits inside another is a question about offsets and nothing else. `floor`
+    and `ceiling` are what keep the enclosing-report scan a bounded second pass rather
+    than a rescan of the whole transcript.
+    """
     decoder = json.JSONDecoder()
-    deadline = time.monotonic() + MAX_SCAN_SECONDS
-    index = len(text)
-    for _ in range(MAX_DECODE_ATTEMPTS):
-        start = text.rfind("{", 0, index)
-        if start == -1 or time.monotonic() > deadline:
+    index = len(text) if ceiling is None else ceiling
+    while True:
+        start = text.rfind("{", floor, index)
+        if start == -1 or not budget.spend():
             return
         index = start
         try:
-            parsed, _end = decoder.raw_decode(text[start:start + MAX_REPORT_CHARS], 0)
+            parsed, length = decoder.raw_decode(text[start:start + MAX_REPORT_CHARS], 0)
         except (ValueError, RecursionError):
             # Malformed here, or nested past the interpreter's stack limit. Neither is
             # the dispatcher's problem: keep scanning.
             continue
         if isinstance(parsed, dict) and _is_report(parsed, mode):
-            yield parsed
+            yield start, start + length, parsed
+
+
+# An array element: the only other place valid JSON admits `{` inside a value. An object
+# value is the third, and it is checked separately because it carries more information.
+_ELEMENT_PUNCTUATION = frozenset("[,")
+
+
+def _skip_space_back(text, index):
+    """The last non-whitespace offset at or before `index`, or -1."""
+    while index >= 0 and text[index] in " \t\r\n":
+        index -= 1
+    return index
+
+
+def _may_be_enclosed(text, start):
+    """Could the object at `start` be inside another JSON value?
+
+    False is a proof rather than a guess, and that matters because it is what lets the
+    common shape - a report at the end of a transcript - be answered without decoding
+    anything else, at any transcript size. For an enclosing object to shadow this one it
+    has to decode; if it decodes, this object lies inside valid JSON, where `{` follows
+    `:`, `[`, `,` or nothing at all. A `{` inside a *string* cannot be a candidate either:
+    a report needs quoted keys, and a JSON string cannot hold an unescaped quote, so
+    nothing that decodes as a report survives in there.
+
+    The colon carries more than the other two, and it is worth reading: JSON puts a
+    *string key* before it, always. A colon that ends a word ends prose - `Final report:`
+    - and prose encloses nothing. Without that distinction a transcript that introduces
+    its report in English would take the bounded search below and, past a certain
+    transcript size, be refused for it.
+    """
+    index = _skip_space_back(text, start - 1)
+    if index < 0:
+        return False
+    if text[index] == ":":
+        key = _skip_space_back(text, index - 1)
+        return key >= 0 and text[key] == '"'
+    return text[index] in _ELEMENT_PUNCTUATION
+
+
+def _enclosing_report(text, mode, budget, start, end):
+    """(outermost report containing text[start:end), whether that answer is settled).
+
+    Bounded twice over, beyond the shared budget: an enclosing object starts before this
+    one, and cannot start more than MAX_REPORT_CHARS before this one ends, because that is
+    the longest slice raw_decode is ever handed. So the window is finite, and in every
+    shape that is not deliberately hostile it is a few hundred characters.
+
+    Scanning backwards, each hit starts earlier than the last, so the final containing hit
+    is the outermost one. Three qualifying objects nested in each other resolve to the
+    first, which is the one the agent actually answered with.
+
+    The second return value is the one this function exists to be honest about. Both
+    bounds above can hide an enclosing report rather than rule one out - its `{` can sit
+    before the window, and it can be too long to decode inside the per-candidate slice -
+    and an enclosing report that cannot be seen is exactly the shape whose inner object
+    must not be handed back. "No enclosing report found" and "could not find out" are
+    different answers, and only the first one clears the candidate.
+
+    This scans rather than reusing _reports() because it is asking a different question:
+    not "which objects here are reports" but "is this one inside one", where a *failed*
+    decode is evidence too.
+    """
+    floor = max(0, end - MAX_REPORT_CHARS)
+    # Every position an enclosing object could start at is inside the window when the
+    # window reaches the beginning of the text - or when nothing before it could open an
+    # object at all, which is the ordinary case of a long transcript carrying no braces.
+    settled = floor == 0 or text.rfind("{", 0, floor) == -1
+    decoder = json.JSONDecoder()
+    outermost = None
+    index = start
+    while True:
+        other = text.rfind("{", floor, index)
+        if other == -1 or not budget.spend():
+            settled = settled and other == -1
+            break
+        index = other
+        try:
+            parsed, length = decoder.raw_decode(text[other:other + MAX_REPORT_CHARS], 0)
+        except (ValueError, RecursionError):
+            # A failure on a slice that had to be cut short is not evidence of
+            # malformation. An object long enough to be truncated is also long enough to
+            # have swallowed this candidate, and from here the two are the same thing.
+            if other + MAX_REPORT_CHARS < len(text):
+                settled = False
+            continue
+        if (
+            other + length >= end        # its span covers ours: ours is written inside it
+            and isinstance(parsed, dict)
+            and _is_report(parsed, mode)
+        ):
+            outermost = parsed
+    return outermost, settled
 
 
 # Keys that carry a verdict. In a mode whose contract has none, an agent that volunteers
@@ -614,9 +1031,28 @@ def extract_report(text, mode):
     that inner fence. Brace balancing has no such failure: the decoder consumes strings
     correctly, whatever they contain.
 
-    The scan runs backwards and stops at the first object that satisfies the mode's
-    contract, so the agent's own answer wins over anything a CLI printed before it, and a
-    nested report is found rather than skipped along with its wrapper.
+    The scan runs backwards, so the agent's own answer wins over anything a CLI printed
+    before it, and the last report in a transcript wins over an earlier one.
+
+    What the backwards scan reaches first, though, is the last object to *start*, and
+    that is the innermost one - so a report quoting an earlier verdict handed back the
+    quoted verdict and threw away the report around it. `{"verdict": "FAIL", ...,
+    "previous_run": {"verdict": "PASS"}}` read as PASS, with the findings gone. In review
+    mode that is the difference between the fix loop and a commit, so selection is by
+    structure and nothing else: a report written inside another report is a field of it,
+    never a replacement for it. Where the outer object is *not* itself a report the inner
+    one still wins, which is the wrapper the contract has always tolerated.
+
+    Severity is not consulted, and neither is the shape of the contents. A nested FAIL
+    does not beat an enclosing PASS any more than the reverse.
+
+    Where the bounds stop that question being answered - an enclosing report whose start
+    is beyond the search window, or one too long to decode - the candidate is refused
+    rather than returned. That costs a wrapped report at the far end of a very long
+    transcript, which is a real loss, and it is the right way round: an enclosing report
+    that cannot be seen is indistinguishable from one that is not there, and only one of
+    those two readings can turn a FAIL into a PASS. A refused report says "read the
+    transcript"; a wrong one says "commit".
 
     This reads untrusted output, so it must not raise, must not hang, and must not pass
     off a CLI's own JSON as something the agent wrote. Decoding failures are therefore
@@ -627,8 +1063,18 @@ def extract_report(text, mode):
     and the answer was unusable. Without one there is nothing to salvage: "missing".
     """
     text = text or ""
-    for report in _reports(text, mode):
-        return "present", report
+    budget = _Budget()
+    for start, end, parsed in _reports(text, mode, budget):
+        if not _may_be_enclosed(text, start):
+            return "present", parsed        # nothing can contain it; it is the report
+        enclosing, settled = _enclosing_report(text, mode, budget, start, end)
+        if enclosing is not None:
+            return "present", enclosing
+        if not settled:
+            # Whether this candidate is a field of a larger report was never established.
+            # Handing it over anyway is the defect above, so it is not handed over.
+            break
+        return "present", parsed            # enclosed by something that is not a report
     return ("invalid" if "```" in text else "missing"), None
 
 
@@ -783,7 +1229,7 @@ def main():
 
     # Outside the repository, so delegation artifacts never reach the working tree.
     workspace = Path(tempfile.mkdtemp(prefix="delegate-%s-%s-" % (args.agent, args.mode)))
-    (workspace / "brief.md").write_text(full_brief)
+    write_artifact(workspace / "brief.md", full_brief)
     # Echoed early so the workspace is recoverable if this process is killed.
     print("workspace: %s" % workspace, file=sys.stderr)
 
@@ -793,8 +1239,8 @@ def main():
     else:
         status, code, out, err, seconds = execute(argv, env, stdin_text, cwd, timeout)
 
-    (workspace / "agent-output.txt").write_text(out)
-    (workspace / "agent-stderr.txt").write_text(err)
+    write_artifact(workspace / "agent-output.txt", out)
+    write_artifact(workspace / "agent-stderr.txt", err)
     block_state, report = extract_report(out, args.mode)
     off_contract = strip_off_contract(report, args.mode)
 
@@ -848,7 +1294,7 @@ def main():
         if args.mode in VERDICT_MODES:
             result["verdict"] = "BLOCKED"
 
-    (workspace / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+    write_artifact(workspace / "result.json", json.dumps(result, indent=2) + "\n")
     json.dump(result, sys.stdout, indent=2)
     print()
 
