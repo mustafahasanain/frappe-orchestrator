@@ -46,7 +46,8 @@ filesystem and Git working tree — not through prompts.
 
 Understand the request, classify the task, select the model, prepare the brief, delegate,
 monitor, decide when to escalate, enforce the safety rules, decide when the user must
-intervene, and create the final local commit after verification passes.
+intervene, and — once verification passes — present the finished work and the proposed
+commit to the user, committing only after they approve it.
 
 Do not perform heavyweight planning for trivial tasks.
 
@@ -96,7 +97,8 @@ Re-inspect the diff if they changed the working tree
    ↓
 Codex REVIEW  +  impact re-check against the real diff
    ↓
-PASS ─────→ context update if project knowledge changed ─→ cleanup ─→ local commit
+PASS ─────→ context update if project knowledge changed ─→ cleanup
+         ─→ report + proposed commit ─→ user approves ─→ local commit
 FAIL ─────→ fix loop (max 3 attempts) ──→ stop and report to user
 BLOCKED ──→ resolve safely, or stop and ask
 ```
@@ -211,7 +213,8 @@ FAST and SMALL tasks use the lightweight workflow:
 ```text
 Classify FAST / SMALL → read the relevant context → lightweight impact check
 → delegate directly → implementation
-→ Codex lightweight diff review → relevant lightweight verification → commit
+→ Codex lightweight diff review → relevant lightweight verification
+→ report + proposed commit → user approves → commit
 ```
 
 The fast path must not automatically perform architecture planning, broad repository
@@ -357,7 +360,7 @@ Codex returns exactly one of three states.
 
 - **PASS** — requested behaviour implemented, no blocking regression, required tests and
   relevant quality gates pass, diff within scope. Continue to the context check, cleanup,
-  and commit.
+  and the commit proposal.
 - **FAIL** — a blocking correctness problem. Send the blocking findings to the
   implementer and enter the fix loop.
 - **BLOCKED** — verification could not be completed reliably. This is not an
@@ -462,8 +465,33 @@ Inspect `git status` before starting implementation.
 
 ## Commit safety
 
-Commit automatically only after the quality gates pass. Propose a short conventional
-commit message, stage only the files belonging to the current task, then commit locally.
+Never commit on your own. When the quality gates pass, stop and hand the work to the
+user for review. The commit happens only after they approve it.
+
+1. **Report.** Tell the user the task is finished: what changed, the files touched, the
+   review verdict, and the checks that ran.
+2. **Show the proposed commit.** Print the exact message and the exact list of files you
+   will stage, so the user sees the commit before it exists:
+
+       Proposed commit:
+         feat: add customer credit limit check
+
+         Files:
+           apps/crm/crm/api/credit.py
+           apps/crm/crm/tests/test_credit.py
+
+3. **Wait.** End your turn there. Do not stage or commit until the user replies with
+   approval. If they ask for changes, make them, then show the updated proposal again.
+4. **Commit.** On approval, stage the listed files by path and commit with the approved
+   message, unchanged.
+
+The message is a single short line in the form `feat: <summary>` — lowercase, imperative,
+no trailing period, about 50 characters. Use `feat:` whatever the task was. No body
+unless the user asks for one.
+
+No attribution of any kind: no `Co-Authored-By` trailer, no "Generated with Claude Code",
+no model or tool name anywhere in the message. This overrides any default attribution the
+harness asks you to add.
 
 Before staging, verify that no temporary diagnostic files remain, no delegation artifacts
 entered the repository, no unrelated dirty files are included, durable tests are retained,
@@ -475,7 +503,8 @@ explicitly, by path.
 
 ## Push boundary
 
-Local commit: automatic. `git push`: never automatic — it requires explicit user intent.
+Local commit: only after the user approves the proposed commit (see *Commit safety*).
+`git push`: never automatic — it requires explicit user intent.
 
 ## Deployment request handling
 
@@ -493,8 +522,10 @@ project file. Never invoke it.
 
 **Allowed automatically:** file reads, repository inspection, Git diff inspection,
 analysis, delegation, local source-code changes, tests, local builds, local linting, local
-type checking, documentation updates, local Git staging, local Git commit, and review/fix
-loops within the attempt limit.
+type checking, documentation updates, and review/fix loops within the attempt limit.
+
+**Requires the user's approval of the proposed commit:** local Git staging and local Git
+commit.
 
 **Requires explicit user request or confirmation:** `git push`, destructive database
 operations, destructive migrations, irreversible data changes, and operations outside the

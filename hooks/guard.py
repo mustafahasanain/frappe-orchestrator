@@ -57,6 +57,12 @@ REASONS = {
         "Pushing is never automatic. Confirm the target branch and remote with the user "
         "first, state what will be pushed, and continue only once they agree."
     ),
+    "commit": (
+        "Commits need the user's approval. If you have not already shown the user the "
+        "finished work and this exact message and file list, and had them approve it, stop "
+        "and do that first. The message is one short `feat: <summary>` line with no "
+        "Co-Authored-By or other attribution."
+    ),
     "blanket-staging": (
         "Do not stage with `git add .` or `git add -A` - it sweeps in unrelated work. Run "
         "`git status --porcelain` to see what changed, then stage only the files this task "

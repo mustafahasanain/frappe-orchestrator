@@ -77,8 +77,8 @@
       ]
     },
     {
-      "name": "commit-inside-delegated-run",
-      "intent": "The orchestrator creates the commit after review passes. An implementer that commits mid-run bypasses diff inspection and the cleanup checklist. Claude's own commits are the normal path, so the hook does not enforce this.",
+      "name": "commit",
+      "intent": "A commit happens only after the user has reviewed the finished work and approved the proposed message. The hook asks before every commit so an unapproved one cannot slip through, and an implementer that commits mid-run bypasses diff inspection and the cleanup checklist.",
       "match": {
         "kind": "program_subcommand",
         "program": "git",
@@ -86,7 +86,7 @@
           "commit"
         ]
       },
-      "hook": null,
+      "hook": "ask",
       "delegated": "deny",
       "documented_in": [
         {
@@ -100,10 +100,7 @@
       ],
       "not_examples": [
         "git status --porcelain"
-      ],
-      "not_enforced_because": {
-        "hook": "Claude commits as the normal end of a task, after review passes. The rule is about an implementer committing mid-run, and only a delegated run can do that."
-      }
+      ]
     },
     {
       "name": "discard-tracked-changes",
