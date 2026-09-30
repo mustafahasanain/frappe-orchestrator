@@ -17,10 +17,10 @@
       "executor": "opencode",
       "id": "opencode-go/glm-5.3"
     },
-    "Claude Sonnet 5": {
+    "Claude Sonnet 5.5": {
       "executor": "claude"
     },
-    "Claude Opus": {
+    "Claude Opus 5.5": {
       "executor": "claude"
     }
   },
@@ -47,7 +47,7 @@
       "description": "Normal feature development, several related files, moderate business logic, manageable regression risk."
     },
     "DIFFICULT": {
-      "model": "Claude Sonnet 5",
+      "model": "Claude Sonnet 5.5",
       "effort": "medium",
       "effort_upgrade": "high",
       "timeout_seconds": 1800,
@@ -73,7 +73,7 @@
     },
     {
       "stage": "DIFFICULT / first escalation",
-      "model": "Claude Sonnet 5",
+      "model": "Claude Sonnet 5.5",
       "effort": "medium or high"
     },
     {
@@ -83,7 +83,7 @@
     },
     {
       "stage": "exceptional escalation",
-      "model": "Claude Opus",
+      "model": "Claude Opus 5.5",
       "effort": "high"
     }
   ],
