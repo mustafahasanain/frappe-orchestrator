@@ -233,6 +233,7 @@ The brief goes in on stdin; the result comes back as JSON on stdout.
 ```text
 delegate --agent opencode --mode implement --tier <TIER> --cwd <repository root> --model "<name from routing file>"
 delegate --agent codex    --mode review    --tier <TIER> --cwd <repository root>
+delegate --agent codex    --mode review    --tier <TIER> --cwd <repository root> --previous-findings <previous review result.json>
 delegate --agent codex    --mode test      --tier <TIER> --cwd <repository root>
 delegate --agent codex    --mode onboard   --tier <TIER> --cwd <repository root>
 ```
@@ -242,6 +243,12 @@ Codex never implements: a reviewer that writes the code it reviews is not indepe
 
 The provider model id, effort, and timeout come from the routing file. `--effort` and
 `--timeout` override them when needed.
+
+A Codex review runs at its tier's `review_effort` from the same file, which the
+dispatcher passes to Codex as `-c model_reasoning_effort=<effort>`; the user's own Codex
+configuration no longer decides it. A FAST review is additionally narrowed by the
+dispatcher to the diff, which it places in the brief. Every other first review keeps
+the full reach of its tier.
 
 ### The working directory is explicit
 
@@ -319,6 +326,11 @@ claimed. Keep the two apart.
 - `agent_report` — the agent's own account of its work. **An implementation agent's
   self-report is never verification.** Only the actual diff and an independent review
   are.
+- `verdict` — in `review` and `test`, the verdict to act on. The dispatcher derives it
+  from the findings: FAIL when at least one finding is blocking, and never otherwise.
+  Where it differs from the verdict in `agent_report`, `verdict_note` says why. Read this
+  field, not `agent_report.verdict`. `finding_counts` gives the blocking and
+  non-blocking totals.
 
 ## The actual diff is authoritative
 
@@ -367,7 +379,9 @@ Codex returns exactly one of three states.
   implementation failure and does not consume an attempt on its own.
 
 Findings are `blocking` or `non_blocking`. Only blocking findings trigger another
-attempt. Surface non-blocking ones when useful, but never expand the task merely to
+attempt, and a review whose findings are all non-blocking is a PASS. The dispatcher
+enforces both directions in its top-level `verdict`; a finding without a category counts
+as blocking. Surface non-blocking ones when useful, but never expand the task merely to
 clear them.
 
 ### Handling BLOCKED
@@ -418,7 +432,12 @@ Never run an unlimited autonomous loop. **Maximum three implementation attempts.
    rung's executor is `claude`, the attempt is yours to implement directly.
 
 After every fix, Codex reviews again against the *current* actual diff, not the previous
-one.
+one. That re-review passes `--previous-findings` with the `result.json` of the review
+that failed (it is in that run's `workspace`). The dispatcher then puts those blocking
+findings and the current diff in the brief and scopes the run to two questions: is each
+finding resolved, and did the fix break anything it touched. The re-review brief carries
+the task in a few lines and what the fix changed; do not restate the findings, and do not
+ask for a full review again unless the fix reached well beyond them.
 
 ### Stop condition
 

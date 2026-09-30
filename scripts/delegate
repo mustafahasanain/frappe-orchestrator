@@ -249,9 +249,17 @@ actual diff and the affected code, run the tests that the change actually warran
 and report what you find.
 
 Use "blocking" only for findings that must be fixed before this can be committed:
-incorrect behaviour, regression, failing required test, data corruption risk,
-permission problem, missing required behaviour, unsafe implementation. Everything
-else is "non_blocking" and will not trigger rework.
+incorrect behaviour, a broken requirement, a runtime error, a clear regression, a
+failing required test, a security problem, a data-loss or data-corruption risk,
+broken permission or access behaviour, or framework usage that will fail. Each one
+needs a concrete failure mode you can state.
+
+Everything else is "non_blocking" and will not trigger rework: low-probability edge
+cases, optional cleanup, style, minor maintainability suggestions, and speculative
+issues without a concrete failure mode.
+
+Return FAIL only when at least one finding is "blocking". A review whose findings are
+all "non_blocking" is a PASS; report those findings anyway.
 
 Return BLOCKED, not FAIL, when verification could not be completed reliably - a
 missing dependency, an unavailable service, a broken test environment. BLOCKED is
@@ -362,6 +370,235 @@ reported as such, not as a failure.
 
 
 # --------------------------------------------------------------------------
+# Review scope
+#
+# The review contract is the same on every tier; how far a review reaches is not. A
+# review was the slow half of every task - two to five minutes against one for the
+# implementation - and most of that was a reviewer re-establishing the whole change from
+# scratch: on a one-line FAST fix, and again on every re-review after a FAIL, where the
+# only open questions are the findings it already reported.
+#
+# So two reviews are narrowed, and both by the dispatcher rather than by the brief, for
+# the same reason the contract is appended here: the scope holds even when the
+# orchestrator forgets to state it. A FAST first review looks at the diff. A re-review
+# looks at its own previous blocking findings and at what the fix changed. Both get the
+# diff in the brief, so the reviewer starts from the change instead of looking for it.
+# Every other review keeps the full reach of its tier.
+#
+# Neither relaxes the contract. A re-review that finds a real regression still reports
+# it as blocking, and a finding that is not resolved is blocking again.
+# --------------------------------------------------------------------------
+
+REVIEW_SCOPE_FAST = """## Review scope: lightweight
+
+This is a FAST-tier change: small, mechanical, low risk. Keep the review short and
+targeted.
+
+- Review the changed lines in the diff below, and read surrounding code only where it
+  is needed to judge them.
+- Check correctness, obvious bugs, clear regressions, and whether the change does what
+  the task asked.
+- Do not audit the architecture or review unchanged code unless the diff clearly
+  requires it.
+- Run a test only when an existing one directly covers the changed code and is quick.
+"""
+
+REVIEW_SCOPE_RECHECK = """## Review scope: re-review after a fix
+
+An earlier review of this change returned the blocking findings listed below, and the
+implementation has since been changed to address them. This is not a fresh full
+review. Verify exactly two things:
+
+1. Whether each previous blocking finding is resolved. One that is not resolved is
+   blocking again.
+2. Whether the fix introduced a regression in the code it changed or in code that
+   directly depends on it.
+
+Do not re-review the parts of the change the previous review raised no blocking
+finding about, and do not raise new findings about code the fix did not touch unless
+you see a concrete failure.
+
+### Previous blocking findings
+
+%s
+"""
+
+# Above this the diff is not embedded, and the reviewer is told to read it itself. A
+# brief that is mostly diff costs more to read than the reviewer's own `git diff`.
+MAX_EMBEDDED_DIFF_CHARS = 50000
+MAX_FINDING_CHARS = 4000
+MAX_LISTED_UNTRACKED = 50
+GIT_SECONDS = 30
+
+
+def is_blocking(finding):
+    """Whether a finding counts as blocking. Only an explicit non_blocking is not.
+
+    A finding without a category, or one that is not an object at all, is counted as
+    blocking: an unlabelled finding read as non-blocking is how a real defect would turn
+    a FAIL into a PASS.
+    """
+    if not isinstance(finding, dict):
+        return True
+    category = str(finding.get("category", "")).strip().casefold()
+    return category.replace("-", "_").replace(" ", "_") != "non_blocking"
+
+
+def load_previous_findings(path, fail):
+    """The blocking findings of an earlier review, from --previous-findings.
+
+    Accepts the dispatcher's own result JSON (stdout, or result.json in its workspace),
+    the agent's report on its own, or a bare list of findings.
+    """
+    try:
+        data = json.loads(Path(path).read_text(encoding=TEXT_ENCODING))
+    except (OSError, ValueError) as exc:
+        fail("cannot read --previous-findings %s: %s" % (path, exc))
+    if isinstance(data, dict) and "agent_report" in data:
+        if data.get("mode") not in VERDICT_MODES:
+            fail(
+                "--previous-findings %s is the result of a %s run, which has no "
+                "findings to re-check" % (path, data.get("mode"))
+            )
+        data = data.get("agent_report") or {}
+    if isinstance(data, dict):
+        data = data.get("findings")
+    if not isinstance(data, list):
+        fail("--previous-findings %s holds no findings list" % path)
+    blocking = [finding for finding in data if is_blocking(finding)]
+    if not blocking:
+        fail(
+            "--previous-findings %s has no blocking findings. A re-review re-checks "
+            "blocking findings; with none, run an ordinary review instead." % path
+        )
+    return blocking
+
+
+def format_findings(findings):
+    lines = []
+    for number, finding in enumerate(findings, 1):
+        if isinstance(finding, dict):
+            where = finding.get("file") or "(no file given)"
+            detail = str(finding.get("detail") or "(no detail given)")
+        else:
+            where, detail = "(unstructured finding)", str(finding)
+        if len(detail) > MAX_FINDING_CHARS:
+            detail = detail[:MAX_FINDING_CHARS] + " [truncated]"
+        lines.append("%d. `%s` - %s" % (number, where, detail))
+    return "\n".join(lines)
+
+
+def working_tree_diff(cwd):
+    """(diff, untracked paths) of the uncommitted change, or (None, None) if git cannot say."""
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
+
+    def git(*args):
+        proc = subprocess.run(
+            ["git", "-C", cwd, "--no-pager"] + list(args),
+            stdin=subprocess.DEVNULL, capture_output=True, env=env, timeout=GIT_SECONDS,
+        )
+        if proc.returncode != 0:
+            return None
+        return proc.stdout.decode(TEXT_ENCODING, TEXT_ERRORS)
+
+    try:
+        diff = git("diff", "--no-color", "--no-ext-diff", "HEAD")
+        listed = git("ls-files", "--others", "--exclude-standard", "-z")
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    if diff is None or listed is None:
+        return None, None
+    return diff, [path for path in listed.split("\0") if path]
+
+
+def fence_for(text):
+    """A code fence longer than any backtick run inside `text`, so the text cannot close it."""
+    longest, run = 0, 0
+    for char in text:
+        run = run + 1 if char == "`" else 0
+        longest = max(longest, run)
+    return "`" * max(3, longest + 1)
+
+
+def diff_section(cwd):
+    diff, untracked = working_tree_diff(cwd)
+    if diff is None:
+        return (
+            "## Current diff\n\nThe diff could not be read when this brief was written. "
+            "Run `git diff HEAD` and `git status` yourself to see the change.\n"
+        )
+    parts = ["## Current diff\n"]
+    if not diff.strip():
+        parts.append("`git diff HEAD` is empty: no tracked file has uncommitted changes.\n")
+    elif len(diff) > MAX_EMBEDDED_DIFF_CHARS:
+        parts.append(
+            "`git diff HEAD` is %d characters, too long to include here. Run it "
+            "yourself and review the change from there.\n" % len(diff)
+        )
+    else:
+        fence = fence_for(diff)
+        parts.append(
+            "The uncommitted change, as `git diff HEAD` reported it when this brief was "
+            "written:\n\n%sdiff\n%s\n%s\n" % (fence, diff.rstrip("\n"), fence)
+        )
+    if untracked:
+        listed = ["- `%s`" % path for path in untracked[:MAX_LISTED_UNTRACKED]]
+        if len(untracked) > MAX_LISTED_UNTRACKED:
+            listed.append("- ... and %d more" % (len(untracked) - MAX_LISTED_UNTRACKED))
+        parts.append(
+            "Untracked files, which the diff above does not show. Read the ones that "
+            "belong to this change:\n\n%s\n" % "\n".join(listed)
+        )
+    return "\n".join(parts)
+
+
+def review_scope(mode, tier, previous, cwd):
+    """The scope section of a review brief, or "" where the tier's full review applies."""
+    if mode != "review":
+        return ""
+    if previous:
+        scope = REVIEW_SCOPE_RECHECK % format_findings(previous)
+    elif tier == "FAST":
+        scope = REVIEW_SCOPE_FAST
+    else:
+        return ""
+    return scope + "\n" + diff_section(cwd)
+
+
+def derive_verdict(report):
+    """(verdict, finding counts, note) for a verdict-mode report, from its findings.
+
+    FAIL means at least one blocking finding, and nothing else does. The agent's own
+    verdict stands where it agrees with its findings. Where it does not, the findings
+    win, in both directions: a FAIL whose findings are all explicitly non_blocking is a
+    PASS, and a PASS carrying a blocking finding is a FAIL. The note says which happened.
+    BLOCKED is never changed - it is a statement about verification, not about the code.
+    A FAIL with no findings at all is left as FAIL: there is nothing to base a PASS on.
+    """
+    if report is None:
+        return None, None, None
+    claimed = str(report.get("verdict", "")).strip().upper()
+    findings = report.get("findings")
+    if not isinstance(findings, list):
+        findings = []
+    blocking = sum(1 for finding in findings if is_blocking(finding))
+    counts = {"blocking": blocking, "non_blocking": len(findings) - blocking}
+    if claimed == "BLOCKED":
+        return claimed, counts, None
+    if blocking:
+        note = None if claimed == "FAIL" else (
+            "the agent returned %s with %d finding(s) that are blocking or have no "
+            "category" % (claimed, blocking)
+        )
+        return "FAIL", counts, note
+    if claimed == "FAIL" and findings:
+        return "PASS", counts, (
+            "the agent returned FAIL, but every finding is non_blocking"
+        )
+    return claimed, counts, None
+
+
+# --------------------------------------------------------------------------
 # Adapters - the only agent-specific code in this file.
 # Each returns (argv, env, stdin_text). stdin_text is None when the brief is
 # delivered as an argument instead.
@@ -413,7 +650,7 @@ def adapt_opencode(*, brief, model_id, effort, mode, cwd, rules=()):
     return argv, env, None
 
 
-def adapt_codex(*, brief, mode, cwd, **_):
+def adapt_codex(*, brief, mode, cwd, effort=None, **_):
     # Both sandboxes execute model-generated shell commands - the CLI's own help for
     # --sandbox says so. What they restrict is reach: read-only permits no write and no
     # network, workspace-write confines writes to the working tree and still has no
@@ -430,7 +667,14 @@ def adapt_codex(*, brief, mode, cwd, **_):
     # is stated rather than inherited: the failure is silent and the run looks normal.
     env = dict(os.environ)
     env["PWD"] = cwd
-    return ["codex", "exec", "--sandbox", sandbox, "-C", cwd, "-"], env, brief
+    argv = ["codex", "exec", "--sandbox", sandbox, "-C", cwd]
+    # Stated, not inherited, for the reason the directory is: left out, the effort is
+    # whatever ~/.codex/config.toml says, and that was "high" for every review on every
+    # tier - a one-line FAST fix reviewed as hard as a migration. The value is checked
+    # against CODEX_EFFORTS before it gets here, so nothing unvalidated reaches -c.
+    if effort:
+        argv += ["-c", "model_reasoning_effort=%s" % effort]
+    return argv + ["-"], env, brief
 
 
 ADAPTERS = {"opencode": adapt_opencode, "codex": adapt_codex}
@@ -471,6 +715,43 @@ def resolve_model(routing, name, fail):
             "delegating to this model." % (name, ROUTING, model_id)
         )
     return model_id
+
+
+# Values Codex accepts for model_reasoning_effort. Checked here, before the command is
+# built, so a typo in the routing file is refused with its name instead of reaching the
+# CLI as an argument it rejects - or accepts, and runs at a default nobody chose.
+CODEX_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+
+
+def resolve_codex_effort(mode, tier_name, tier, override, fail):
+    """The reasoning effort for a Codex run, or None to leave Codex at its own default.
+
+    A review runs at the tier's review_effort, and a tier without a valid one is refused
+    rather than quietly falling back to ~/.codex/config.toml, which is the behaviour this
+    replaces. `--effort` overrides it in any Codex mode; an empty `--effort` omits it.
+    Test and onboard runs are unchanged unless `--effort` is passed.
+    """
+    if override is not None:
+        if override == "":
+            return None
+        value, source = override, "--effort"
+    elif mode == "review":
+        value = tier.get("review_effort")
+        source = 'review_effort of tier "%s" in %s' % (tier_name, ROUTING)
+        if value is None:
+            fail(
+                'tier "%s" has no review_effort in %s. Codex reviews run at the tier\'s '
+                "effort, not at the CLI's own default; set one of: %s"
+                % (tier_name, ROUTING, ", ".join(CODEX_EFFORTS))
+            )
+    else:
+        return None
+    if not isinstance(value, str) or value not in CODEX_EFFORTS:
+        fail(
+            "%s is %r, which Codex does not accept as a reasoning effort. Use one of: %s"
+            % (source, value, ", ".join(CODEX_EFFORTS))
+        )
+    return value
 
 
 # --------------------------------------------------------------------------
@@ -1115,7 +1396,14 @@ def build_parser():
     parser.add_argument("--model", help="display name from the routing file")
     parser.add_argument(
         "--effort",
-        help="defaults to the tier's effort; pass an empty string to omit --variant",
+        help="defaults to the tier's effort (OpenCode --variant) or, for a Codex review, "
+        "its review_effort (-c model_reasoning_effort); an empty string omits it",
+    )
+    parser.add_argument(
+        "--previous-findings",
+        metavar="PATH",
+        help="review only: an earlier review's result JSON; the run re-checks its "
+        "blocking findings against the current diff instead of reviewing afresh",
     )
     parser.add_argument(
         "--cwd",
@@ -1181,7 +1469,14 @@ def main():
         model_id = resolve_model(routing, args.model, fail)
         effort = args.effort if args.effort is not None else tier.get("effort")
     else:
-        model_id, effort = None, None
+        model_id = None
+        effort = resolve_codex_effort(args.mode, args.tier, tier, args.effort, fail)
+
+    previous = None
+    if args.previous_findings is not None:
+        if args.mode != "review":
+            fail("--previous-findings is accepted only with --mode review")
+        previous = load_previous_findings(args.previous_findings, fail)
 
     brief = "" if sys.stdin.isatty() else sys.stdin.read()
     if not brief.strip():
@@ -1193,9 +1488,11 @@ def main():
 
     # The leading heading also guarantees the brief never starts with "-" when it is
     # passed as a positional argument.
-    full_brief = "# Delegated task (%s)\n\n%s\n\n%s" % (
+    scope = review_scope(args.mode, args.tier, previous, cwd)
+    full_brief = "# Delegated task (%s)\n\n%s\n\n%s%s" % (
         args.mode,
         brief.strip(),
+        scope + "\n" if scope else "",
         CONTRACTS[args.mode],
     )
 
@@ -1271,6 +1568,16 @@ def main():
         "off_contract_keys": off_contract,
         "agent_report": report,
     }
+    if args.mode in VERDICT_MODES:
+        result["previous_findings"] = (
+            os.path.abspath(args.previous_findings) if args.previous_findings else None
+        )
+        verdict, counts, note = derive_verdict(report)
+        if verdict is not None:
+            result["verdict"] = verdict
+            result["finding_counts"] = counts
+        if note:
+            result["verdict_note"] = note
 
     if status == "cli_missing":
         result["error"] = (

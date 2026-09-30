@@ -2857,6 +2857,285 @@ def check_group_isolation():
     return problems
 
 
+# --------------------------------------------------------------------------
+# Codex review effort and scope
+#
+# A review used to run at whatever ~/.codex/config.toml said - "high", on every tier -
+# because the dispatcher never stated an effort for Codex. That failure is invisible in a
+# result: the run completes, the report parses, and it simply took four minutes to review
+# a one-line fix. So the effort is checked where it is resolved and where it reaches the
+# command line, and the narrowed review briefs are checked in the brief Codex actually
+# receives, from a real repository with a real diff.
+# --------------------------------------------------------------------------
+
+EXPECTED_REVIEW_EFFORT = {
+    "FAST": "low", "SMALL": "medium", "NORMAL": "medium", "DIFFICULT": "high",
+}
+
+
+def check_codex_effort():
+    problems = []
+    routing = json.loads((ROOT / "config" / "model-routing.json").read_text())
+    tiers = routing["tiers"]
+    if set(tiers) != set(EXPECTED_REVIEW_EFFORT):
+        problems.append("tiers %s, expected %s" % (sorted(tiers), sorted(EXPECTED_REVIEW_EFFORT)))
+
+    for name, want in EXPECTED_REVIEW_EFFORT.items():
+        try:
+            got = d.resolve_codex_effort("review", name, tiers.get(name, {}), None, refuse)
+        except Refused as exc:
+            problems.append("%s review effort refused: %s" % (name, exc))
+            continue
+        if got != want:
+            problems.append("%s review effort %r, wanted %r" % (name, got, want))
+        argv, _env, stdin = d.adapt_codex(brief="b", mode="review", cwd="/probe", effort=got)
+        if "model_reasoning_effort=%s" % want not in argv:
+            problems.append("%s: codex argv carries no -c model_reasoning_effort=%s" % (name, want))
+        elif argv[argv.index("model_reasoning_effort=%s" % want) - 1] != "-c":
+            problems.append("%s: the effort is not passed through -c" % name)
+        if argv[-1] != "-" or stdin != "b":
+            problems.append("%s: the brief is no longer delivered on stdin" % name)
+
+    # Refused, never a command with a bad or missing value in it. Each of these would
+    # otherwise reach Codex as an argument it rejects, or be dropped and leave the run at
+    # the CLI's own default - the behaviour being replaced.
+    for label, tier in (
+        ("missing", {"timeout_seconds": 1}),
+        ("misspelt", {"review_effort": "hgih"}),
+        ("empty", {"review_effort": ""}),
+        ("not a string", {"review_effort": 3}),
+        ("null", {"review_effort": None}),
+    ):
+        try:
+            got = d.resolve_codex_effort("review", "FAST", tier, None, refuse)
+        except Refused:
+            continue
+        problems.append("a %s review_effort resolved to %r instead of being refused" % (label, got))
+    try:
+        d.resolve_codex_effort("review", "FAST", {"review_effort": "low"}, "loud", refuse)
+        problems.append("an invalid --effort for codex was accepted")
+    except Refused:
+        pass
+
+    # --effort overrides; an empty one omits -c entirely, as it omits --variant.
+    cases = (
+        ("review", {"review_effort": "low"}, "high", "high"),
+        ("review", {"review_effort": "low"}, "", None),
+        ("test", {"review_effort": "low"}, None, None),
+        ("onboard", {"review_effort": "low"}, None, None),
+        ("test", {"review_effort": "low"}, "medium", "medium"),
+    )
+    for mode, tier, override, want in cases:
+        got = d.resolve_codex_effort(mode, "FAST", tier, override, refuse)
+        if got != want:
+            problems.append("%s with --effort %r: %r, wanted %r" % (mode, override, got, want))
+    argv, _env, _stdin = d.adapt_codex(brief="b", mode="test", cwd="/probe")
+    if "-c" in argv:
+        problems.append("codex without an effort still passes -c: %r" % argv)
+    return problems
+
+
+VERDICTS = [
+    # (name, report, verdict, counts, noted)
+    ("blocking fails", {"verdict": "FAIL", "findings": [{"category": "blocking"}]},
+     "FAIL", (1, 0), False),
+    ("non-blocking only passes", {"verdict": "FAIL", "findings": [
+        {"category": "non_blocking"}, {"category": "non-blocking"}]},
+     "PASS", (0, 2), True),
+    ("pass with suggestions stays pass", {"verdict": "PASS", "findings": [
+        {"category": "non_blocking"}]}, "PASS", (0, 1), False),
+    ("pass carrying a blocking finding fails", {"verdict": "pass", "findings": [
+        {"category": "non_blocking"}, {"category": "blocking"}]}, "FAIL", (1, 1), True),
+    ("uncategorised counts as blocking", {"verdict": "PASS", "findings": [
+        {"detail": "x"}]}, "FAIL", (1, 0), True),
+    ("non-object finding counts as blocking", {"verdict": "PASS", "findings": ["x"]},
+     "FAIL", (1, 0), True),
+    ("fail with no findings stays fail", {"verdict": "FAIL", "findings": []},
+     "FAIL", (0, 0), False),
+    ("blocked is never changed", {"verdict": "BLOCKED", "findings": [
+        {"category": "blocking"}]}, "BLOCKED", (1, 0), False),
+    ("clean pass", {"verdict": "PASS"}, "PASS", (0, 0), False),
+]
+
+
+def check_derived_verdict(tmp):
+    problems = []
+    for name, report, want, (blocking, non_blocking), noted in VERDICTS:
+        verdict, counts, note = d.derive_verdict(report)
+        if verdict != want:
+            problems.append("%s: %r, wanted %r" % (name, verdict, want))
+        if counts != {"blocking": blocking, "non_blocking": non_blocking}:
+            problems.append("%s: counts %r" % (name, counts))
+        if bool(note) != noted:
+            problems.append("%s: note %r" % (name, note))
+    if d.derive_verdict(None) != (None, None, None):
+        problems.append("no report still produced a verdict")
+
+    # --previous-findings: the dispatcher's own result, a bare report, or a list.
+    blocking = {"category": "blocking", "file": "a.py", "detail": "wrong"}
+    suggestion = {"category": "non_blocking", "file": "b.py", "detail": "tidy"}
+    accepted = {
+        "result": {"mode": "review", "agent_report": {"findings": [blocking, suggestion]}},
+        "report": {"verdict": "FAIL", "findings": [suggestion, blocking]},
+        "list": [blocking, suggestion],
+    }
+    for label, data in accepted.items():
+        path = tmp / ("%s.json" % label)
+        path.write_text(json.dumps(data))
+        try:
+            got = d.load_previous_findings(str(path), refuse)
+        except Refused as exc:
+            problems.append("previous findings (%s) refused: %s" % (label, exc))
+            continue
+        if got != [blocking]:
+            problems.append("previous findings (%s): %r, wanted the blocking one only" % (label, got))
+    refused = {
+        "no blocking": [suggestion],
+        "implement result": {"mode": "implement", "agent_report": {"findings": [blocking]}},
+        "no findings list": {"verdict": "FAIL"},
+        "not json": "{",
+    }
+    for label, data in refused.items():
+        path = tmp / ("refused-%s.json" % label.replace(" ", "-"))
+        path.write_text(data if isinstance(data, str) else json.dumps(data))
+        try:
+            d.load_previous_findings(str(path), refuse)
+            problems.append("previous findings (%s) accepted" % label)
+        except Refused:
+            pass
+    try:
+        d.load_previous_findings(str(tmp / "absent.json"), refuse)
+        problems.append("a missing --previous-findings file was accepted")
+    except Refused:
+        pass
+
+    inner = "text with ```` four backticks"
+    if len(d.fence_for(inner)) <= 4:
+        problems.append("fence_for returned a fence the text can close")
+    return problems
+
+
+# The stub records the arguments and the brief it was given, then prints whatever report
+# the test put in REPORT - so the brief Codex receives is observed, not reconstructed.
+CODEX_RECORDING_STUB = """#!/bin/sh
+printf '%s\\n' "$@" > "$RECORD_DIR/argv"
+cat > "$RECORD_DIR/stdin"
+cat "$RECORD_DIR/report"
+"""
+
+
+def check_review_briefs(tmp):
+    problems = []
+    if shutil.which("git") is None:
+        return ["git is not installed; the review brief cannot be checked"]
+    bin_dir, repo, record, work = tmp / "bin", tmp / "repo", tmp / "record", tmp / "work"
+    for path in (bin_dir, repo, record, work):
+        path.mkdir(parents=True)
+    stub = bin_dir / "codex"
+    stub.write_text(CODEX_RECORDING_STUB)
+    stub.chmod(0o755)
+
+    def git(*args):
+        subprocess.run(["git", "-C", str(repo)] + list(args), check=True,
+                       capture_output=True, timeout=30)
+
+    git("init", "-q")
+    (repo / "app.py").write_text("def total(a, b):\n    return a - b\n")
+    git("add", "app.py")
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init")
+    (repo / "app.py").write_text("def total(a, b):\n    return a + b\n")
+    (repo / "new_module.py").write_text("X = 1\n")
+
+    env = dict(os.environ)
+    env["PATH"] = "%s:%s" % (bin_dir, env.get("PATH", "/usr/bin:/bin"))
+    env["TMPDIR"] = str(work)
+    env["RECORD_DIR"] = str(record)
+
+    def review(tier, report, *extra):
+        (record / "report").write_text("```json\n%s\n```\n" % json.dumps(report))
+        proc = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "delegate"), "--agent", "codex",
+             "--mode", "review", "--tier", tier, "--cwd", str(repo)] + list(extra),
+            input="Fix total() so it adds.", capture_output=True, text=True, env=env,
+            timeout=60,
+        )
+        if proc.returncode != 0:
+            problems.append("%s review exited %s: %s" % (tier, proc.returncode, proc.stderr[-300:]))
+            return None, [], ""
+        return (json.loads(proc.stdout), (record / "argv").read_text().splitlines(),
+                (record / "stdin").read_text())
+
+    changed_line = "+    return a + b"
+    blocking = {"category": "blocking", "file": "app.py", "detail": "SENTINEL-FINDING"}
+
+    # FAST first review: low effort, lightweight scope, the diff in the brief.
+    result, argv, brief = review("FAST", {"verdict": "FAIL", "summary": "s", "findings": [blocking]})
+    if result is not None:
+        if "model_reasoning_effort=low" not in argv:
+            problems.append("FAST review argv has no low effort: %r" % argv)
+        if "Review scope: lightweight" not in brief:
+            problems.append("FAST review brief has no lightweight scope")
+        if changed_line not in brief:
+            problems.append("FAST review brief does not carry the diff")
+        if "new_module.py" not in brief:
+            problems.append("FAST review brief does not list the untracked file")
+        if result.get("verdict") != "FAIL":
+            problems.append("a blocking finding gave verdict %r" % result.get("verdict"))
+        if brief.index("Review scope") > brief.index("## Requested output"):
+            problems.append("the review scope comes after the output contract")
+    first = result
+
+    # SMALL first review: medium effort, the tier's full review, no narrowing.
+    result, argv, brief = review("SMALL", {"verdict": "FAIL", "summary": "s", "findings": [
+        {"category": "non_blocking", "file": "app.py", "detail": "rename a"}]})
+    if result is not None:
+        if "model_reasoning_effort=medium" not in argv:
+            problems.append("SMALL review argv has no medium effort: %r" % argv)
+        if "Review scope" in brief or changed_line in brief:
+            problems.append("SMALL first review was narrowed")
+        if "Fix total() so it adds." not in brief:
+            problems.append("SMALL review brief lost the orchestrator's task context")
+        if result.get("verdict") != "PASS" or not result.get("verdict_note"):
+            problems.append(
+                "non-blocking-only FAIL gave verdict %r, note %r"
+                % (result.get("verdict"), result.get("verdict_note"))
+            )
+        if result["agent_report"]["verdict"] != "FAIL":
+            problems.append("the agent's own verdict was rewritten in agent_report")
+
+    # Re-review from the first result: previous blocking findings plus the current diff.
+    if first is not None:
+        previous = Path(first["workspace"]) / "result.json"
+        result, argv, brief = review(
+            "DIFFICULT", {"verdict": "PASS", "summary": "s", "findings": []},
+            "--previous-findings", str(previous),
+        )
+        if result is not None:
+            if "model_reasoning_effort=high" not in argv:
+                problems.append("DIFFICULT re-review argv has no high effort: %r" % argv)
+            if "re-review after a fix" not in brief:
+                problems.append("re-review brief has no re-review scope")
+            if "SENTINEL-FINDING" not in brief:
+                problems.append("re-review brief does not carry the previous finding")
+            if changed_line not in brief:
+                problems.append("re-review brief does not carry the current diff")
+            if result.get("previous_findings") != str(previous):
+                problems.append("the result does not record which findings were re-checked")
+            if result.get("verdict") != "PASS":
+                problems.append("clean re-review gave verdict %r" % result.get("verdict"))
+
+    # --previous-findings belongs to review only.
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "delegate"), "--agent", "codex",
+         "--mode", "test", "--tier", "FAST", "--cwd", str(repo),
+         "--previous-findings", str(record / "report"), "--dry-run"],
+        input="b", capture_output=True, text=True, env=env, timeout=60,
+    )
+    if proc.returncode != 2:
+        problems.append("--previous-findings with --mode test was not refused")
+    return problems
+
+
 def main():
     failures = []
 
@@ -2902,6 +3181,11 @@ def main():
     failures.extend("destructive: " + line for line in check_destructive_boundaries())
     failures.extend("mode matrix: " + line for line in check_matrix())
     failures.extend("working directory: " + line for line in check_working_directory())
+    failures.extend("codex effort: " + line for line in check_codex_effort())
+    with tempfile.TemporaryDirectory() as tmp:
+        failures.extend("verdict: " + line for line in check_derived_verdict(Path(tmp)))
+    with tempfile.TemporaryDirectory() as tmp:
+        failures.extend("review brief: " + line for line in check_review_briefs(Path(tmp)))
     failures.extend("invocation: " + line for line in check_dispatcher_invocation())
     failures.extend("hook payload: " + line for line in check_hook_payloads())
     failures.extend("hook response: " + line for line in check_hook_response_shape())
@@ -2934,14 +3218,14 @@ def main():
     print(
         "%d cases, %d timed, %d strip, %d nested, %d oversized, %d boundary rules, "
         "%d hook payloads, %d precedence, %d boundary faults, %d destructive decisions, "
-        "mode matrix, invocation, "
+        "%d derived verdicts, mode matrix, invocation, codex effort, review briefs, "
         "nesting invariant, hook response, hook fault, agent path, adapters, --cwd, "
         "group isolation, timeout containment and the byte/text boundary checked"
         % (len(CASES), len(TIMED), len(STRIP), len(NESTED_SELECTION),
            len(OVERSIZED_ENCLOSURE) + len(INDEPENDENT_AFTER_TRANSCRIPT)
            + len(ENCLOSURE_GATE),
            len(BOUNDARIES["rules"]), len(HOOK_PAYLOADS), len(PRECEDENCE),
-           len(BOUNDARY_FAULTS), len(DESTRUCTIVE_POLICY))
+           len(BOUNDARY_FAULTS), len(DESTRUCTIVE_POLICY), len(VERDICTS))
     )
 
     regressed = []

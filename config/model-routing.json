@@ -29,18 +29,21 @@
       "model": "Kimi K2.6",
       "effort": "low",
       "timeout_seconds": 180,
+      "review_effort": "low",
       "description": "Extremely clear, low risk, mechanical, very limited scope; latency is the priority."
     },
     "SMALL": {
       "model": "Kimi K2.7 Code",
       "effort": "low",
       "timeout_seconds": 420,
+      "review_effort": "medium",
       "description": "Clear requirement, limited scope, one or a few related files, no architecture impact, low regression risk."
     },
     "NORMAL": {
       "model": "Kimi K2.7 Code",
       "effort": "medium",
       "timeout_seconds": 900,
+      "review_effort": "medium",
       "description": "Normal feature development, several related files, moderate business logic, manageable regression risk."
     },
     "DIFFICULT": {
@@ -48,6 +51,7 @@
       "effort": "medium",
       "effort_upgrade": "high",
       "timeout_seconds": 1800,
+      "review_effort": "high",
       "description": "Subtle business logic, hard debugging, permissions, integration behaviour, data integrity, concurrency, complex migrations, architectural decisions, high ambiguity, or previous implementation failure. Raise effort to high when reasoning complexity or risk justifies it."
     }
   },
