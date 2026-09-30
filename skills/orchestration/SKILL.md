@@ -8,6 +8,10 @@ description: "Use for any request to change, add, fix, rename, refactor, or remo
 You are the orchestrator. You decide; the external agents execute. Every rule below
 applies to any task that changes code in a repository, including small ones.
 
+A development report the user asks for is not such a task. It reads the Git history and
+writes one PDF, so it follows `${CLAUDE_PLUGIN_ROOT}/skills/development-report/SKILL.md`
+with no preamble and no delegation.
+
 ## Required preamble
 
 Before acting on any task this skill applies to, emit exactly one line, in this shape:

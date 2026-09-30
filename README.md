@@ -8,9 +8,10 @@ and live-site boundaries.
 
 | Component | Where |
 | :-- | :-- |
-| Skills | `skills/orchestration`, `skills/project-context`, `skills/frappe-operations` |
+| Skills | `skills/orchestration`, `skills/project-context`, `skills/frappe-operations`, `skills/development-report` |
 | Enforcement hook | `hooks/guard.py` (`PreToolUse` on `Bash`) |
 | Delegation dispatcher | `scripts/delegate` |
+| Development report | `scripts/dev-report` (on request only) |
 | Boundaries and routing | `config/command-boundaries.json`, `config/model-routing.json` |
 
 The hook and the dispatcher's permission policy are the two enforcement layers, and
@@ -25,6 +26,10 @@ they read their rules from `config/command-boundaries.json` rather than keeping 
 - **[Codex CLI](https://github.com/openai/codex).** Runs `review`, `test`, and `onboard` —
   a reviewer that wrote the code it reviews is not an independent reviewer, so the two
   agents never overlap.
+- **For the development report only:** Google Chrome or Chromium, poppler-utils, and an
+  Arabic font (Noto Sans Arabic / Noto Kufi Arabic). Nothing else in the plugin needs
+  them. Ask for a report in so many words — "Create today's development report" — and it
+  is written to `reports/<date>-development-report-ar.pdf`; it never runs on its own.
 
 ### PATH order matters
 
@@ -60,7 +65,7 @@ every repository with no `--plugin-dir` flag. Confirm:
 
 ```bash
 claude plugin list          # frappe-orchestrator@frappe-orchestrator — enabled
-claude plugin details frappe-orchestrator@frappe-orchestrator   # 3 skills, 1 PreToolUse hook
+claude plugin details frappe-orchestrator@frappe-orchestrator   # 4 skills, 1 PreToolUse hook
 ```
 
 A `directory` marketplace source is used **in place**. `CLAUDE_PLUGIN_ROOT` resolves to
@@ -81,8 +86,8 @@ loads it. There is nothing to sync:
 | `hooks/`, `config/`, `scripts/` | Next session, or `/reload-plugins` in an open one |
 
 The cost of that is worth stating plainly: a broken working tree is broken enforcement in
-every session, not just this repository's. Run `python3 tests/test_parser.py` before you
-leave a change in the tree.
+every session, not just this repository's. Run `python3 tests/test_parser.py` and
+`python3 tests/test_dev_report.py` before you leave a change in the tree.
 
 The two update commands are bookkeeping. `plugin.json` carries **no `version` field**, so
 Claude Code stamps the install with the source commit SHA; a pinned version would freeze

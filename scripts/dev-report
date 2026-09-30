@@ -1,0 +1,753 @@
+#!/usr/bin/env python3
+"""On-demand development report: one day's commits in, an Arabic right-to-left PDF out.
+
+    dev-report collect [--date YYYY-MM-DD] [--head-only]      > commits.json
+    dev-report render CONTENT.json --commits commits.json [--out PATH]
+    dev-report verify PATH [--previews DIR]
+
+Nothing here runs on its own. The development-report skill calls it when, and only when,
+the user asks for a report.
+
+`collect` reads the repository and prints the facts: which commits fall on the day in the
+machine's local timezone, and what each one touched. `render` takes the Arabic prose Claude
+wrote from those facts and lays it out. The split is the point. Hashes, messages, times,
+file lists and line counts in the PDF come from `collect`, never from the prose, and
+`render` refuses content that cites a commit `collect` did not return - so the report can
+be badly worded but cannot describe a commit that does not exist.
+
+The PDF is printed by headless Chrome, whose text engine shapes Arabic and lays out
+`dir="rtl"` properly; the Python PDF libraries that ship without a shaper do neither.
+`verify` then checks the file rather than trusting the printer: an Arabic font embedded,
+Arabic text extractable, and a heading sitting on the right-hand side of the page.
+
+Standard library only. Chrome (or Chromium) is required; poppler-utils (`pdfinfo`,
+`pdffonts`, `pdftotext`, `pdftoppm`) is required by `verify`.
+
+Exit status: 0 on success, 1 when the work failed (no Chrome, a check did not pass),
+2 when the invocation or its input was wrong.
+"""
+
+import argparse
+import datetime as dt
+import html
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+# Files that change in a commit without being the work. Counted separately so the report
+# neither dumps them nor hides that they changed.
+NOISE_NAMES = frozenset({
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "bun.lock",
+    "poetry.lock", "Pipfile.lock", "uv.lock", "Cargo.lock", "composer.lock",
+    "Gemfile.lock", "go.sum", ".DS_Store",
+})
+NOISE_DIRS = frozenset({
+    "node_modules", "dist", "build", ".next", "out", "coverage", "__pycache__",
+    ".ruff_cache", ".pytest_cache", ".mypy_cache", ".turbo", ".cache",
+})
+NOISE_SUFFIXES = (".min.js", ".min.css", ".map", ".pyc", ".pyo", ".pdf")
+
+KIND_LABELS = {
+    "feature": "ميزة جديدة",
+    "fix": "إصلاح",
+    "improvement": "تحسين",
+    "refactor": "إعادة هيكلة",
+    "perf": "أداء",
+    "security": "أمان",
+    "docs": "توثيق",
+    "test": "اختبارات",
+    "config": "إعدادات",
+    "chore": "صيانة",
+}
+NOTE_LABELS = {
+    "breaking": "تغيير كاسر",
+    "migration": "ترحيل",
+    "config": "إعدادات",
+    "dependency": "اعتماديات",
+    "limitation": "قيود معروفة",
+    "followup": "أعمال لاحقة",
+    "info": "ملاحظة",
+}
+WEEKDAYS = ("الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد")
+MONTHS = (
+    "كانون الثاني", "شباط", "آذار", "نيسان", "أيار", "حزيران",
+    "تموز", "آب", "أيلول", "تشرين الأول", "تشرين الثاني", "كانون الأول",
+)
+
+CHROME_CANDIDATES = (
+    "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
+    "microsoft-edge", "microsoft-edge-stable",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+)
+
+ARABIC_FONT = re.compile(r"arab|kufi|naskh|geeza|amiri|cairo|tajawal|vazir|nazanin", re.I)
+ARABIC_CHAR = re.compile(r"[؀-ۿﭐ-﷿ﹰ-﻿]")
+
+# The heading `verify` looks for to decide which side of the page text starts on. Every
+# report has this section, and in an RTL layout its first word sits at the right margin.
+RTL_PROBE = "الملخص"
+
+
+class UsageError(Exception):
+    """The invocation or its input is wrong: exit 2."""
+
+
+class Failure(Exception):
+    """The work could not be done: exit 1."""
+
+
+# --------------------------------------------------------------------------- collect
+
+
+def git(*args, cwd=None):
+    proc = subprocess.run(
+        ["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+        errors="replace",
+    )
+    if proc.returncode != 0:
+        raise UsageError("git %s: %s" % (" ".join(args), proc.stderr.strip()))
+    return proc.stdout
+
+
+def day_bounds(day):
+    """Local midnight to the next local midnight, as epoch seconds.
+
+    mktime with isdst=-1 resolves each midnight in the local zone on its own date, so a
+    day that crosses a daylight-saving change is 23 or 25 hours long, as it really is.
+    """
+    start = time.mktime((day.year, day.month, day.day, 0, 0, 0, 0, 0, -1))
+    after = day + dt.timedelta(days=1)
+    end = time.mktime((after.year, after.month, after.day, 0, 0, 0, 0, 0, -1))
+    return int(start), int(end)
+
+
+def is_noise(path):
+    parts = path.split("/")
+    name = parts[-1]
+    if name in NOISE_NAMES or name.endswith(NOISE_SUFFIXES):
+        return True
+    return any(part in NOISE_DIRS for part in parts[:-1])
+
+
+def commit_files(sha, cwd):
+    """Per-file status and line counts for one commit, renames resolved."""
+    base = ["diff-tree", "-r", "-M", "--root", "--no-commit-id", "-z"]
+    statuses = {}
+    tokens = git(*base, "--name-status", sha, cwd=cwd).split("\0")
+    i = 0
+    while i < len(tokens) and tokens[i]:
+        status = tokens[i]
+        if status[0] in "RC":
+            statuses[tokens[i + 2]] = (status[0], tokens[i + 1])
+            i += 3
+        else:
+            statuses[tokens[i + 1]] = (status[0], None)
+            i += 2
+
+    files = []
+    tokens = git(*base, "--numstat", sha, cwd=cwd).split("\0")
+    i = 0
+    while i < len(tokens) and tokens[i]:
+        added, deleted, path = tokens[i].split("\t", 2)
+        i += 1
+        if not path:  # a rename: the old and new paths follow as their own tokens
+            path = tokens[i + 1]
+            i += 2
+        status, old = statuses.get(path, ("M", None))
+        binary = added == "-"
+        files.append({
+            "path": path,
+            "status": status,
+            "old_path": old,
+            "added": 0 if binary else int(added),
+            "deleted": 0 if binary else int(deleted),
+            "binary": binary,
+            "noise": is_noise(path),
+        })
+    return files
+
+
+def area_of(path):
+    parts = path.split("/")
+    if len(parts) == 1:
+        return "(root)"
+    return "/".join(parts[:2]) if len(parts) > 2 else parts[0]
+
+
+def collect(args):
+    try:
+        day = dt.date.fromisoformat(args.date) if args.date else dt.date.today()
+    except ValueError:
+        raise UsageError("--date must be YYYY-MM-DD, got %r" % args.date)
+    root = git("rev-parse", "--show-toplevel").strip()
+    start, end = day_bounds(day)
+
+    # Committer time is never earlier than author time, so filtering on it with --since
+    # is a safe superset; the exact cut is made on author time below.
+    refs = ["HEAD"] if args.head_only else ["--branches", "HEAD"]
+    fmt = "%x1e" + "%x1f".join(("%H", "%h", "%an", "%ae", "%at", "%P", "%s", "%b"))
+    out = git("log", *refs, "--since=@%d" % start, "--format=" + fmt, cwd=root)
+
+    commits, merges = [], 0
+    for record in out.split("\x1e")[1:]:
+        sha, short, name, email, at, parents, subject, body = record.split("\x1f")
+        if not start <= int(at) < end:
+            continue
+        if len(parents.split()) > 1:
+            merges += 1
+            continue
+        files = commit_files(sha, root)
+        real = [f for f in files if not f["noise"]]
+        commits.append({
+            "hash": sha,
+            "short": short,
+            "author": name,
+            "email": email,
+            "time": dt.datetime.fromtimestamp(int(at)).astimezone().isoformat(),
+            "subject": subject,
+            "body": body.strip(),
+            "files": files,
+            "added": sum(f["added"] for f in real),
+            "deleted": sum(f["deleted"] for f in real),
+        })
+    commits.sort(key=lambda c: c["time"])
+
+    paths = {}
+    for commit in commits:
+        for f in commit["files"]:
+            paths.setdefault(f["path"], f["noise"])
+    areas = {}
+    for path, noise in paths.items():
+        if not noise:
+            areas.setdefault(area_of(path), []).append(path)
+
+    porcelain = git("status", "--porcelain", cwd=root).splitlines()
+    result = {
+        "project": Path(root).name,
+        "repository": root,
+        "branch": git("rev-parse", "--abbrev-ref", "HEAD", cwd=root).strip(),
+        "date": day.isoformat(),
+        "timezone": time.strftime("%Z") or dt.datetime.now().astimezone().strftime("%z"),
+        "utc_offset": dt.datetime.now().astimezone().strftime("%z"),
+        "scope": "HEAD" if args.head_only else "all local branches",
+        "commit_count": len(commits),
+        "merge_commits_skipped": merges,
+        "commits": commits,
+        "areas": {k: sorted(v) for k, v in sorted(areas.items())},
+        "noise_files": sorted(p for p, noise in paths.items() if noise),
+        "uncommitted": {
+            "tracked": sum(1 for line in porcelain if not line.startswith("??")),
+            "untracked": sum(1 for line in porcelain if line.startswith("??")),
+        },
+    }
+    json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
+    sys.stdout.write("\n")
+    if not commits:
+        print("no commits on %s" % day.isoformat(), file=sys.stderr)
+
+
+# --------------------------------------------------------------------------- render
+
+
+def inline(text):
+    """Escape, then give `code` its own left-to-right span and **text** its weight.
+
+    Identifiers inside Arabic prose are the one place the bidi algorithm guesses wrong on
+    its own - a path like `hooks/guard.py` would otherwise have its punctuation flipped to
+    the wrong end. Isolating each one fixes it without touching the surrounding flow.
+    """
+    out = []
+    for i, part in enumerate(re.split(r"`([^`]+)`", str(text))):
+        part = html.escape(part)
+        if i % 2:
+            out.append('<code dir="ltr">%s</code>' % part)
+        else:
+            out.append(re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", part))
+    return "".join(out)
+
+
+def paragraphs(text):
+    return "".join("<p>%s</p>" % inline(p) for p in str(text).split("\n\n") if p.strip())
+
+
+def arabic_date(day):
+    return "%s %d %s %d" % (WEEKDAYS[day.weekday()], day.day, MONTHS[day.month - 1], day.year)
+
+
+def numbered(sections):
+    """Number the sections as they appear. Optional ones may be absent, and a report
+    whose headings jump from 2 to 4 reads as if something was cut."""
+    return "".join(
+        '<section><h2><span class="num">%s</span>%s</h2>%s</section>'
+        % ("١٢٣٤٥٦٧٨٩"[i], html.escape(title), body)
+        for i, (title, body) in enumerate(sections)
+    )
+
+
+def build_html(content, facts, generated):
+    day = dt.date.fromisoformat(facts["date"])
+    commits = facts["commits"]
+    by_hash = {}
+    for entry in content.get("changelog", []):
+        by_hash[resolve(entry.get("hash", ""), commits)["hash"]] = entry.get("explanation", "")
+
+    touched = {f["path"] for c in commits for f in c["files"] if not f["noise"]}
+    authors = sorted({c["author"] for c in commits})
+    stats = [
+        ("الإيداعات", len(commits)),
+        ("الملفات المعدّلة", len(touched)),
+        ("أسطر مضافة", "+%d" % sum(c["added"] for c in commits)),
+        ("أسطر محذوفة", "−%d" % sum(c["deleted"] for c in commits)),
+    ]
+    stat_cards = "".join(
+        '<div class="stat"><div class="stat-value" dir="ltr">%s</div>'
+        '<div class="stat-label">%s</div></div>' % (html.escape(str(v)), html.escape(k))
+        for k, v in stats
+    )
+
+    project = content.get("project") or facts["project"]
+    sections = []
+
+    sections.append(("الملخص التنفيذي", '<div class="lead">%s</div>'
+                            % paragraphs(content["summary"])))
+
+    cards = []
+    for item in content.get("accomplishments", []):
+        kind = item.get("kind", "improvement")
+        cards.append(
+            '<div class="card kind-%s"><div class="card-head"><span class="badge">%s</span>'
+            "<h3>%s</h3></div>%s</div>"
+            % (html.escape(kind), html.escape(KIND_LABELS.get(kind, kind)),
+               inline(item["title"]), paragraphs(item.get("description", "")))
+        )
+    sections.append(("الأعمال المنجزة", '<div class="cards">%s</div>'
+                            % "".join(cards)))
+
+    changes = "".join(
+        '<li><h3>%s</h3>%s</li>' % (inline(c["title"]), paragraphs(c.get("description", "")))
+        for c in content.get("technical_changes", [])
+    )
+    if changes:
+        sections.append(("التغييرات التقنية", '<ol class="changes">%s</ol>'
+                                % changes))
+
+    rows = []
+    for comp in content.get("components", []):
+        chips = "".join('<code dir="ltr">%s</code>' % html.escape(f)
+                        for f in comp.get("files", []))
+        rows.append(
+            "<tr><td class='comp-name'>%s</td><td>%s</td><td class='files'>%s</td></tr>"
+            % (inline(comp["name"]), inline(comp.get("description", "")), chips)
+        )
+    if rows:
+        noise = facts.get("noise_files", [])
+        foot = ""
+        if noise:
+            foot = ('<p class="muted">استُبعدت من هذا الجدول ملفات مولَّدة أو ملفات قفل '
+                    'الاعتماديات (%d ملف) لأنها لا تمثّل عملاً مباشراً.</p>' % len(noise))
+        sections.append(("الملفات والمكونات المتأثرة",
+            "<table class='components'><thead><tr><th>المكوّن</th><th>ما الذي تغيّر</th>"
+            "<th>الملفات</th></tr></thead><tbody>%s</tbody></table>%s" % ("".join(rows), foot),
+        ))
+
+    log_rows = []
+    for c in commits:
+        stamp = dt.datetime.fromisoformat(c["time"]).strftime("%H:%M")
+        log_rows.append(
+            "<tr><td><code dir='ltr' class='hash'>%s</code><div class='time' dir='ltr'>%s</div>"
+            "</td><td><div class='subject' dir='ltr'>%s</div>%s</td>"
+            "<td class='delta' dir='ltr'><span class='plus'>+%d</span> "
+            "<span class='minus'>−%d</span></td></tr>"
+            % (c["short"], stamp, html.escape(c["subject"]),
+               '<div class="explain">%s</div>' % inline(by_hash[c["hash"]])
+               if by_hash.get(c["hash"]) else "",
+               c["added"], c["deleted"])
+        )
+    sections.append(("سجل التغييرات",
+        "<table class='log'><thead><tr><th>الإيداع</th><th>الرسالة والشرح</th>"
+        "<th>الأسطر</th></tr></thead><tbody>%s</tbody></table>" % "".join(log_rows),
+    ))
+
+    notes = "".join(
+        '<div class="note note-%s"><span class="note-tag">%s</span><div>%s</div></div>'
+        % (html.escape(n.get("type", "info")),
+           html.escape(NOTE_LABELS.get(n.get("type", "info"), n.get("type", ""))),
+           inline(n["text"]))
+        for n in content.get("notes", [])
+    )
+    if notes:
+        sections.append(("ملاحظات", notes))
+
+    meta = [
+        ("التاريخ", arabic_date(day)),
+        ("وقت الإنشاء", "%s (UTC%s)" % (generated.strftime("%H:%M"),
+                                         generated.strftime("%z")[:3] + ":" +
+                                         generated.strftime("%z")[3:])),
+        ("الفرع", facts["branch"]),
+        ("المساهمون", "، ".join(authors)),
+    ]
+    meta_html = "".join(
+        '<div class="meta-item"><span>%s</span><strong><bdi>%s</bdi></strong></div>'
+        % (html.escape(k), html.escape(v)) for k, v in meta
+    )
+
+    return TEMPLATE.format(
+        title=html.escape("تقرير التطوير — %s — %s" % (project, facts["date"])),
+        css=CSS,
+        project=html.escape(project),
+        meta=meta_html,
+        stats=stat_cards,
+        sections=numbered(sections),
+        footer=html.escape("أُعدّ هذا التقرير من سجل Git للمستودع %s، ويغطّي الإيداعات "
+                           "المسجّلة بتاريخ %s فقط." % (project, facts["date"])),
+    )
+
+
+def resolve(ref, commits):
+    """The collected commit a content entry refers to, by full or abbreviated hash."""
+    ref = str(ref).strip().lower()
+    matches = [c for c in commits if ref and c["hash"].startswith(ref)]
+    if len(matches) != 1:
+        raise UsageError(
+            "changelog hash %r matches %d of the collected commits; cite only commits "
+            "that `collect` returned" % (ref, len(matches))
+        )
+    return matches[0]
+
+
+def check_content(content, facts):
+    if not facts.get("commits"):
+        raise UsageError("the commits file has no commits; there is nothing to report")
+    for key in ("summary", "accomplishments"):
+        if not content.get(key):
+            raise UsageError("content is missing %r" % key)
+    for item in content["accomplishments"]:
+        if "title" not in item:
+            raise UsageError("every accomplishment needs a title")
+    for entry in content.get("changelog", []):
+        resolve(entry.get("hash", ""), facts["commits"])
+    cited = {resolve(e["hash"], facts["commits"])["hash"]
+             for e in content.get("changelog", [])}
+    return [c["short"] for c in facts["commits"] if c["hash"] not in cited]
+
+
+def find_chrome():
+    override = os.environ.get("CHROME")
+    for name in ((override,) if override else ()) + CHROME_CANDIDATES:
+        path = shutil.which(name) or (name if os.path.isfile(name) else None)
+        if path:
+            return path
+    raise Failure("no Chrome or Chromium found; install one or set CHROME to its path")
+
+
+def print_pdf(html_text, out):
+    chrome = find_chrome()
+    with tempfile.TemporaryDirectory(prefix="dev-report-") as tmp:
+        page = Path(tmp) / "report.html"
+        page.write_text(html_text, encoding="utf-8")
+        partial = Path(tmp) / "report.pdf"
+        # A throwaway profile, so an open browser window never swallows the job.
+        cmd = [
+            chrome, "--headless=new", "--disable-gpu", "--no-first-run",
+            "--no-default-browser-check", "--user-data-dir=%s" % (Path(tmp) / "profile"),
+            "--no-pdf-header-footer", "--print-to-pdf=%s" % partial, page.as_uri(),
+        ]
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            cmd.insert(1, "--no-sandbox")
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        except subprocess.TimeoutExpired:
+            raise Failure("Chrome did not finish printing within 180s")
+        if not partial.is_file() or partial.stat().st_size == 0:
+            raise Failure("Chrome produced no PDF:\n%s" % proc.stderr.strip()[-2000:])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(partial), str(out))
+
+
+def render(args):
+    try:
+        content = json.loads(Path(args.content).read_text(encoding="utf-8"))
+        facts = json.loads(Path(args.commits).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise UsageError(str(exc))
+    uncited = check_content(content, facts)
+
+    out = Path(args.out) if args.out else (
+        Path(facts["repository"]) / "reports"
+        / ("%s-development-report-ar.pdf" % facts["date"])
+    )
+    out = out.resolve()
+    html_text = build_html(content, facts, dt.datetime.now().astimezone())
+    if args.html:
+        Path(args.html).write_text(html_text, encoding="utf-8")
+    print_pdf(html_text, out)
+
+    report = verify_pdf(out, args.previews)
+    report["uncited_commits"] = uncited
+    json.dump(report, sys.stdout, ensure_ascii=False, indent=2)
+    sys.stdout.write("\n")
+    if not report["ok"]:
+        raise Failure("the PDF was written but failed verification: %s"
+                      % "; ".join(report["problems"]))
+
+
+# --------------------------------------------------------------------------- verify
+
+
+def tool(name, *args):
+    if not shutil.which(name):
+        raise Failure("%s not found; install poppler-utils to verify the PDF" % name)
+    proc = subprocess.run([name, *args], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
+    if proc.returncode != 0:
+        raise Failure("%s failed: %s" % (name, proc.stderr.strip()))
+    return proc.stdout
+
+
+def verify_pdf(path, previews=None):
+    path = Path(path)
+    problems = []
+    if not path.is_file() or path.read_bytes()[:5] != b"%PDF-":
+        return {"ok": False, "path": str(path), "problems": ["not a PDF file"]}
+
+    info = tool("pdfinfo", str(path))
+    pages = int(re.search(r"^Pages:\s+(\d+)", info, re.M).group(1))
+    width = float(re.search(r"^Page size:\s+([\d.]+)", info, re.M).group(1))
+
+    fonts = [line.split()[0] for line in tool("pdffonts", str(path)).splitlines()[2:]
+             if line.strip()]
+    arabic_fonts = sorted({f.split("+", 1)[-1] for f in fonts if ARABIC_FONT.search(f)})
+    if not arabic_fonts:
+        problems.append("no Arabic font is embedded; the Arabic text fell back to boxes "
+                        "or a font without Arabic glyphs")
+
+    text = tool("pdftotext", "-enc", "UTF-8", str(path), "-")
+    if len(ARABIC_CHAR.findall(text)) < 50:
+        problems.append("almost no Arabic text can be extracted from the PDF")
+    if "الملخص التنفيذي" not in text:
+        problems.append("the heading 'الملخص التنفيذي' is not extractable in logical "
+                        "order, so the Arabic may not be shaped correctly")
+
+    # Where the summary heading's first word sits across the page. In an RTL layout it
+    # hugs the right margin; in a layout that fell back to LTR it hugs the left one.
+    rtl = None
+    bbox = tool("pdftotext", "-f", "1", "-l", "1", "-bbox", str(path), "-")
+    for match in re.finditer(r'<word xMin="([\d.]+)" yMin="[\d.]+" xMax="([\d.]+)"'
+                             r'[^>]*>([^<]+)</word>', bbox):
+        # -bbox reports each Arabic word in visual order, so it may come back reversed.
+        if RTL_PROBE in (html.unescape(match.group(3)), html.unescape(match.group(3))[::-1]):
+            rtl = float(match.group(2)) / width
+            break
+    if rtl is None:
+        problems.append("could not locate the summary heading on page 1 to check RTL")
+    elif rtl < 0.75:
+        problems.append("the summary heading ends at %.0f%% of the page width; an RTL "
+                        "heading ends near the right margin" % (rtl * 100))
+
+    images = []
+    if previews:
+        Path(previews).mkdir(parents=True, exist_ok=True)
+        prefix = str(Path(previews) / "page")
+        tool("pdftoppm", "-png", "-r", "80", str(path), prefix)
+        images = sorted(str(p) for p in Path(previews).glob("page*.png"))
+
+    return {
+        "ok": not problems,
+        "path": str(path),
+        "pages": pages,
+        "arabic_fonts": arabic_fonts,
+        "rtl_heading_right_edge": None if rtl is None else round(rtl, 3),
+        "previews": images,
+        "problems": problems,
+    }
+
+
+def verify(args):
+    report = verify_pdf(args.path, args.previews)
+    json.dump(report, sys.stdout, ensure_ascii=False, indent=2)
+    sys.stdout.write("\n")
+    if not report["ok"]:
+        raise Failure("; ".join(report["problems"]))
+
+
+# --------------------------------------------------------------------------- page
+
+
+TEMPLATE = """<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<title>{title}</title>
+<style>{css}</style>
+</head>
+<body>
+<header class="cover">
+  <div class="eyebrow">تقرير التطوير اليومي</div>
+  <h1><bdi>{project}</bdi></h1>
+  <div class="meta">{meta}</div>
+</header>
+<div class="stats">{stats}</div>
+<main>{sections}</main>
+<footer>{footer}</footer>
+</body>
+</html>
+"""
+
+CSS = """
+@page { size: A4; margin: 16mm 15mm 18mm; }
+:root {
+  --ink: #0f172a; --body: #334155; --muted: #64748b; --line: #e2e8f0;
+  --surface: #f8fafc; --primary: #1e3a8a; --primary-2: #1d4ed8; --accent: #0f766e;
+  --plus: #047857; --minus: #b91c1c;
+}
+* { box-sizing: border-box; }
+html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+body {
+  margin: 0; color: var(--body); background: #fff; font-size: 10.5pt; line-height: 1.85;
+  font-family: "Noto Sans Arabic", "Noto Sans Arabic UI", "SF Arabic", "Geeza Pro",
+    "Noto Sans", "DejaVu Sans", sans-serif;
+}
+h1, h2, h3, .eyebrow, .stat-value, .badge, .note-tag, th {
+  font-family: "Noto Kufi Arabic", "Noto Sans Arabic", "Geeza Pro", sans-serif;
+}
+code {
+  font-family: "JetBrains Mono", "DejaVu Sans Mono", "Noto Sans Mono", monospace;
+  font-size: 0.86em; background: #eef2ff; color: #3730a3; padding: 0.05em 0.4em;
+  border-radius: 4px; unicode-bidi: isolate; white-space: nowrap;
+}
+p { margin: 0 0 0.55em; }
+p:last-child { margin-bottom: 0; }
+
+.cover {
+  background: linear-gradient(135deg, var(--primary) 0%, var(--primary-2) 60%, var(--accent) 100%);
+  color: #fff; border-radius: 14px; padding: 22px 26px 20px;
+}
+.eyebrow { font-size: 10pt; letter-spacing: 0; opacity: 0.85; font-weight: 500; }
+.cover h1 { margin: 2px 0 14px; font-size: 25pt; line-height: 1.35; font-weight: 800; color: #fff; }
+.meta { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;
+  border-top: 1px solid rgba(255,255,255,0.25); padding-top: 12px; }
+.meta-item span { display: block; font-size: 8pt; opacity: 0.75; }
+.meta-item strong { display: block; font-size: 9.5pt; font-weight: 600; line-height: 1.5; }
+
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 14px 0 6px; }
+.stat { background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+  padding: 10px 12px; text-align: center; }
+.stat-value { font-size: 17pt; font-weight: 700; color: var(--primary); line-height: 1.3; }
+.stat-label { font-size: 8.5pt; color: var(--muted); }
+
+section { margin-top: 20px; }
+h2 { display: flex; align-items: center; gap: 10px; margin: 0 0 10px; font-size: 14pt;
+  color: var(--ink); font-weight: 700; border-bottom: 2px solid var(--line); padding-bottom: 6px;
+  break-after: avoid; }
+h2 .num { display: inline-flex; align-items: center; justify-content: center; width: 26px;
+  height: 26px; border-radius: 7px; background: var(--primary); color: #fff; font-size: 11pt; }
+h3 { margin: 0 0 4px; font-size: 11pt; color: var(--ink); font-weight: 600; line-height: 1.6; }
+
+.lead { background: var(--surface); border-right: 4px solid var(--accent); border-radius: 8px;
+  padding: 12px 16px; font-size: 11pt; color: var(--ink); }
+
+.cards { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.card { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px;
+  break-inside: avoid; border-top: 3px solid var(--kind, var(--primary)); }
+.card-head { margin-bottom: 4px; }
+.badge { display: inline-block; font-size: 7.5pt; font-weight: 600; padding: 1px 9px;
+  border-radius: 99px; background: var(--kind-bg, #e0e7ff); color: var(--kind, var(--primary));
+  margin-bottom: 4px; }
+.kind-feature { --kind: #1d4ed8; --kind-bg: #dbeafe; }
+.kind-fix { --kind: #b91c1c; --kind-bg: #fee2e2; }
+.kind-improvement, .kind-perf { --kind: #0f766e; --kind-bg: #ccfbf1; }
+.kind-refactor { --kind: #7c3aed; --kind-bg: #ede9fe; }
+.kind-security { --kind: #9a3412; --kind-bg: #ffedd5; }
+.kind-docs, .kind-test, .kind-config, .kind-chore { --kind: #475569; --kind-bg: #e2e8f0; }
+
+.changes { list-style: none; margin: 0; padding: 0; counter-reset: c; }
+.changes li { position: relative; padding: 8px 34px 8px 0; border-bottom: 1px dashed var(--line);
+  break-inside: avoid; }
+.changes li:last-child { border-bottom: 0; }
+.changes li::before { counter-increment: c; content: counter(c); position: absolute; right: 0;
+  top: 10px; width: 22px; height: 22px; border-radius: 50%; background: #e0e7ff;
+  color: var(--primary); font-size: 9pt; font-weight: 700; text-align: center; line-height: 22px; }
+
+/* No border on the table itself: a table split across pages would carry it down to the
+   bottom of the first page as an empty box. */
+table { width: 100%; border-collapse: collapse; font-size: 9.5pt; }
+th { background: var(--surface); color: var(--ink); font-weight: 600; text-align: right;
+  padding: 7px 10px; border-top: 2px solid var(--primary); border-bottom: 1px solid var(--line);
+  font-size: 9pt; }
+td { padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+tr { break-inside: avoid; }
+.comp-name { font-weight: 600; color: var(--ink); width: 19%; }
+.files { width: 41%; }
+.files code { display: inline-block; margin: 0 0 3px 3px; font-size: 7.5pt;
+  white-space: normal; overflow-wrap: anywhere; text-align: left; }
+.log td:first-child { width: 15%; }
+.hash { font-weight: 600; }
+.time { font-size: 8pt; color: var(--muted); text-align: right; }
+.subject { font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace; font-size: 8.5pt;
+  color: var(--ink); text-align: left; margin-bottom: 3px; }
+.explain { color: var(--body); }
+.delta { width: 12%; white-space: nowrap; font-family: "DejaVu Sans Mono", monospace;
+  font-size: 8.5pt; text-align: left; }
+.plus { color: var(--plus); } .minus { color: var(--minus); }
+.muted { color: var(--muted); font-size: 8.5pt; margin-top: 6px; }
+
+.note { display: flex; gap: 12px; align-items: flex-start; border: 1px solid var(--line);
+  border-right: 4px solid var(--tone, var(--muted)); border-radius: 8px; padding: 9px 12px;
+  margin-bottom: 8px; background: var(--tone-bg, var(--surface)); break-inside: avoid; }
+.note-tag { flex: none; font-size: 8pt; font-weight: 600; color: var(--tone, var(--muted));
+  min-width: 70px; padding-top: 2px; }
+.note-breaking { --tone: #b91c1c; --tone-bg: #fef2f2; }
+.note-migration, .note-dependency { --tone: #b45309; --tone-bg: #fffbeb; }
+.note-config { --tone: #1d4ed8; --tone-bg: #eff6ff; }
+.note-limitation { --tone: #7c3aed; --tone-bg: #f5f3ff; }
+.note-followup { --tone: #0f766e; --tone-bg: #f0fdfa; }
+
+footer { margin-top: 24px; padding-top: 10px; border-top: 1px solid var(--line);
+  color: var(--muted); font-size: 8.5pt; text-align: center; }
+"""
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("collect", help="print one day's commits as JSON")
+    p.add_argument("--date", help="YYYY-MM-DD in local time (default: today)")
+    p.add_argument("--head-only", action="store_true",
+                   help="only commits reachable from HEAD, not every local branch")
+    p.set_defaults(func=collect)
+
+    p = sub.add_parser("render", help="lay out the Arabic content as a PDF")
+    p.add_argument("content", help="JSON file with the Arabic report content")
+    p.add_argument("--commits", required=True, help="the JSON `collect` printed")
+    p.add_argument("--out", help="PDF path (default: <repo>/reports/<date>-...-ar.pdf)")
+    p.add_argument("--html", help="also write the intermediate HTML here")
+    p.add_argument("--previews", help="write a PNG of each page into this directory")
+    p.set_defaults(func=render)
+
+    p = sub.add_parser("verify", help="check an existing report PDF")
+    p.add_argument("path")
+    p.add_argument("--previews", help="write a PNG of each page into this directory")
+    p.set_defaults(func=verify)
+
+    args = parser.parse_args()
+    try:
+        args.func(args)
+    except UsageError as exc:
+        print("dev-report: %s" % exc, file=sys.stderr)
+        return 2
+    except Failure as exc:
+        print("dev-report: %s" % exc, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
