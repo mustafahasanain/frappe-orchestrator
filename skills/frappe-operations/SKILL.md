@@ -147,15 +147,35 @@ without asking again.
 
 Never `--site all`, and never a loop over sites.
 
-## The live-site boundary is not restated here
+## Running without a prompt
 
-Whether reaching a site is allowed at all is decided in one place: `### Live site access`
-in the orchestration skill, enforced by `hooks/guard.py`. This skill decides only **which
-operations a change requires**, which is a different question.
+Once implementation is done, run the operations the plan line says yes to — straight
+away, without asking the user and without stopping to propose them. The hook lets these
+through with no permission prompt:
 
-So: a site-dependent bench command asks for confirmation when it runs. That is the
-boundary working, not an obstacle to route around, and this skill's "may run
-automatically" means "is a correct operation to propose", never "may bypass that ask".
+```text
+bench build [--app <app>]          no site involved
+bench --site <site> migrate        site named on the command line
+bench --site <site> clear-cache    site named on the command line
+```
+
+Running from the bench directory is fine: `cd <bench> && bench --site <site> migrate 2>&1
+| tail -40` still goes through. Anything else chained onto the command sends it back to
+the normal permission check.
+
+What still asks, on purpose:
+
+- the same commands with no `--site`, or with `--site all` — bench would pick the site
+  itself, or hit every site;
+- every other site command — `console`, `execute`, `install-app`, `mariadb` and the rest.
+
+The prompt is gone, so the judgment is yours. Use only the site resolved under
+`## Site resolution`, and still stop and ask before a migration that may be destructive
+(see `## Confirmation and refusal`) — the hook cannot tell a routine migration from one
+that drops a column.
+
+Whether reaching a site is allowed at all is decided in `### Live site access` in the
+orchestration skill, enforced by `hooks/guard.py`.
 
 ## Operations are never delegated
 

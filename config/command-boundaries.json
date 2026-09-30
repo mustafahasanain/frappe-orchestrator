@@ -3,7 +3,7 @@
   "purpose": "The mechanical command boundaries, in one place. hooks/guard.py enforces them for commands Claude runs through the Bash tool; scripts/delegate enforces them inside a delegated OpenCode run, where the hook cannot see anything. Both read this file and each translates it into its own matching form - token parsing in the hook, glob patterns in the dispatcher's permission policy. Nothing here is written in either engine's syntax, and neither engine keeps its own copy of a rule.",
   "how_to_change": "Add or edit a rule here, not in a consumer. tests/test_parser.py fails by rule name when a rule is not enforced by both consumers that declare a decision for it, when its documented_in heading is missing from the skill it names, or when an example is not caught. Rule order is precedence: the first match wins.",
   "decisions": {
-    "hook": "What hooks/guard.py decides for a command Claude runs. null means this rule is not the hook's to enforce.",
+    "hook": "What hooks/guard.py decides for a command Claude runs: ask, deny, or allow (runs with no permission prompt). null means this rule is not the hook's to enforce.",
     "delegated": "What scripts/delegate's permission policy decides inside a delegated run. null means the rule cannot be expressed there, or does not apply.",
     "not_enforced_because": "Required whenever hook or delegated is null. A rule that no longer applies to a consumer has to say why, in the data, where the next reader sees it. Without this field a decision could be quietly dropped to null and nothing would notice - which is the shape of the divergence this file exists to prevent, not a hypothetical."
   },
@@ -492,6 +492,85 @@
       ]
     },
     {
+      "name": "asset-build",
+      "intent": "Rebuilding an app's frontend assets touches no site and no database, and it is the step that makes a frontend change visible at all. Once a task is finished it runs without a prompt, so the work is ready to look at when the report arrives.",
+      "match": {
+        "kind": "program_subcommand",
+        "program": "bench",
+        "subcommands": [
+          "build"
+        ]
+      },
+      "hook": "allow",
+      "delegated": null,
+      "documented_in": [
+        {
+          "file": "skills/frappe-operations/SKILL.md",
+          "heading": "## Running without a prompt"
+        }
+      ],
+      "examples": [
+        "bench build",
+        "bench build --app erpnext"
+      ],
+      "not_examples": [
+        "bench start",
+        "bench migrate",
+        "npm run build"
+      ],
+      "not_enforced_because": {
+        "delegated": "Frappe operations are never delegated - the frappe-operations skill runs every one itself - and a build reaches no site, so there is nothing for a delegated run to be kept away from here."
+      }
+    },
+    {
+      "name": "dev-site-routine-operation",
+      "intent": "Applying a finished change's schema and dropping its cached metadata are the routine end of a task on the development site, so `bench --site <site> migrate` and `clear-cache` run without a prompt once the site is named. Naming it is what the carve-out requires: without --site bench picks a site from configuration, and that form still asks under site-unnamed. `--site all` still asks too. Choosing the site - one OPERATIONS.md or the user identified as a development site - and stopping before a destructive migration are the skill's job, not this rule's.",
+      "match": {
+        "kind": "program_subcommand",
+        "program": "bench",
+        "subcommands": [
+          "migrate",
+          "clear-cache"
+        ],
+        "any_argument": [
+          "--site",
+          "-s"
+        ],
+        "unless_flags": [
+          "all"
+        ]
+      },
+      "hook": "allow",
+      "delegated": null,
+      "documented_in": [
+        {
+          "file": "skills/frappe-operations/SKILL.md",
+          "heading": "## Running without a prompt"
+        },
+        {
+          "file": "skills/orchestration/SKILL.md",
+          "heading": "### Live site access"
+        }
+      ],
+      "examples": [
+        "bench --site dev.local migrate",
+        "bench -s dev.local migrate",
+        "bench --site dev.local clear-cache",
+        "bench --site dev.local migrate --skip-failing"
+      ],
+      "not_examples": [
+        "bench migrate",
+        "bench clear-cache",
+        "bench --site all migrate",
+        "bench -s all clear-cache",
+        "bench --site dev.local console",
+        "bench --site dev.local install-app erpnext"
+      ],
+      "not_enforced_because": {
+        "delegated": "A delegated run never gets this carve-out: site-named and site-unnamed deny every bench site command inside one, which is what should happen, because operations are never delegated."
+      }
+    },
+    {
       "name": "site-named",
       "intent": "A bench command carrying --site runs against that live site's database or a running Frappe instance. Confirm the single target site first.",
       "match": {
@@ -514,7 +593,7 @@
         }
       ],
       "examples": [
-        "bench --site dev.local migrate",
+        "bench --site dev.local console",
         "bench --site all clear-cache",
         "bench --site dev.local list-apps"
       ],
@@ -626,7 +705,7 @@
         "bench install-app erpnext",
         "bench console",
         "bench list-apps",
-        "bench -s dev.local migrate"
+        "bench -s dev.local console"
       ],
       "not_examples": [
         "bench build",

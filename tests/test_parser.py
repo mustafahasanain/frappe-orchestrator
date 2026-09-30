@@ -1262,8 +1262,10 @@ def run_hook(stdin_text, guard=None):
 def outcome(proc):
     """(decision, reason) for a finished hook run.
 
-    "allow" is the absence of a decision, which is how this hook permits a command - so a
-    run that produced no output is an allow, and must be read as one. Anything that is not
+    A run that produced no output is read as "allow" too: no decision leaves the command
+    to Claude Code's own permission check, which is how this hook passes most commands
+    through. An explicit allow, which skips that check, comes back as "allow" with its
+    reason. Anything that is not
     a clean exit with either no output or exactly one well-formed decision is reported as
     a fault, because that is what Claude Code would be left to interpret: a non-zero exit
     is a non-blocking error there, after which the command runs.
@@ -1415,6 +1417,19 @@ PRECEDENCE = [
     ("newline is a separator, so a heredoc body is seen",
      "bash <<'EOF'\ngit add -A\nEOF", "deny", "blanket-staging"),
     ("nothing matches", "ls -la; npm test", "allow", None),
+    ("an allow alone", "bench --site dev.local migrate", "allow", "dev-site-routine-operation"),
+    ("ask outranks an earlier allow", "bench --site dev.local migrate && git push", "ask", "push"),
+    ("ask outranks a later allow", "git push; bench build", "ask", "push"),
+    ("deny outranks an allow", "bench build && git add -A", "deny", "blanket-staging"),
+    ("two allows: the first segment wins",
+     "bench build --app erpnext && bench --site dev.local migrate", "allow", "asset-build"),
+    ("cd and an output filter keep an allow",
+     "cd ~/frappe-bench && bench --site dev.local migrate 2>&1 | tail -20",
+     "allow", "dev-site-routine-operation"),
+    # No decision, rather than allow: the uncovered segment goes to Claude Code's own
+    # permission check, and an allow must never carry it along.
+    ("an uncovered segment cancels an allow", "bench build && curl http://x", "allow", None),
+    ("--site all is not the carve-out", "bench --site all migrate", "ask", "site-named"),
 ]
 
 
@@ -1422,11 +1437,17 @@ def check_decision_precedence():
     """deny > ask > allow, across the segments of one command."""
     problems = []
     for name, command, want, rule in PRECEDENCE:
-        got, reason = outcome(run_hook(payload(command)))
+        proc = run_hook(payload(command))
+        got, reason = outcome(proc)
         if got != want:
             problems.append("%s: %r decided %r, wanted %r" % (name, command, got, want))
             continue
         if rule is None:
+            if proc.stdout.strip():
+                problems.append(
+                    "%s: %r should leave the decision to Claude Code, but the hook "
+                    "decided %r" % (name, command, got)
+                )
             continue
         expected = g.REASONS.get(rule) or ""
         if reason != expected:
@@ -1509,7 +1530,7 @@ BOUNDARY_FAULTS = [
     ("unless_flags holds a number",
      lambda data: _match(data, "bare-agent-run", unless_flags=["--help", 5])),
     # --- a decision the hook cannot make ------------------------------------
-    ("hook decision is allow", lambda data: _rules(data, "push", hook="allow")),
+    ("hook decision is an unknown word", lambda data: _rules(data, "push", hook="maybe")),
     ("hook decision is a number", lambda data: _rules(data, "push", hook=5)),
     ("hook decision is an empty string", lambda data: _rules(data, "push", hook="")),
 ]
@@ -1522,6 +1543,7 @@ DEGRADED_EXPECTED = (
     ("git add .", "ask"),
     ("git reset --hard", "ask"),
     ("bench migrate", "ask"),
+    ("bench --site dev.local migrate", "ask"),
     ("mysql -u root", "ask"),
     ("rm -rf .", "ask"),
     ("find . -delete", "ask"),
@@ -1535,6 +1557,7 @@ INTACT_EXPECTED = (
     ("git add .", "deny"),
     ("git reset --hard", "ask"),
     ("bench migrate", "ask"),
+    ("bench --site dev.local migrate", "allow"),
     ("mysql -u root", "ask"),
     ("rm -rf .", "ask"),
     ("find . -delete", "ask"),

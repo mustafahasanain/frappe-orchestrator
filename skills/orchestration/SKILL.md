@@ -353,7 +353,8 @@ ${CLAUDE_PLUGIN_ROOT}/skills/frappe-operations/SKILL.md
 
 Read it before running any bench command. Four rules hold even when it is not read:
 
-1. The default is no operation. Run what this change requires, never the four by reflex.
+1. The default is no operation. Run what this change requires, never the four by reflex —
+   and run it yourself once implementation is done, without asking first.
 2. A site-dependent command names its site with `--site`, and that site is one
    `OPERATIONS.md` or the user identified as a development site. An unnamed site is not
    no site — bench resolves one from configuration.
@@ -541,7 +542,10 @@ project file. Never invoke it.
 
 **Allowed automatically:** file reads, repository inspection, Git diff inspection,
 analysis, delegation, local source-code changes, tests, local builds, local linting, local
-type checking, documentation updates, and review/fix loops within the attempt limit.
+type checking, documentation updates, review/fix loops within the attempt limit, and the
+bench operations a finished change requires — `bench build`, and `migrate` / `clear-cache`
+on the named development site (see `## Running without a prompt` in the frappe-operations
+skill).
 
 **Requires the user's approval of the proposed commit:** local Git staging and local Git
 commit.
@@ -564,7 +568,9 @@ any script or snippet that opens a Frappe connection (`frappe.init`, `frappe.con
 
 Such execution:
 
-- requires an explicit user request — never a step you chose to take on your own;
+- requires an explicit user request — never a step you chose to take on your own. The one
+  exception is `bench --site <site> migrate` and `clear-cache` on the resolved
+  development site, when the finished change requires them; those run without asking;
 - is limited to the single site the user named; if no site was named, ask;
 - is never fanned out across sites, and never repeated site by site to hunt for
   something.

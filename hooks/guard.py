@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """PreToolUse guard: deny blanket staging and bare agent runs, ask before pushes and
-live-site execution.
+live-site execution, and let the routine end-of-task bench operations run unprompted.
 
 Reads a PreToolUse payload on stdin. Prints a JSON permission decision when a rule
 matches, and prints nothing otherwise. A payload carrying no Bash command is allowed -
@@ -26,6 +26,14 @@ from pathlib import Path
 BOUNDARIES = Path(__file__).resolve().parent.parent / "config" / "command-boundaries.json"
 
 SEPARATORS = re.compile(r"&&|\|\||[;|&\n]")
+
+# `2>&1` and friends. The `&` in them is not a separator, and splitting on it leaves a
+# stray `1` segment that no rule covers - which is enough to cancel an allow.
+FD_DUPLICATION = re.compile(r"\d*>&\d*-?")
+
+# Segments that may sit beside an allowed operation without cancelling it: changing into
+# the bench directory, and reading the operation's output. None of them acts on anything.
+ALLOW_COMPANIONS = frozenset({"cd", "tail", "head", "grep"})
 
 # Options taking a separate argument, so the token after them is not the subcommand.
 # Matching mechanics, not rules: which token is the subcommand is a fact about each CLI's
@@ -129,6 +137,15 @@ REASONS = {
         "the byte-level operation really is what is wanted, the user should confirm the "
         "exact target path."
     ),
+    "asset-build": (
+        "Asset build: touches no site, so it runs without a prompt. Check the output for a "
+        "build failure before treating the assets as rebuilt."
+    ),
+    "dev-site-routine-operation": (
+        "Routine operation on a named site, so it runs without a prompt. The site must be "
+        "one docs/ai-context/OPERATIONS.md or the user identified as a development site, "
+        "and a migration that may drop or transform data still needs the user first."
+    ),
     "site-named": (
         "This runs against a live site database or a running Frappe instance. Confirm with "
         "the user which single site to target before continuing, and do not repeat it across "
@@ -202,9 +219,15 @@ MATCH_FIELDS = {
 # on the same terms as the required ones.
 OPTIONAL_LISTS = ("any_argument", "unless_flags")
 
-# What this hook can decide. `null` is a decision too - the data stating that a rule is
-# not the hook's to enforce - and is the only other value accepted.
-HOOK_DECISIONS = frozenset({"ask", "deny"})
+# What this hook can decide. `allow` is an explicit decision, not the absence of one: it
+# skips Claude Code's own permission prompt, where printing nothing leaves that prompt in
+# place. `null` is a decision too - the data stating that a rule is not the hook's to
+# enforce - and is the only other value accepted.
+HOOK_DECISIONS = frozenset({"ask", "deny", "allow"})
+
+# Strongest first. One command is one unit, so the strongest decision any segment earns
+# is the decision for all of it - an allowed migrate chained to a push still asks.
+DECISION_STRENGTH = ("deny", "ask", "allow")
 
 
 def _string_list(value):
@@ -225,7 +248,7 @@ def rule_fault(rule, index):
         return "rule %d has no name" % index
     decision = rule.get("hook")
     if decision is not None and decision not in HOOK_DECISIONS:
-        return "%s: hook decision %r is not ask, deny or null" % (name, decision)
+        return "%s: hook decision %r is not ask, deny, allow or null" % (name, decision)
     match = rule.get("match")
     if not isinstance(match, dict):
         return "%s: match is not an object" % name
@@ -495,14 +518,30 @@ def read_command():
 def decide(command):
     """(decision, reason) for a whole command, or None when no rule covers it.
 
-    A deny outranks an ask whichever segment each came from: the command is submitted as
-    one unit, so the strongest decision any part of it earns is the decision for all of
-    it. Among equals the first segment wins.
+    deny outranks ask outranks allow, whichever segment each came from: the command is
+    submitted as one unit, so the strongest decision any part of it earns is the decision
+    for all of it. Among equals the first segment wins.
+
+    An allow covers the whole command only when every other segment is either allowed too
+    or one of ALLOW_COMPANIONS. Anything else is left to Claude Code's own permission
+    check: an allow for `bench build` must not wave through whatever was chained after it.
     """
-    matches = [m for m in (check(segment) for segment in SEPARATORS.split(command)) if m]
-    if not matches:
+    segments = [s for s in SEPARATORS.split(FD_DUPLICATION.sub(" ", command)) if s.strip()]
+    matches = [check(segment) for segment in segments]
+    decided = [m for m in matches if m]
+    if not decided:
         return None
-    return next((m for m in matches if m[0] == "deny"), matches[0])
+    for decision in DECISION_STRENGTH:
+        strongest = next((m for m in decided if m[0] == decision), None)
+        if strongest is None:
+            continue
+        if decision == "allow" and any(
+            m is None and program(split_tokens(segment)) not in ALLOW_COMPANIONS
+            for m, segment in zip(matches, segments)
+        ):
+            return None
+        return strongest
+    return decided[0]
 
 
 def main():
