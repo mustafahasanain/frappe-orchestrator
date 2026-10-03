@@ -9,7 +9,7 @@ and live-site boundaries.
 | Component | Where |
 | :-- | :-- |
 | Skills | `skills/orchestration`, `skills/project-context`, `skills/frappe-operations`, `skills/development-report` |
-| Enforcement hook | `hooks/guard.py` (`PreToolUse` on `Bash`) |
+| Enforcement hook | `hooks/guard.py` (`PreToolUse` and `PostToolUse` on `Bash`) |
 | Delegation dispatcher | `scripts/delegate` |
 | Development report | `scripts/dev-report` (on request only) |
 | Boundaries and routing | `config/command-boundaries.json`, `config/model-routing.json` |
@@ -65,7 +65,7 @@ every repository with no `--plugin-dir` flag. Confirm:
 
 ```bash
 claude plugin list          # frappe-orchestrator@frappe-orchestrator — enabled
-claude plugin details frappe-orchestrator@frappe-orchestrator   # 4 skills, 1 PreToolUse hook
+claude plugin details frappe-orchestrator@frappe-orchestrator   # 4 skills; hooks: PreToolUse, PostToolUse
 ```
 
 A `directory` marketplace source is used **in place**. `CLAUDE_PLUGIN_ROOT` resolves to

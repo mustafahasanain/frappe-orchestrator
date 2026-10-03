@@ -810,8 +810,17 @@ def check_command_boundaries():
     else:
         subs = site["match"]["subcommands"]
         patterns = d.rule_patterns(site)
-        missed_hook = [s for s in subs
-                       if (g.match_rule("bench %s" % s) or {}).get("name") != "site-unnamed"]
+
+        # Caught by site-unnamed itself, or by a stronger rule ahead of it that asks or
+        # denies regardless of the site - destructive-site-operation. A site_access rule
+        # ahead of it would not do: the site can relax that one.
+        def caught(sub):
+            owner = g.match_rule("bench %s" % sub) or {}
+            return owner.get("name") == "site-unnamed" or (
+                owner.get("hook") in ("ask", "deny") and not owner.get("site_access")
+            )
+
+        missed_hook = [s for s in subs if not caught(s)]
         missed_deleg = [s for s in subs
                         if not any(fnmatch.fnmatch("bench %s" % s, p) for p in patterns)]
         if missed_hook:
@@ -1417,7 +1426,7 @@ PRECEDENCE = [
     ("newline is a separator, so a heredoc body is seen",
      "bash <<'EOF'\ngit add -A\nEOF", "deny", "blanket-staging"),
     ("nothing matches", "ls -la; npm test", "allow", None),
-    ("an allow alone", "bench --site dev.local migrate", "allow", "dev-site-routine-operation"),
+    ("an allow alone", "bench --site dev.local migrate", "allow", "development-site"),
     ("ask outranks an earlier allow", "bench --site dev.local migrate && git push", "ask", "push"),
     ("ask outranks a later allow", "git push; bench build", "ask", "push"),
     ("deny outranks an allow", "bench build && git add -A", "deny", "blanket-staging"),
@@ -1425,12 +1434,18 @@ PRECEDENCE = [
      "bench build --app erpnext && bench --site dev.local migrate", "allow", "asset-build"),
     ("cd and an output filter keep an allow",
      "cd ~/frappe-bench && bench --site dev.local migrate 2>&1 | tail -20",
-     "allow", "dev-site-routine-operation"),
+     "allow", "development-site"),
     # No decision, rather than allow: the uncovered segment goes to Claude Code's own
     # permission check, and an allow must never carry it along.
     ("an uncovered segment cancels an allow", "bench build && curl http://x", "allow", None),
     ("--site all is not the carve-out", "bench --site all migrate", "ask", "site-named"),
+    ("a non-.local site is not the carve-out", "bench --site erp.example.com migrate",
+     "ask", "site-named"),
 ]
+
+# An allow the hook grants for a .local site carries the development-site reason, which
+# names the site, rather than any one rule's text.
+SITE_REASONS = {"development-site": g.DEVELOPMENT_REASON % "dev.local"}
 
 
 def check_decision_precedence():
@@ -1449,8 +1464,8 @@ def check_decision_precedence():
                     "decided %r" % (name, command, got)
                 )
             continue
-        expected = g.REASONS.get(rule) or ""
-        if reason != expected:
+        expected = g.REASONS.get(rule) or SITE_REASONS.get(rule, "")
+        if not reason.startswith(expected) or not expected:
             problems.append(
                 "%s: %r decided %r but with %s's reason, not %s's"
                 % (name, command, got,

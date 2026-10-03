@@ -122,12 +122,18 @@ context skill, applied to operations.
 
 ## Site resolution
 
-A site is a **development site** only when `docs/ai-context/OPERATIONS.md` identifies it
-as one, or the user identifies it for this task. Belonging to the same bench is not
-enough, and neither is a name that looks local.
+A site whose name ends in **`.local`** is a **development site** — `atyaf.local`,
+`safeer.local`. That is this plugin's convention, and `hooks/guard.py` enforces it. Nothing
+else makes a site a development site: not `localhost`, not `staging` or `dev-server`, not
+an IP address, not a name in `OPERATIONS.md`, and not belonging to the same bench. Every
+other site is **protected**.
+
+Which development site a task uses is a separate question, and the convention does not
+answer it. A bench usually holds several `.local` sites; the one for this task is the one
+`docs/ai-context/OPERATIONS.md` names, or the one the user names.
 
 ```text
-exactly one known development site  →  use it
+exactly one site for this task      →  use it
 more than one could be affected     →  stop and ask
 none identified, or unclear         →  stop and ask
 ```
@@ -154,20 +160,50 @@ away, without asking the user and without stopping to propose them. The hook let
 through with no permission prompt:
 
 ```text
-bench build [--app <app>]          no site involved
-bench --site <site> migrate        site named on the command line
-bench --site <site> clear-cache    site named on the command line
+bench build [--app <app>]                no site involved
+bench --site <name>.local migrate        a development site
+bench --site <name>.local clear-cache    a development site
 ```
 
+`migrate` and `clear-cache` get no carve-out of their own: they are routine site access
+like any other site command. On a protected site they ask under the same rule as
+everything else. Like all site access, the decision depends on the one site the command
+names:
+
+```text
+bench --site <name>.local <command>   development site  →  runs without a prompt
+bench --site <other> <command>        protected site    →  asks the first time in a
+                                                            Claude Code session; once
+                                                            that command is approved and
+                                                            runs, the same exact site
+                                                            runs without a prompt for the
+                                                            rest of the session
+```
+
+`console`, `execute`, `run-tests`, `list-apps` and the other site commands are all
+routine access. So is a Frappe snippet whose `frappe.init(...)` / `frappe.connect(...)`
+names its site as a literal. Write the site with `--site <name>`, `-s <name>` or
+`--site=<name>`. A heredoc feeding `console` counts as part of the command:
+`bench --site <name>.local console <<'EOF' … EOF` goes through as one command.
+
 Running from the bench directory is fine: `cd <bench> && bench --site <site> migrate 2>&1
-| tail -40` still goes through. Anything else chained onto the command sends it back to
-the normal permission check.
+| tail -40` still goes through. Anything else chained onto the command — a pipe into
+`console`, another program, a `$(…)` substitution — sends it back to the normal
+permission check.
 
-What still asks, on purpose:
+What still asks, on purpose, whatever the site:
 
-- the same commands with no `--site`, or with `--site all` — bench would pick the site
-  itself, or hit every site;
-- every other site command — `console`, `execute`, `install-app`, `mariadb` and the rest.
+- a command with no `--site`, or with `--site all` — bench would pick the site itself,
+  or hit every site. An approved site never covers an unnamed command;
+- a command that reaches more than one site, or a site the hook cannot read off the
+  text — a variable, a loop, a computed `frappe.init(site=…)`;
+- destructive site operations — `reinstall`, `restore`, `partial-restore`, `drop-site`,
+  `uninstall-app`, `trim-database`, `trim-tables`, `transform-database`,
+  `clear-log-table`, `destroy-all-sessions`, `set-admin-password`, `set-password`, and the
+  raw database shells `mariadb`, `db-console`, `postgres`. These ask on `.local` sites and
+  on approved sites alike;
+- every Git, filesystem and database rule in the orchestration skill. A stronger rule
+  always wins over a site allow.
 
 The prompt is gone, so the judgment is yours. Use only the site resolved under
 `## Site resolution`, and still stop and ask before a migration that may be destructive
@@ -269,5 +305,9 @@ bench --site <site> install-app <app>       only on explicit request
 bench --site <site> run-tests --app <app>   run the app's tests
 bench --site <site> list-apps               read-only check of what is installed
 ```
+
+Plug `<site>` in as the site resolved under `## Site resolution`. On a `.local` site
+every line runs without a prompt, `install-app` included, so whether to install an app
+is a judgment call, not something the hook decides.
 
 Anything beyond these belongs in the project's own `OPERATIONS.md`, not here.

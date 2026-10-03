@@ -5,7 +5,8 @@
   "decisions": {
     "hook": "What hooks/guard.py decides for a command Claude runs: ask, deny, or allow (runs with no permission prompt). null means this rule is not the hook's to enforce.",
     "delegated": "What scripts/delegate's permission policy decides inside a delegated run. null means the rule cannot be expressed there, or does not apply.",
-    "not_enforced_because": "Required whenever hook or delegated is null. A rule that no longer applies to a consumer has to say why, in the data, where the next reader sees it. Without this field a decision could be quietly dropped to null and nothing would notice - which is the shape of the divergence this file exists to prevent, not a hypothetical."
+    "not_enforced_because": "Required whenever hook or delegated is null. A rule that no longer applies to a consumer has to say why, in the data, where the next reader sees it. Without this field a decision could be quietly dropped to null and nothing would notice - which is the shape of the divergence this file exists to prevent, not a hypothetical.",
+    "site_access": "Optional, true only on a rule the hook asks on. It marks an ask that is about reaching a site at all, not about what is done there, and lets hooks/guard.py answer it itself when the whole command reaches one explicitly named site: a site ending in .local is a development site and is allowed, and any other site is allowed once the user has approved a command reaching that exact site earlier in the same Claude Code session. What a site name means and what a session approved are the hook's mechanics, not rules, so they live there. A rule without this flag is never relaxed by the site it reaches - which is why destructive-site-operation is its own rule, ahead of the site rules. The delegated policy ignores it: a delegated run never reaches a site."
   },
   "match_kinds": {
     "program_subcommand": "program name, plus the subcommand that follows it, options skipped",
@@ -492,6 +493,57 @@
       ]
     },
     {
+      "name": "destructive-site-operation",
+      "intent": "Bench site commands whose effect is not undone by running something else: reinstalling, restoring or dropping a site, uninstalling an app, trimming or transforming tables, clearing log tables, resetting passwords, destroying every session, and the raw database shells, which reach the same place database-client asks about. It precedes the site rules so that neither the .local development convention nor a site approved earlier in the session relaxes it - those relax only site_access rules, and this is not one. Named or unnamed, on any site, it asks.",
+      "match": {
+        "kind": "program_subcommand",
+        "program": "bench",
+        "subcommands": [
+          "clear-log-table",
+          "db-console",
+          "destroy-all-sessions",
+          "drop-site",
+          "mariadb",
+          "partial-restore",
+          "postgres",
+          "reinstall",
+          "restore",
+          "set-admin-password",
+          "set-password",
+          "transform-database",
+          "trim-database",
+          "trim-tables",
+          "uninstall-app"
+        ]
+      },
+      "hook": "ask",
+      "delegated": "deny",
+      "documented_in": [
+        {
+          "file": "skills/frappe-operations/SKILL.md",
+          "heading": "## Running without a prompt"
+        },
+        {
+          "file": "skills/orchestration/SKILL.md",
+          "heading": "### Live site access"
+        }
+      ],
+      "examples": [
+        "bench --site dev.local reinstall --yes",
+        "bench --site=dev.local restore backup.sql.gz",
+        "bench -s erp.example.com mariadb",
+        "bench --site dev.local uninstall-app hrms",
+        "bench drop-site dev.local",
+        "bench reinstall"
+      ],
+      "not_examples": [
+        "bench --site dev.local console",
+        "bench --site dev.local list-apps",
+        "bench --site dev.local backup",
+        "bench build"
+      ]
+    },
+    {
       "name": "asset-build",
       "intent": "Rebuilding an app's frontend assets touches no site and no database, and it is the step that makes a frontend change visible at all. Once a task is finished it runs without a prompt, so the work is ready to look at when the report arrives.",
       "match": {
@@ -523,54 +575,6 @@
       }
     },
     {
-      "name": "dev-site-routine-operation",
-      "intent": "Applying a finished change's schema and dropping its cached metadata are the routine end of a task on the development site, so `bench --site <site> migrate` and `clear-cache` run without a prompt once the site is named. Naming it is what the carve-out requires: without --site bench picks a site from configuration, and that form still asks under site-unnamed. `--site all` still asks too. Choosing the site - one OPERATIONS.md or the user identified as a development site - and stopping before a destructive migration are the skill's job, not this rule's.",
-      "match": {
-        "kind": "program_subcommand",
-        "program": "bench",
-        "subcommands": [
-          "migrate",
-          "clear-cache"
-        ],
-        "any_argument": [
-          "--site",
-          "-s"
-        ],
-        "unless_flags": [
-          "all"
-        ]
-      },
-      "hook": "allow",
-      "delegated": null,
-      "documented_in": [
-        {
-          "file": "skills/frappe-operations/SKILL.md",
-          "heading": "## Running without a prompt"
-        },
-        {
-          "file": "skills/orchestration/SKILL.md",
-          "heading": "### Live site access"
-        }
-      ],
-      "examples": [
-        "bench --site dev.local migrate",
-        "bench -s dev.local migrate",
-        "bench --site dev.local clear-cache",
-        "bench --site dev.local migrate --skip-failing"
-      ],
-      "not_examples": [
-        "bench migrate",
-        "bench clear-cache",
-        "bench --site all migrate",
-        "bench -s all clear-cache",
-        "bench --site dev.local console",
-        "bench --site dev.local install-app erpnext"
-      ],
-      "not_enforced_because": {
-        "delegated": "A delegated run never gets this carve-out: site-named and site-unnamed deny every bench site command inside one, which is what should happen, because operations are never delegated."
-      }
-    },
-    {
       "name": "site-named",
       "intent": "A bench command carrying --site runs against that live site's database or a running Frappe instance. Confirm the single target site first.",
       "match": {
@@ -581,6 +585,7 @@
         ]
       },
       "hook": "ask",
+      "site_access": true,
       "delegated": "deny",
       "documented_in": [
         {
@@ -593,9 +598,9 @@
         }
       ],
       "examples": [
-        "bench --site dev.local console",
+        "bench --site erp.example.com console",
         "bench --site all clear-cache",
-        "bench --site dev.local list-apps"
+        "bench --site erp.example.com list-apps"
       ],
       "not_examples": [
         "bench build",
@@ -688,6 +693,7 @@
         ]
       },
       "hook": "ask",
+      "site_access": true,
       "delegated": "deny",
       "documented_in": [
         {
@@ -705,7 +711,7 @@
         "bench install-app erpnext",
         "bench console",
         "bench list-apps",
-        "bench -s dev.local console"
+        "bench -s erp.example.com console"
       ],
       "not_examples": [
         "bench build",
@@ -758,6 +764,7 @@
         ]
       },
       "hook": "ask",
+      "site_access": true,
       "delegated": null,
       "documented_in": [
         {

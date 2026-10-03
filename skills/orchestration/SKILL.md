@@ -359,9 +359,10 @@ Read it before running any bench command. Four rules hold even when it is not re
 
 1. The default is no operation. Run what this change requires, never the four by reflex —
    and run it yourself once implementation is done, without asking first.
-2. A site-dependent command names its site with `--site`, and that site is one
-   `OPERATIONS.md` or the user identified as a development site. An unnamed site is not
-   no site — bench resolves one from configuration.
+2. A site-dependent command names its site with `--site`, and that site is the
+   development site `OPERATIONS.md` or the user named for this task. A development site
+   is one whose name ends in `.local`. An unnamed site is not no site — bench resolves
+   one from configuration.
 3. Run them yourself, as local commands. A Frappe operation is never delegated and never
    goes in a brief: the hook does not see a delegated agent's shell, and no delegated
    containment decides which site an operation should touch.
@@ -548,8 +549,8 @@ project file. Never invoke it.
 analysis, delegation, local source-code changes, tests, local builds, local linting, local
 type checking, documentation updates, review/fix loops within the attempt limit, and the
 bench operations a finished change requires — `bench build`, and `migrate` / `clear-cache`
-on the named development site (see `## Running without a prompt` in the frappe-operations
-skill).
+on the named development site — and routine site access to a named `.local` development
+site (see `## Running without a prompt` in the frappe-operations skill).
 
 **Requires the user's approval of the proposed commit:** local Git staging and local Git
 commit.
@@ -570,12 +571,34 @@ This covers `bench console`, `bench mariadb`, `bench execute`, `bench --site ...
 any script or snippet that opens a Frappe connection (`frappe.init`, `frappe.connect`,
 `frappe.db`, `frappe.get_doc`).
 
-Such execution:
+Which site it reaches decides how it is gated. `hooks/guard.py` enforces this:
 
-- requires an explicit user request — never a step you chose to take on your own. The one
-  exception is `bench --site <site> migrate` and `clear-cache` on the resolved
-  development site, when the finished change requires them; those run without asking;
-- is limited to the single site the user named; if no site was named, ask;
+```text
+explicit *.local site       development  →  routine access runs without a prompt
+explicit other site         protected    →  asks the first time in a Claude Code session;
+                                             once approved and run, routine access to that
+                                             exact site runs without a prompt until the
+                                             session ends
+no site, --site all, more
+than one site, or one the
+hook cannot read            protected    →  asks, every time
+destructive operation       —            →  the stronger rule wins: it asks (or denies) on
+                                             every site, development and approved alike
+```
+
+A session approval is recorded only after the approved command has actually run. An ask
+the user rejected approves nothing, and a new Claude Code session starts with no
+approvals.
+
+Such execution, whatever the hook allows:
+
+- needs a reason in the task. On the task's development site, querying a site is part of
+  the work and needs no separate request. On a protected site it requires an explicit
+  user request — never a step you chose to take on your own — and an approval earlier in
+  the session is not that request. `bench --site <site> migrate` and `clear-cache` on the
+  resolved development site run without asking when the finished change requires them;
+- is limited to the single site the user or `OPERATIONS.md` named; if no site was named,
+  ask;
 - is never fanned out across sites, and never repeated site by site to hunt for
   something.
 
