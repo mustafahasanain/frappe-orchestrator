@@ -11,11 +11,25 @@ and live-site boundaries.
 | Skills | `skills/orchestration`, `skills/project-context`, `skills/frappe-operations`, `skills/development-report` |
 | Enforcement hook | `hooks/guard.py` (`PreToolUse` and `PostToolUse` on `Bash`) |
 | Delegation dispatcher | `scripts/delegate` |
+| Debate Mode runner | `scripts/debate` |
 | Development report | `scripts/dev-report` (on request only) |
 | Boundaries and routing | `config/command-boundaries.json`, `config/model-routing.json` |
 
 The hook and the dispatcher's permission policy are the two enforcement layers, and
 they read their rules from `config/command-boundaries.json` rather than keeping copies.
+
+## Debate Mode
+
+For a DIFFICULT task that genuinely needs architectural deliberation — ambiguous
+structure, competing approaches, or a high-risk design decision — or when the user asks
+for one, `scripts/debate` puts Claude Opus and Codex in front of the question as
+independent, read-only advisers before anything is implemented. Two stages and no more:
+each states a position without seeing the other's, then each critiques the other's.
+Claude, the orchestrator, makes the decision and the normal implementation and review
+workflow follows; the debate never replaces the post-implementation Codex review.
+Difficulty alone does not trigger it. Configuration is the `deliberation` block of
+`config/model-routing.json`; the rules are in `skills/orchestration/SKILL.md` under
+*Debate Mode*.
 
 ## Requirements
 
@@ -25,7 +39,10 @@ they read their rules from `config/command-boundaries.json` rather than keeping 
 - **[OpenCode](https://opencode.ai), Linux build.** The only agent that runs `implement`.
 - **[Codex CLI](https://github.com/openai/codex).** Runs `review`, `test`, and `onboard` —
   a reviewer that wrote the code it reviews is not an independent reviewer, so the two
-  agents never overlap.
+  agents never overlap — and the Codex side of `deliberate`.
+- **The `claude` CLI, logged in, for Debate Mode only.** Runs the Opus side of
+  `deliberate`, read-only and pinned to the model id in the routing file. Verified
+  against 2.1.288; the flags it relies on are listed in `adapt_claude`.
 - **For the development report only:** Google Chrome or Chromium, poppler-utils, and an
   Arabic font (Noto Sans Arabic / Noto Kufi Arabic). Nothing else in the plugin needs
   them. Ask for a report in so many words — "Create today's development report" — and it
@@ -86,8 +103,9 @@ loads it. There is nothing to sync:
 | `hooks/`, `config/`, `scripts/` | Next session, or `/reload-plugins` in an open one |
 
 The cost of that is worth stating plainly: a broken working tree is broken enforcement in
-every session, not just this repository's. Run `python3 tests/test_parser.py` and
-`python3 tests/test_dev_report.py` before you leave a change in the tree.
+every session, not just this repository's. Run `python3 tests/test_parser.py`,
+`python3 tests/test_debate.py` and `python3 tests/test_dev_report.py` before you leave a
+change in the tree.
 
 The two update commands are bookkeeping. `plugin.json` carries **no `version` field**, so
 Claude Code stamps the install with the source commit SHA; a pinned version would freeze
@@ -129,3 +147,7 @@ this plugin included.
 
 Disabling removes the enforcement hook along with the skills. The push, blanket-staging,
 live-site and bare-agent boundaries stop being enforced.
+
+To turn off Debate Mode alone, set `deliberation.enabled` to `false` in
+`config/model-routing.json`; the dispatcher then refuses every `deliberate` run,
+including one the user asked for.
