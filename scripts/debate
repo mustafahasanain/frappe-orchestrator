@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""Debate Mode runner: two read-only advisers, two stages, one result.
+
+    debate --tier <TIER> --trigger <reason> --cwd <repository root>   (brief on stdin)
+
+Runs scripts/delegate four times and nothing else:
+
+    stage 1   claude deliberate --stage position     codex deliberate --stage position
+              (in parallel, the same brief, neither sees the other)
+    stage 2   claude deliberate --stage critique     codex deliberate --stage critique
+              (in parallel, each given its own position and the other's)
+
+Then it stops. The decision is the orchestrator's: it reads this result, writes
+synthesis.md into the debate directory, and carries the decision into the existing
+implementation workflow. This file decides nothing, implements nothing, and retries
+nothing.
+
+Every rule about a run - the trigger, the model pin and its verification, read-only
+execution, the contracts, the two-stage bound - is enforced by the dispatcher, which this
+calls rather than re-implements. What this adds is the sequence and the failure rule: a
+debate is complete only when all four runs are usable. If either position is unusable,
+stage two does not run, because a critique of a missing side would be a fabrication; if
+either critique is unusable, the debate is incomplete. Incomplete is reported as
+incomplete, with the reasons, and never as a debate that happened.
+
+Exit status is 0 whenever a result was produced, complete or incomplete; read "status".
+Exit status 2 means the invocation was refused - by this runner or by the dispatcher's
+own validation, which is run first as a dry run so that nothing starts when it would be
+refused.
+"""
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+DELEGATE = Path(__file__).resolve().parent / "delegate"
+
+# Who takes part. Fixed, not configured: these are the two agents the dispatcher accepts
+# for --mode deliberate, and the routing file pins the Claude side's model.
+PARTICIPANTS = ("claude", "codex")
+STAGES = ("position", "critique")
+
+ENCODING = "utf-8"
+
+
+def artifact(directory, agent, stage):
+    return directory / ("%s-%s.json" % (agent, stage))
+
+
+def delegate_argv(agent, stage, args, directory=None):
+    argv = [
+        sys.executable, str(DELEGATE),
+        "--agent", agent, "--mode", "deliberate", "--stage", stage,
+        "--tier", args.tier, "--trigger", args.trigger, "--cwd", args.cwd,
+    ]
+    if args.timeout:
+        argv += ["--timeout", str(args.timeout)]
+    if stage == "critique":
+        other = PARTICIPANTS[1 - PARTICIPANTS.index(agent)]
+        argv += [
+            "--own-position", str(artifact(directory, agent, "position")),
+            "--counterpart", str(artifact(directory, other, "position")),
+        ]
+    return argv
+
+
+def preflight(args, brief):
+    """Run the dispatcher's own validation for both advisers before anything starts.
+
+    A dry run resolves the trigger, the tier, the routing, the model pin and the
+    directory exactly as a real run would, and costs nothing. Without it a refusal for one
+    adviser would arrive after the other had started a fifteen-minute run.
+    """
+    for agent in PARTICIPANTS:
+        try:
+            proc = subprocess.run(
+                delegate_argv(agent, "position", args) + ["--dry-run"],
+                input=brief, capture_output=True, text=True, encoding=ENCODING,
+                errors="replace", timeout=120,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return "%s: the dispatcher could not be run (%s)" % (agent, exc)
+        if proc.returncode != 0:
+            message = proc.stderr.strip().splitlines()
+            return "%s: %s" % (agent, message[-1] if message else "refused")
+        try:
+            dry = json.loads(proc.stdout)
+        except ValueError:
+            return "%s: the dispatcher's dry run printed no result" % agent
+        if dry.get("agent_path") is None:
+            return "%s: %s is not installed or not on PATH" % (agent, dry["argv"][0])
+    return None
+
+
+def run_stage(stage, args, brief, directory):
+    """Run one stage for both advisers in parallel. {agent: result dict or None}."""
+    procs = {}
+    try:
+        for agent in PARTICIPANTS:
+            out = open(artifact(directory, agent, stage), "w", encoding=ENCODING)
+            err = open(directory / ("%s-%s.stderr.txt" % (agent, stage)), "w",
+                       encoding=ENCODING)
+            proc = subprocess.Popen(
+                delegate_argv(agent, stage, args, directory),
+                stdin=subprocess.PIPE, stdout=out, stderr=err, text=True,
+                encoding=ENCODING, errors="replace",
+            )
+            procs[agent] = (proc, out, err)
+            proc.stdin.write(brief)
+            proc.stdin.close()
+        for proc, out, err in procs.values():
+            proc.wait()
+    except KeyboardInterrupt:
+        # The dispatcher passes SIGINT on to the agent's own process group; SIGTERM would
+        # stop the dispatcher and leave the agent running.
+        for proc, _out, _err in procs.values():
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGINT)
+        raise
+    finally:
+        for _proc, out, err in procs.values():
+            out.close()
+            err.close()
+    results = {}
+    for agent, (proc, _out, _err) in procs.items():
+        try:
+            data = json.loads(artifact(directory, agent, stage).read_text(encoding=ENCODING))
+        except (OSError, ValueError):
+            data = None
+        if not isinstance(data, dict) or proc.returncode != 0:
+            data = None
+        results[agent] = data
+    return results
+
+
+def failures_of(stage, results, directory):
+    failed = []
+    for agent in PARTICIPANTS:
+        data = results.get(agent)
+        if data is None:
+            failed.append({
+                "agent": agent, "stage": stage, "status": "no_result",
+                "reasons": ["the dispatcher produced no result; see %s"
+                            % (directory / ("%s-%s.stderr.txt" % (agent, stage)))],
+            })
+        elif data.get("usable") is not True:
+            failed.append({
+                "agent": agent, "stage": stage, "status": data.get("status"),
+                "reasons": data.get("unusable_reasons") or ["not usable"],
+                "error": data.get("error"),
+                "workspace": data.get("workspace"),
+            })
+    return failed
+
+
+def participant(data):
+    if not data:
+        return None
+    return {
+        "model": data.get("model"),
+        "model_id": data.get("model_id"),
+        "model_verified": data.get("model_verified"),
+        "served_models": data.get("served_models"),
+        "workspace": data.get("workspace"),
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="debate",
+        description="Debate Mode: two read-only advisers, position then one cross-critique. "
+        "The brief is read from stdin.",
+    )
+    parser.add_argument("--tier", required=True, choices=("FAST", "SMALL", "NORMAL", "DIFFICULT"))
+    parser.add_argument("--trigger", required=True,
+                        help="the reason Debate Mode runs, from the routing file")
+    parser.add_argument("--cwd", required=True, help="the repository root, never inherited")
+    parser.add_argument("--timeout", type=int,
+                        help="per run; defaults to deliberation.timeout_seconds")
+    args = parser.parse_args()
+
+    brief = "" if sys.stdin.isatty() else sys.stdin.read()
+    if not brief.strip():
+        parser.error("the brief is read from stdin and was empty")
+
+    refused = preflight(args, brief)
+    if refused:
+        parser.error(refused)
+
+    # Outside the repository, like every delegation artifact.
+    directory = Path(tempfile.mkdtemp(prefix="debate-"))
+    (directory / "brief.md").write_text(brief, encoding=ENCODING)
+    print("debate: %s" % directory, file=sys.stderr)
+
+    result = {
+        "status": "incomplete",
+        "tier": args.tier,
+        "trigger": args.trigger,
+        "cwd": os.path.realpath(args.cwd),
+        "directory": str(directory),
+        "brief": str(directory / "brief.md"),
+        "synthesis": str(directory / "synthesis.md"),
+        "stages_run": [],
+        "participants": {},
+        "positions": {},
+        "critiques": {},
+        "failures": [],
+    }
+
+    for stage in STAGES:
+        results = run_stage(stage, args, brief, directory)
+        result["stages_run"].append(stage)
+        for agent in PARTICIPANTS:
+            data = results.get(agent)
+            if data and stage == "position":
+                result["participants"][agent] = participant(data)
+            key = "positions" if stage == "position" else "critiques"
+            result[key][agent] = data.get("agent_report") if data and data.get("usable") else None
+        failed = failures_of(stage, results, directory)
+        if failed:
+            result["failures"] = failed
+            # One side is not a debate. What was produced stays on disk for the record,
+            # but the result carries no positions or critiques to build a decision on.
+            result["positions"], result["critiques"] = {}, {}
+            break
+    else:
+        result["status"] = "complete"
+
+    (directory / "debate.json").write_text(json.dumps(result, indent=2) + "\n",
+                                           encoding=ENCODING)
+    json.dump(result, sys.stdout, indent=2)
+    print()
+
+
+if __name__ == "__main__":
+    main()

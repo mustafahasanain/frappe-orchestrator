@@ -857,6 +857,40 @@
       "not_enforced_because": {
         "delegated": "As above."
       }
+    },
+    {
+      "name": "bare-agent-print",
+      "intent": "The same rule for Claude's non-interactive mode, which Debate Mode now delegates to. A bare `claude -p` runs whatever model the CLI defaults to, with whatever tools and permissions the user's settings grant; the dispatcher pins the model from the routing file, verifies it from the run's own usage report, and holds the run to read-only tools. An interactive `claude` and its management subcommands are untouched - only the print forms run an agent unattended.",
+      "match": {
+        "kind": "program_option",
+        "program": "claude",
+        "options": [
+          "-p",
+          "--print"
+        ]
+      },
+      "hook": "deny",
+      "delegated": null,
+      "documented_in": [
+        {
+          "file": "skills/orchestration/SKILL.md",
+          "heading": "## Delegation"
+        }
+      ],
+      "examples": [
+        "claude -p 'design the permission model'",
+        "claude --print --model opus 'x'",
+        "claude --model claude-opus-5-5 -p 'x'"
+      ],
+      "not_examples": [
+        "claude --version",
+        "claude plugin list",
+        "claude plugin details frappe-orchestrator@frappe-orchestrator",
+        "claude --help"
+      ],
+      "not_enforced_because": {
+        "delegated": "As above."
+      }
     }
   ]
 }

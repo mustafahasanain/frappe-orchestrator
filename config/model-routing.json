@@ -21,7 +21,8 @@
       "executor": "claude"
     },
     "Claude Opus 5.5": {
-      "executor": "claude"
+      "executor": "claude",
+      "id": "claude-opus-5-5"
     }
   },
   "tiers": {
@@ -87,6 +88,25 @@
       "effort": "high"
     }
   ],
+  "deliberation": {
+    "enabled": true,
+    "trigger_tiers": [
+      "DIFFICULT"
+    ],
+    "triggers": [
+      "architectural-ambiguity",
+      "competing-approaches",
+      "high-risk-decision"
+    ],
+    "user_trigger": "user-request",
+    "claude_model": "Claude Opus 5.5",
+    "claude_auxiliary_model_prefixes": [
+      "claude-haiku-"
+    ],
+    "effort": "high",
+    "timeout_seconds": 900,
+    "description": "Debate Mode: Claude (claude_model) and Codex as independent, read-only architectural advisers before implementation. Two stages only - independent positions, then one cross-critique - fixed in scripts/delegate, not here. Automatic only on trigger_tiers and only with one of triggers; user_trigger is an explicit user request and is honoured on any tier. claude_auxiliary_model_prefixes are the only models other than claude_model allowed to appear in a Claude run's model usage: Claude Code's own housekeeping model, never the one answering."
+  },
   "special_models": {
     "Kimi K3": {
       "effort": "medium",

@@ -190,30 +190,32 @@ REASONS = {
         "a DocType definition or other committed configuration, read that file in the "
         "working tree instead of querying a site."
     ),
-    "bare-agent-run": None,   # filled in below - both agent rules share one text
+    "bare-agent-run": None,   # filled in below - the agent rules share one text
     "bare-agent-exec": None,
+    "bare-agent-print": None,
 }
 
 DELEGATE = os.path.join(os.environ.get("CLAUDE_PLUGIN_ROOT", ""), "scripts", "delegate")
 
 AGENT_REASON = (
     "Coding agents run through the dispatcher, not directly. Use `" + DELEGATE + " "
-    "--agent <opencode|codex> --mode <implement|review|test|onboard> --tier <TIER> "
-    "--cwd <repository root> [--model \"<name from the routing file>\"]` with the "
-    "brief on stdin. The "
+    "--agent <opencode|codex|claude> --mode <implement|review|test|onboard|deliberate> "
+    "--tier <TIER> --cwd <repository root> [--model \"<name from the routing file>\"]` "
+    "with the brief on stdin; for Debate Mode, run `scripts/debate`, which calls it. The "
     "dispatcher supplies the model and timeout from central routing, the permission "
     "policy that holds a delegated run inside the same boundaries enforced here, and "
     "the structured result contract. A bare invocation skips all three."
 )
 REASONS["bare-agent-run"] = AGENT_REASON
 REASONS["bare-agent-exec"] = AGENT_REASON
+REASONS["bare-agent-print"] = AGENT_REASON
 
 # Last resort, and deliberately not a second copy of the rules: the programs any rule has
 # ever been about. If the boundary data cannot be loaded there are no rules to apply, and
 # silently enforcing nothing is the one failure mode this hook must not have. Asking on
 # these programs turns a total, invisible lapse into a visible degraded one.
 GUARDED_PROGRAMS = frozenset({
-    "git", "bench", "mysql", "mariadb", "opencode", "codex",
+    "git", "bench", "mysql", "mariadb", "opencode", "codex", "claude",
     # The destructive filesystem programs. Listed for the same reason as the rest: with
     # the rule data unloadable there is nothing to narrow `rm` down to its recursive
     # forms, and asking on every `rm` for as long as the file is broken is the failure

@@ -38,6 +38,9 @@ and a short reason:
 
     Orchestration: NORMAL | model: <name from routing file> | tree: clean | context: present | reclassified: <reason>
 
+When Debate Mode runs, two more lines follow, and only then (see *Debate Mode*). They do
+not replace this one.
+
 ## Core principle
 
 Use the simplest reliable solution. Never introduce agent servers, message brokers,
@@ -76,6 +79,15 @@ plan did not anticipate, and reports AI context it found to be stale or incomple
 unfamiliar repository it performs the read-only onboarding analysis — in `onboard` mode,
 not review mode, because there is no diff there and nothing to pass or fail.
 
+### Debate Mode advisers — Claude Opus and Codex
+
+Only when Debate Mode runs (see *Debate Mode*), and only before implementation. The
+Claude adviser is the routing file's `deliberation.claude_model`, run as a separate,
+pinned, read-only process — not you, and not whichever model this session runs on. Codex
+is the other adviser, in its own `deliberate` mode, read-only. Both inspect the
+repository, state a position, and critique the other's. Neither implements, edits,
+stages, commits, or decides: the decision is yours.
+
 ## Workflow
 
 ```text
@@ -90,6 +102,8 @@ Dirty working tree check
 AI context: read it, or bootstrap it if missing
    ↓
 Impact analysis  →  targeted reads
+   ↓
+Debate Mode — DIFFICULT with an architectural trigger, or user request only
    ↓
 Implementation — delegated, or your own (see Who implements)
    ↓
@@ -159,9 +173,10 @@ Every model in the routing file carries an `executor`. Read it from the file; ne
 infer it from the model's name.
 
 - **`opencode`** — delegate the implementation through the dispatcher.
-- **`claude`** — implement it yourself, with your own access. These models have no
-  provider CLI id and no dispatcher call for the implementation step. The DIFFICULT
-  tier and the Claude Opus escalation rung are both `claude`.
+- **`claude`** — implement it yourself, with your own access. There is no dispatcher
+  call for the implementation step. The DIFFICULT tier and the Claude Opus escalation
+  rung are both `claude`. Claude Opus also carries a provider `id`; that id exists only
+  to pin the Debate Mode adviser, and does not make Opus delegable for implementation.
 
 Implementing directly is not a shortcut around the workflow. The preamble, the impact
 line, the Codex review, the bounded fix loop, and the commit rules all apply
@@ -242,8 +257,21 @@ delegate --agent codex    --mode test      --tier <TIER> --cwd <repository root>
 delegate --agent codex    --mode onboard   --tier <TIER> --cwd <repository root>
 ```
 
-Those four are the only valid combinations, and the dispatcher refuses the rest.
+Debate Mode adds one mode, `deliberate`, which `scripts/debate` runs for you — call the
+runner, not these:
+
+```text
+delegate --agent claude --mode deliberate --stage position --trigger <reason> --tier <TIER> --cwd <repository root>
+delegate --agent codex  --mode deliberate --stage position --trigger <reason> --tier <TIER> --cwd <repository root>
+delegate --agent claude --mode deliberate --stage critique --trigger <reason> --tier <TIER> --cwd <repository root> --own-position <claude position.json> --counterpart <codex position.json>
+delegate --agent codex  --mode deliberate --stage critique --trigger <reason> --tier <TIER> --cwd <repository root> --own-position <codex position.json> --counterpart <claude position.json>
+```
+
+Those are the only valid combinations, and the dispatcher refuses the rest.
 Codex never implements: a reviewer that writes the code it reviews is not independent.
+Claude runs `deliberate` and nothing else through the dispatcher: you implement
+DIFFICULT work yourself, and `--model` is refused for it because the routing file pins
+it. A bare `claude -p`, like a bare `opencode run` or `codex exec`, is denied by the hook.
 
 The provider model id, effort, and timeout come from the routing file. `--effort` and
 `--timeout` override them when needed.
@@ -290,13 +318,13 @@ PASS/FAIL/BLOCKED, so an analysis run in review mode returns a verdict it had no
 for — an artefact of the contract rather than a judgement. That is worse than no verdict:
 where the orchestrator reads it, a false FAIL is indistinguishable from a real one.
 
-Only `review` and `test` produce a verdict. `implement` and `onboard` have no verdict
-field at all, and the dispatcher removes one from the report if the agent volunteers it,
-naming what it removed in `off_contract_keys`. Do not supply the missing verdict
+Only `review` and `test` produce a verdict. `implement`, `onboard` and `deliberate` have
+no verdict field at all, and the dispatcher removes one from the report if the agent
+volunteers it, naming what it removed in `off_contract_keys`. Do not supply the missing verdict
 yourself: an onboarding analysis that produced findings is not a FAIL, and one that
 produced none is not a PASS. It either produced findings or it did not.
 
-If a use of a delegated agent appears that is not one of these four, it needs its own
+If a use of a delegated agent appears that is not one of these five, it needs its own
 mode and its own contract in the dispatcher. Until it has one, do that work directly or
 stop and ask — do not borrow another mode's contract to get the run out the door.
 
@@ -451,30 +479,153 @@ If the third attempt still fails, stop. No fourth automatic attempt. Return to t
 with the current blocker, the Codex findings, the attempts already made, the likely root
 cause, and a recommended next action.
 
-## Agent debate
+## Debate Mode
 
-Debate is an exception, not a workflow stage.
+Debate Mode puts two independent architectural advisers — Claude Opus and Codex — in
+front of a hard design question **before** implementation, and then you decide. It is an
+exception, not a workflow stage: most DIFFICULT tasks never use it.
 
-**Never debate** on FAST tasks, SMALL tasks, straightforward bug fixes, ordinary review
-findings, ordinary implementation failures, or mechanical refactors.
+```text
+DIFFICULT + architectural trigger  (or an explicit user request)
+   ↓
+Stage 1  Opus position   ‖  Codex position     same brief, neither sees the other
+   ↓
+Stage 2  Opus critiques Codex  ‖  Codex critiques Opus     one round, no third
+   ↓
+You synthesize the decision  →  synthesis.md
+   ↓
+The existing implementation workflow, then the existing fresh Codex review
+```
 
-On NORMAL tasks the default is no debate; use one only if a meaningful architectural
-disagreement actually appears.
+### When it runs
 
-On DIFFICULT or high-risk tasks, debate is available when you and Codex reach materially
-different conclusions, when multiple valid architectures carry important trade-offs, when
-the decision is expensive to reverse, or when security, permissions, data integrity, or
-migration risk is affected.
+Automatically only when **both** hold:
 
-**Maximum one automatic round.** If the disagreement survives it, stop, summarize both
-positions, and let the user decide.
+1. the tier is one of `deliberation.trigger_tiers` in the routing file — DIFFICULT; and
+2. one of `deliberation.triggers` genuinely applies:
+   - `architectural-ambiguity` — the right structure is not settled by the request,
+     the context, or the code;
+   - `competing-approaches` — two or more materially different viable approaches with
+     real trade-offs;
+   - `high-risk-decision` — an architecture or design choice that is expensive to
+     reverse, or carries security, permission, data-integrity or migration risk.
 
-**Debate has no dispatcher mode.** A debate turn is a position, not a verdict, so it must
-not be run as a review to get it delegated — that is the defect described under *One mode
-per use*. Hold the round against the findings Codex already returned in its review; those
-are its position, stated on the record. Do not delegate a fresh turn for it. If that is
-not enough to settle the disagreement, stop and put both positions to the user, which is
-where an unresolved debate ends in any case.
+Typical cases: permission architecture, data model design, migration strategy,
+integration architecture, security-sensitive architecture, a major refactor strategy.
+
+**Difficulty alone is never a trigger.** Do not debate difficult debugging with one clear
+approach, a large but straightforward implementation, a mechanical migration, normal
+CRUD, UI changes, or ordinary validation logic — whatever their tier. FAST, SMALL and
+NORMAL never trigger it automatically, and the dispatcher refuses an automatic trigger
+on them.
+
+The user can ask for a debate explicitly. That is `deliberation.user_trigger`
+(`user-request`), honoured on any tier while `deliberation.enabled` is true. A request
+for "a second opinion" on the code that already exists is a review, not a debate.
+
+### Running it
+
+```text
+${CLAUDE_PLUGIN_ROOT}/scripts/debate --tier <TIER> --trigger <reason> --cwd <repository root>
+```
+
+The brief goes in on stdin. It is the same short brief for both advisers: the task goal,
+the affected area, the relevant constraints, the known risks, and **the architectural
+question being decided**, stated as a question. Do not paste source files; the advisers
+read the working tree. Do not include your own preferred answer — that is what the
+advisers are independent of.
+
+Before starting it, emit:
+
+    Debate: enabled | reason: <trigger> | participants: <deliberation.claude_model> + Codex
+
+The model name comes from the routing file, like the preamble's. A debate takes two
+stages of up to `deliberation.timeout_seconds` each, so start it in the background and
+collect the result, as for any long delegated run. Its directory is printed to stderr at
+once.
+
+### What the runner and the dispatcher enforce
+
+- **The Opus side is Opus.** The dispatcher runs `claude -p --model <id>` with the id
+  from the routing file, and reads back the run's own usage report. `model_verified` is
+  true only when that id produced the answer and nothing but Claude Code's housekeeping
+  model (`deliberation.claude_auxiliary_model_prefixes`) appears beside it.
+- **Read-only.** The Claude adviser has Read, Grep and Glob and no other tool — no shell,
+  no edit, no write, no MCP server, no skills — with every other tool denied rather than
+  asked about, and the target repository's own Claude settings ignored. The Codex
+  adviser runs in Codex's `read-only` sandbox, the same one review and onboard use.
+  Neither can edit, stage, commit, push, run bench, or reach a database.
+- **Independence.** A position run accepts no other answer. Both positions run in
+  parallel from the one brief, and the dispatcher records its digest.
+- **Two stages, no more.** A critique accepts only two usable stage-one positions answered
+  from that same brief — its own and the other adviser's. Nothing accepts a critique as
+  input, so a third round cannot be assembled.
+- **The contract.** `deliberate` has no verdict. A volunteered verdict, `winner` or
+  `final_decision` is removed and named in `off_contract_keys`. A run is `usable` only
+  when it completed, returned the requested stage with every required field, and — for
+  Claude — passed model verification. `unusable_reasons` says why it is not.
+
+### Reading the result
+
+`status` is `complete` only when all four runs were usable. Then `positions` and
+`critiques` hold the advisers' reports, and `participants` records which model each
+side ran on.
+
+`incomplete` means there was no debate. Each entry in `failures` names the adviser, the
+stage, and why. If a position failed, the critique stage did not run. Either way, the
+result carries no positions to build on: **one adviser's answer is not a debate and is
+never presented as one.** Do not fabricate the missing side, do not re-run it in a loop,
+and do not rerun the debate automatically. Emit:
+
+    Debate: incomplete | <adviser> <stage>: <reason>
+
+Then decide as you would without Debate Mode, if you can do so safely under the existing
+workflow. If the question is too ambiguous or too risky to decide alone, stop and put it
+to the user.
+
+### Synthesis
+
+You make the decision, not either adviser. Write it to the `synthesis` path the result
+names (in the debate directory, outside the repository):
+
+```text
+Debate decision
+- Selected approach
+- Why it was selected
+- Points incorporated from the Opus adviser
+- Points incorporated from the Codex adviser
+- Rejected alternatives, and why
+- Remaining risks
+- Implementation constraints
+- Verification expectations
+```
+
+Then emit one line, and keep the transcript out of the conversation unless the user
+asks for it:
+
+    Debate: complete | decision: <one-line summary>
+
+The synthesis is the architectural part of the implementation brief. Implementation
+then proceeds exactly as it would have — same tier, same executor, same review loop.
+
+### What Debate Mode does not change
+
+- It does not implement. Neither adviser writes code; the existing workflow does.
+- It is not a review, and never counts as one. The post-implementation Codex review is a
+  fresh `review` run on the actual diff, exactly as for any other task. Do not pass the
+  debate transcript or the synthesis to the reviewer: it judges the task, the diff, the
+  repository and the tests, not whether its own earlier proposal was followed.
+- It is not an escalation rung. A failed implementation goes up the escalation ladder,
+  not back into a debate.
+
+## Disagreement with a review
+
+When you and Codex reach materially different conclusions about a review finding, hold
+**at most one automatic round** — against the findings Codex already returned, which are
+its position on the record. Do not delegate a fresh turn for it, and do not run it as a
+review or as a debate. If the disagreement survives that round, stop, summarize both
+positions, and let the user decide. Never do this on FAST or SMALL tasks, for ordinary
+review findings, or for ordinary implementation failures.
 
 ## Git safety
 
