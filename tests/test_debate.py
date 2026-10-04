@@ -243,7 +243,21 @@ def check_contract():
         if parsed is not None and parsed.get("stage") != stage:
             problems.append("%s: parsed the wrong object %r" % (stage, parsed))
 
+    # A transcript holding only the requested-output template - an echoed prompt, or an
+    # adviser that returned it unfilled - is found as a report and must not be usable.
+    for stage, tail in d.DELIBERATION_STAGES.items():
+        template = d.CONTRACTS["deliberate"] + tail
+        state, parsed = d.extract_report(template, "deliberate")
+        if state == "present" and not d.validate_deliberation(parsed, stage):
+            problems.append("the bare %s template was accepted as an answer" % stage)
+
     malformed = [
+        ("approach left as placeholder", "position",
+         dict(POSITION, recommended_approach="  <the approach you recommend>  ")),
+        ("list item left as placeholder", "position",
+         dict(POSITION, risks=["real risk", "<what could go wrong with it, concretely>"])),
+        ("critique list left as placeholder", "critique",
+         dict(CRITIQUE, concerns=["<what is wrong or weak in it, and why>"])),
         ("bare discriminator", "position", {"stage": "position"}),
         ("wrong stage", "position", CRITIQUE),
         ("critique answered with a position", "critique", POSITION),

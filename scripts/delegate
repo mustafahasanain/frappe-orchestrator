@@ -1109,7 +1109,24 @@ def validate_deliberation(report, stage):
                 field, "missing" if value is None else type(value).__name__, kind.__name__))
         elif kind is str and not value.strip():
             errors.append("%s is empty" % field)
+        elif kind is str and is_placeholder(value):
+            errors.append("%s is the contract placeholder, not an answer" % field)
+        elif kind is list and any(is_placeholder(item) for item in value):
+            errors.append("%s still holds a contract placeholder" % field)
     return errors
+
+
+def is_placeholder(value):
+    """Whether `value` is a `<...>` placeholder from the requested-output template.
+
+    The template is valid JSON with the right discriminator, so a transcript that echoes
+    the prompt - or an adviser that returns it unfilled - would otherwise pass as a
+    complete answer.
+    """
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    return len(text) >= 2 and text.startswith("<") and text.endswith(">")
 
 
 def load_position(path, *, agent, own, cwd, digest, fail):
