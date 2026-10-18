@@ -1,6 +1,6 @@
 {
   "name": "frappe-orchestrator",
-  "description": "Claude-orchestrated delegation of coding work to external coding-agent CLIs, with task classification, central model routing, bounded review loops, and Git safety rules.",
+  "description": "Opus-orchestrated Frappe/ERPNext and Next.js development: OpenCode implements routine work, a Sonnet subagent handles trivial edits and failed OpenCode runs, Codex reviews only risky changes, and a hook enforces Git, site and destructive-operation boundaries with minimal prompts.",
   "author": {
     "name": "Mustafa Hasanain"
   },

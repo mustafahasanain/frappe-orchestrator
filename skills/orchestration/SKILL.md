@@ -1,759 +1,166 @@
 ---
 name: orchestration
-description: "Use for any request to change, add, fix, rename, refactor, or remove something in a Frappe/ERPNext or Next.js repository, including small one-line fixes and typos, and equally for any request to inspect or investigate such a repository or the data in its sites, whether or not anything is changed. Also use when asked to deploy or push."
+description: "Use when the user asks to implement, fix, change, refactor or remove code in a Frappe/ERPNext or Next.js repository. Routes the work fast: a Sonnet subagent for trivial edits, OpenCode for routine coding, Opus for hard problems, and Codex review only when the diff carries real risk. Do not use for questions, explanations, reading or investigating code, or reviewing code without changing it."
 ---
 
 # Orchestration
 
-You are the orchestrator. You decide; the external agents execute. Every rule below
-applies to any task that changes code in a repository, including small ones.
+You are the orchestrator (Opus). Agents implement; you route, check, and report. The
+fastest safe path is the default. No planning ritual for small work, no reading code just
+to classify, no context bootstrap unless asked. Background and rationale:
+`${CLAUDE_PLUGIN_ROOT}/docs/reference/orchestration.md` — you do not need it to work.
 
-A development report the user asks for is not such a task. It reads the Git history and
-writes one PDF, so it follows `${CLAUDE_PLUGIN_ROOT}/skills/development-report/SKILL.md`
-with no preamble and no delegation.
+Questions, explanations and "look at X" are answered directly: no routing, no agents.
 
-## Required preamble
+## 1. Route
 
-Before acting on any task this skill applies to, emit exactly one line, in this shape:
+| Tier | Typical work | Implementer |
+|---|---|---|
+| FAST | text, labels, minor styling, a mechanical one-liner | Sonnet subagent |
+| SMALL | simple bug fix, minor UI change, isolated edit | OpenCode |
+| NORMAL | typical feature, several files, moderate logic | OpenCode |
+| DIFFICULT | hard debugging, architecture, data integrity, permissions, sensitive logic | you, or OpenCode with a precise brief — your call |
 
-    Orchestration: <TIER> | model: <name from routing file> | tree: <clean|dirty> | context: <present|absent>
+File count alone does not make work DIFFICULT. Move up a tier if the work turns out
+harder; never escalate for size alone. Print one line, then act:
 
-`<TIER>` is FAST, SMALL, NORMAL, or DIFFICULT. `<name from routing file>` is read from
-`config/model-routing.json` for that tier — never a name recalled from memory.
-`<clean|dirty>` is the result of the `git status` check. `<present|absent>` is whether
-`docs/ai-context/` exists in this repository — a directory check, not a judgement.
+    Route: <TIER> → <sonnet | opencode | opus> | review: gate
 
-This line is mandatory. It must appear before the first tool call and not after one, and
-not at the end as a summary. Two read-only checks may precede it because they supply its
-last two fields: `git status`, and the check for `docs/ai-context/`. Nothing else may.
+## 2. Before you implement
 
-It is not optional for small tasks. A one-word typo fix emits it exactly as a migration
-does.
+- `git status --porcelain`, once. Unrelated dirty files: leave them, mention them. Staged
+  changes, or dirty files the task must edit: ask the user first.
+- Read `docs/ai-context/` only if it exists and the task needs orientation.
+- Do not read files to paste into a brief. Agents read the repository themselves.
 
-**If the line has not been emitted, the workflow has not started.** No edit, no
-delegation, no command runs ahead of it.
+## 3. Implement
 
-Reclassification emits the line again, carrying the new tier, the newly selected model,
-and a short reason:
+**FAST → Sonnet.** Exactly three steps, nothing else:
+1. `git status --porcelain` (section 2).
+2. Agent tool, `subagent_type: "frappe-orchestrator:implementer"`, prompt = goal, the
+   file if known, "FAST: no checks". Say nothing while it runs.
+3. One Bash call: `git diff -- <files>; ${CLAUDE_PLUGIN_ROOT}/scripts/orch gate --cwd <repo
+   root> --tier FAST --files <files>`. Then finish (section 6).
 
-    Orchestration: NORMAL | model: <name from routing file> | tree: clean | context: present | reclassified: <reason>
-
-When Debate Mode runs, two more lines follow, and only then (see *Debate Mode*). They do
-not replace this one.
-
-## Core principle
-
-Use the simplest reliable solution. Never introduce agent servers, message brokers,
-databases, workflow engines, or state machines. Agents share the repository through the
-filesystem and Git working tree — not through prompts.
-
-## Roles
-
-### Claude — orchestrator
-
-Understand the request, classify the task, select the model, prepare the brief, delegate,
-monitor, decide when to escalate, enforce the safety rules, decide when the user must
-intervene, and — once verification passes — present the finished work and the proposed
-commit to the user, committing only after they approve it.
-
-Do not perform heavyweight planning for trivial tasks.
-
-### OpenCode — implementation agent
-
-The default implementer of production code: features, bug fixes, refactors,
-implementation-related local commands, and fixes for findings Codex returns. OpenCode
-reads the repository directly from the working tree.
-
-### Codex — independent reviewer
-
-Codex must not modify production code.
-
-Codex may inspect code and the Git diff, perform impact analysis, identify regression
-risks, run tests, write or modify tests, review code, verify fixes, and report defects and
-missing cases. Its findings go back to the implementation agent. Keeping Codex out of the
-production code it reviews is what preserves reviewer independence.
-
-Codex also recalculates impact from the real diff after implementation, selects the
-targeted tests that follow from it, checks whether the implementation touched areas the
-plan did not anticipate, and reports AI context it found to be stale or incomplete. In an
-unfamiliar repository it performs the read-only onboarding analysis — in `onboard` mode,
-not review mode, because there is no diff there and nothing to pass or fail.
-
-### Debate Mode advisers — Claude Opus and Codex
-
-Only when Debate Mode runs (see *Debate Mode*), and only before implementation. The
-Claude adviser is the routing file's `deliberation.claude_model`, run as a separate,
-pinned, read-only process — not you, and not whichever model this session runs on. Codex
-is the other adviser, in its own `deliberate` mode, read-only. Both inspect the
-repository, state a position, and critique the other's. Neither implements, edits,
-stages, commits, or decides: the decision is yours.
-
-## Workflow
+**SMALL / NORMAL → OpenCode** (and DIFFICULT when you delegate):
 
 ```text
-User task
-   ↓
-Task classification
-   ↓
-Model selection
-   ↓
-Dirty working tree check
-   ↓
-AI context: read it, or bootstrap it if missing
-   ↓
-Impact analysis  →  targeted reads
-   ↓
-Debate Mode — DIFFICULT with an architectural trigger, or user request only
-   ↓
-Implementation — delegated, or your own (see Who implements)
-   ↓
-Actual Git diff
-   ↓
-Required environment operations, if any
-   ↓
-Re-inspect the diff if they changed the working tree
-   ↓
-Codex REVIEW  +  impact re-check against the real diff
-   ↓
-PASS ─────→ context update if project knowledge changed ─→ cleanup
-         ─→ report + proposed commit ─→ user approves ─→ local commit
-FAIL ─────→ fix loop (max 3 attempts) ──→ stop and report to user
-BLOCKED ──→ resolve safely, or stop and ask
+${CLAUDE_PLUGIN_ROOT}/scripts/delegate --agent opencode --mode implement --tier <TIER> --cwd <repo root> <<'EOF'
+<goal, required behaviour, known files or areas, what must not change, how to check it>
+EOF
 ```
 
-## Task classification
+- 5–20 line brief. No source dumps, no conversation history, no output contract (the
+  dispatcher appends it), no `--model` (it uses the verified model).
+- SMALL: foreground with Bash `timeout: 600000`. NORMAL/DIFFICULT: `run_in_background`,
+  then wait for the completion notice — do not poll.
+- Never `2>&1`: stdout is the JSON result and nothing else.
+- Read `status`, `files_changed` (measured from the tree), `agent_report.summary`,
+  `review_gate`, and on failure `error_category`, `error`, `recovery`, `fallback`.
 
-Classify directly from the request and the project context you already have. There is no
-classifier, scoring engine, or complexity service.
+**DIFFICULT by you:** implement directly. Everything below still applies.
 
-### FAST
+If a delegated run you started earlier may still be going, `orch status --cwd <repo>`
+before editing. The hook blocks edits while a delegated writer is alive in the repo.
 
-Extremely clear, low risk, mechanical, very limited scope; latency is the priority.
-Trivial renames, simple text changes, obvious configuration adjustments, mechanical
-one-line changes.
+## 4. Fallback — at most one per task
 
-### SMALL
+Not `completed` and `fallback.allowed: true` → give the same brief to the Sonnet subagent,
+plus: "A failed run partially edited: <partial_changes>. Inspect them first; keep correct
+work, complete or fix the rest; touch nothing else." No re-planning. Note it as
+`fallback: opencode → sonnet (<error_category>)`.
 
-Clear requirement, limited scope, one or a few related files, no architecture impact, low
-regression risk. Direct bug fixes, small UI adjustments, isolated validation changes,
-small configuration features.
+`fallback.allowed: false` → start no other agent:
+- `busy` — a delegated agent is still running here: wait, or `orch stop --cwd <repo>`.
+- `mixed_files` non-empty — it touched files that had the user's own changes: ask.
+- `interrupted` — it was cancelled: stop and report.
+- `recovery: inspect_diff` — it exited without a report: look at the diff, then decide.
+- other `blockers` (cleanup unconfirmed, HEAD moved) — report them and ask; no fallback.
 
-### NORMAL
+A wrong implementation is not an infrastructure failure: send just the problems back to
+the same implementer. At most two fix rounds, then stop and report. A fallback never
+works around a permission denial.
 
-Normal feature development. Several related files may be involved, moderate business
-logic, normal impact analysis required, manageable regression risk.
+## 5. Verify, then review only when the gate says so
 
-### DIFFICULT
+Check proportionally, yourself: the diff, the one targeted test if it exists. The gate
+parses changed `.py` and `.json` files: `invalid_files` non-empty → a fix round, not done.
+FAST: the diff and the gate are the whole check — no other commands.
 
-Subtle business logic, difficult debugging, permissions, integration behaviour, data
-integrity, concurrency, complex migration behaviour, architectural decisions, high
-ambiguity, or a previous implementation failure.
+Frappe/ERPNext: run only the bench operations the diff needs — usually none. Follow the
+`frappe-operations` skill. Never `bench restart` by reflex.
 
-### Reclassification
-
-If unexpected complexity appears mid-task, upgrade the classification (SMALL → NORMAL or
-DIFFICULT) and re-select the model. Downgrading mid-task is not a reason to skip a review
-that has already been triggered.
-
-## Model routing
-
-Models and effort levels come from one place:
+**Gate.** Every OpenCode implement result carries `review_gate`. After Sonnet or your own edits:
 
 ```text
-${CLAUDE_PLUGIN_ROOT}/config/model-routing.json
+${CLAUDE_PLUGIN_ROOT}/scripts/orch gate --cwd <repo root> --tier <TIER> --files <changed files>
 ```
 
-Read the tier from that file. Never hardcode a model name here or in any other skill, and
-never create a second routing mechanism — model availability changes there and nowhere
-else.
+Add `--tests-failed`, `--fix-rounds <n>` or `--user-requested` when they apply.
+Review when `review` is `required`, when `gate_status` is not `complete`, when `orch gate`
+exits non-zero, or when there is no gate result at all. Only a complete `not_required`
+skips Codex; record `review: not_required`, never "passed". You may review more than the
+gate requires; never skip a required review.
 
-### Who implements
-
-Every model in the routing file carries an `executor`. Read it from the file; never
-infer it from the model's name.
-
-- **`opencode`** — delegate the implementation through the dispatcher.
-- **`claude`** — implement it yourself, with your own access. There is no dispatcher
-  call for the implementation step. The DIFFICULT tier and the Claude Opus escalation
-  rung are both `claude`. Claude Opus also carries a provider `id`; that id exists only
-  to pin the Debate Mode adviser, and does not make Opus delegable for implementation.
-
-Implementing directly is not a shortcut around the workflow. The preamble, the impact
-line, the Codex review, the bounded fix loop, and the commit rules all apply
-unchanged. The only difference is who writes the code.
-
-### Escalation ladder
-
-Escalation is deterministic and conservative. Escalate because of reasoning complexity,
-unexpected implementation difficulty, repeated implementation failure, high-risk business
-logic, or architectural ambiguity. **Do not escalate merely because a task is large.**
-
-Start at the lowest suitable tier and move up the `escalation_ladder` in the routing file
-one step at a time. Claude Opus becomes an implementation model only with a strong reason:
-multiple implementation agents failed, a highly sensitive architecture problem, high-risk
-data or security logic, or unresolved ambiguity that needs stronger judgment.
-
-### Kimi K3
-
-Not a default. Choose it only when a task genuinely benefits from large repository
-context, long-horizon reasoning, or broad codebase analysis. Not for routine
-implementation that the standard tier model handles.
-
-## Project context and impact
-
-The project's own AI context lives in its repository at `docs/ai-context/`. The rules for
-reading, creating, and maintaining it, and for impact analysis and test selection, are in:
+**Review** (in the background):
 
 ```text
-${CLAUDE_PLUGIN_ROOT}/skills/project-context/SKILL.md
+${CLAUDE_PLUGIN_ROOT}/scripts/delegate --agent codex --mode review --tier <TIER> --cwd <repo root> --files <changed files> <<'EOF'
+<the task in 2-4 lines; what changed and why>
+EOF
 ```
 
-Read that file when `context: absent` (it has to be bootstrapped) or when the task is
-NORMAL or DIFFICULT. On a FAST or SMALL task with context present, these four rules are
-enough:
+- `--test-results <file>`: output of tests you ran. Codex's sandbox cannot reach MariaDB,
+  Redis or a site, so DB-backed tests are yours to run, on the development site.
+- `PASS` → done. `FAIL` → send only the blocking findings to the implementer, then
+  re-review with `--previous-findings <workspace>/result.json`. Two fix rounds at most.
+- `BLOCKED` → read `blocker_reason` / `recovery`. `blocked_quota`, `blocked_reauth`,
+  `blocked_fix_model`: report `review: blocked (<reason>)` and do not retry.
+  `retry_once`: one retry, then report blocked. A blocked review is never a pass: the
+  task is unverified, and the report says so.
 
-1. Read the parts of `docs/ai-context/` that bear on the task. Do not re-scan the
-   repository because a task arrived; targeted reads follow from the context.
-2. Emit the impact line before delegating, on every tier:
-
-       Impact: <area> | affected: <direct> | risks: <what could regress> | verify: <checks>
-
-   On a FAST task it is one short line. It is still required — "too small to bother" is
-   not a decision available here.
-3. The repository overrides the context. Where a targeted read contradicts the context,
-   trust the code, then fix that context section.
-4. After the task passes, update context only if important project knowledge changed.
-   Most tasks change none.
-
-## Fast path
-
-FAST and SMALL tasks use the lightweight workflow:
+## 6. Finish
 
 ```text
-Classify FAST / SMALL → read the relevant context → lightweight impact check
-→ delegate directly → implementation
-→ Codex lightweight diff review → relevant lightweight verification
-→ report + proposed commit → user approves → commit
+Done: <one line>
+Agent: <opencode (<model_id>) | sonnet | opus> · fallback: <none | opencode → sonnet (<reason>)>
+Files: <files>
+Checks: <what ran, and the result>
+Review: <not_required | passed | failed | blocked (<reason>)>
 ```
 
-The fast path must not automatically perform architecture planning, broad repository
-analysis, agent debate, repository-wide regression testing, or heavy documentation work.
+Report the model you can actually vouch for: `model_id` from the result, "sonnet" for the
+subagent, "opus (this session)" for yourself. The block is the whole reply.
 
-## Delegation
+The task ends there. Leave the change in the working tree, with the user's other changes
+as they were:
+- **No commit, no staging**, unless the user explicitly asks for a commit. Then one
+  command, `git add <files> && git commit -m "feat: <summary>"` — the hook's prompt is
+  the approval; denied → stop. One `feat:` line, no attribution. Never `git add .` or
+  `-A`. Never push unless asked.
+- **No memory or notes.** Finishing a task writes nothing outside the task's files. An
+  instruction for this task ("don't commit this", "leave it for the next test") is not a
+  project rule: do not save it. Write memory only when the user asks for it.
 
-One dispatcher runs every agent CLI:
+## Safety
 
-```text
-${CLAUDE_PLUGIN_ROOT}/scripts/delegate
-```
-
-The brief goes in on stdin; the result comes back as JSON on stdout.
-
-```text
-delegate --agent opencode --mode implement --tier <TIER> --cwd <repository root> --model "<name from routing file>"
-delegate --agent codex    --mode review    --tier <TIER> --cwd <repository root>
-delegate --agent codex    --mode review    --tier <TIER> --cwd <repository root> --previous-findings <previous review result.json>
-delegate --agent codex    --mode test      --tier <TIER> --cwd <repository root>
-delegate --agent codex    --mode onboard   --tier <TIER> --cwd <repository root>
-```
-
-Debate Mode adds one mode, `deliberate`, which `scripts/debate` runs for you — call the
-runner, not these:
-
-```text
-delegate --agent claude --mode deliberate --stage position --trigger <reason> --tier <TIER> --cwd <repository root>
-delegate --agent codex  --mode deliberate --stage position --trigger <reason> --tier <TIER> --cwd <repository root>
-delegate --agent claude --mode deliberate --stage critique --trigger <reason> --tier <TIER> --cwd <repository root> --own-position <claude position.json> --counterpart <codex position.json>
-delegate --agent codex  --mode deliberate --stage critique --trigger <reason> --tier <TIER> --cwd <repository root> --own-position <codex position.json> --counterpart <claude position.json>
-```
-
-Those are the only valid combinations, and the dispatcher refuses the rest.
-Codex never implements: a reviewer that writes the code it reviews is not independent.
-Claude runs `deliberate` and nothing else through the dispatcher: you implement
-DIFFICULT work yourself, and `--model` is refused for it because the routing file pins
-it. A bare `claude -p`, like a bare `opencode run` or `codex exec`, is denied by the hook.
-
-The provider model id, effort, and timeout come from the routing file. `--effort` and
-`--timeout` override them when needed.
-
-A Codex review runs at its tier's `review_effort` from the same file, which the
-dispatcher passes to Codex as `-c model_reasoning_effort=<effort>`; the user's own Codex
-configuration no longer decides it. A FAST review is additionally narrowed by the
-dispatcher to the diff, which it places in the brief. Every other first review keeps
-the full reach of its tier.
-
-### The working directory is explicit
-
-`--cwd` is required on every delegated run, and it is the repository root. There is no
-default and nothing is inherited. The dispatcher exits 2 if it is missing, if the path is
-not a git work tree, or if it is a subdirectory of one rather than the root — a
-subdirectory is refused rather than resolved upward, and the error names the root.
-
-This is not pedantry about a flag. A delegated agent does not necessarily work in the
-directory this process is in, so an unstated directory is not "here" — it is whichever
-directory happened to be current, and a run can edit one repository while its result
-describes another. Naming the wrong repository on purpose is still possible; choosing one
-by accident is what this removes.
-
-When you report a delegated run, state the directory the result came back with, verbatim:
-
-    Delegated: <agent> <mode> | tier: <TIER> | cwd: <resolved path from the result>
-
-Take it from the result's `cwd`, not from what you passed in — those are the same thing
-only when nothing went wrong, and the point of stating it is the case where something
-did.
-
-NORMAL and DIFFICULT timeouts are longer than a foreground command may run, so start
-those in the background and collect the result when it finishes. The dispatcher prints
-its workspace path to stderr immediately, so a run that is cut off short is still
-recoverable there.
-
-### One mode per use
-
-Each mode carries its own result contract, and the contract is what the agent is forced
-to produce. A run therefore uses the mode that matches what it is actually for.
-
-**Never route a non-review use through `review`.** Review's contract requires
-PASS/FAIL/BLOCKED, so an analysis run in review mode returns a verdict it had no basis
-for — an artefact of the contract rather than a judgement. That is worse than no verdict:
-where the orchestrator reads it, a false FAIL is indistinguishable from a real one.
-
-Only `review` and `test` produce a verdict. `implement`, `onboard` and `deliberate` have
-no verdict field at all, and the dispatcher removes one from the report if the agent
-volunteers it, naming what it removed in `off_contract_keys`. Do not supply the missing verdict
-yourself: an onboarding analysis that produced findings is not a FAIL, and one that
-produced none is not a PASS. It either produced findings or it did not.
-
-If a use of a delegated agent appears that is not one of these five, it needs its own
-mode and its own contract in the dispatcher. Until it has one, do that work directly or
-stop and ask — do not borrow another mode's contract to get the run out the door.
-
-### Briefs
-
-Send a concise, self-contained brief: the goal, the required behaviour, relevant
-constraints, files or areas already known to be relevant, what must not change, and the
-verification expectations. Carry over the affected area, its direct dependencies, and
-the known regression risks from the impact analysis.
-
-Do not read repository files and copy their contents into the brief. Agents read the
-repository directly. Large source dumps are only acceptable when there is genuinely no
-other way.
-
-The dispatcher appends the output contract itself. Do not write one.
-
-### Reading the result
-
-Top-level fields are what the dispatcher observed. `agent_report` is what the agent
-claimed. Keep the two apart.
-
-- `status` — whether the CLI run finished: `completed`, `failed`, `timeout`,
-  `cli_missing`, `error`. `completed` means the process exited cleanly and nothing more.
-- `result_block` — `missing` or `invalid` means the agent returned no usable report.
-  Read the file at `transcript` before concluding anything.
-- `cwd` — the absolute, symlink-resolved repository root the run was given. This is the
-  directory the run worked in, and it is what you quote when reporting the run.
-- `off_contract_keys` — verdict keys the agent volunteered in a mode that has none, and
-  which were removed. Non-empty means the agent answered a contract it was not given;
-  the rest of its report still stands, but do not go looking for the removed value.
-- `agent_report` — the agent's own account of its work. **An implementation agent's
-  self-report is never verification.** Only the actual diff and an independent review
-  are.
-- `verdict` — in `review` and `test`, the verdict to act on. The dispatcher derives it
-  from the findings: FAIL when at least one finding is blocking, and never otherwise.
-  Where it differs from the verdict in `agent_report`, `verdict_note` says why. Read this
-  field, not `agent_report.verdict`. `finding_counts` gives the blocking and
-  non-blocking totals.
-
-## The actual diff is authoritative
-
-After any implementation, delegated or your own, inspect the real repository state with
-`git status` and `git diff`, or appropriately scoped equivalents.
-
-Compare four things: the original task, the preliminary impact analysis, the
-implementation result, and the actual diff. Where the summary and the diff disagree, the
-diff is what happened.
-
-## Environment operations
-
-Some projects need local environment commands to run after implementation before a
-review means anything. In a Frappe/ERPNext repository these are the bench operations the
-change actually requires, and which ones those are is decided in:
-
-```text
-${CLAUDE_PLUGIN_ROOT}/skills/frappe-operations/SKILL.md
-```
-
-Read it before running any bench command. Four rules hold even when it is not read:
-
-1. The default is no operation. Run what this change requires, never the four by reflex —
-   and run it yourself once implementation is done, without asking first.
-2. A site-dependent command names its site with `--site`, and that site is the
-   development site `OPERATIONS.md` or the user named for this task. A development site
-   is one whose name ends in `.local`. An unnamed site is not no site — bench resolves
-   one from configuration.
-3. Run them yourself, as local commands. A Frappe operation is never delegated and never
-   goes in a brief: the hook does not see a delegated agent's shell, and no delegated
-   containment decides which site an operation should touch.
-4. If any operation changed the working tree, inspect the diff again before delegating
-   the review.
-
-## Review outcome
-
-These three states belong to `review` and `test`. No other mode produces them, and none
-is ever inferred for a mode whose contract has no verdict.
-
-Codex returns exactly one of three states.
-
-- **PASS** — requested behaviour implemented, no blocking regression, required tests and
-  relevant quality gates pass, diff within scope. Continue to the context check, cleanup,
-  and the commit proposal.
-- **FAIL** — a blocking correctness problem. Send the blocking findings to the
-  implementer and enter the fix loop.
-- **BLOCKED** — verification could not be completed reliably. This is not an
-  implementation failure and does not consume an attempt on its own.
-
-Findings are `blocking` or `non_blocking`. Only blocking findings trigger another
-attempt, and a review whose findings are all non-blocking is a PASS. The dispatcher
-enforces both directions in its top-level `verdict`; a finding without a category counts
-as blocking. Surface non-blocking ones when useful, but never expand the task merely to
-clear them.
-
-### Handling BLOCKED
-
-Decide which kind of blocker it is.
-
-- **Safe and local** — a dependency to install in the project, a local test service to
-  start, generated files to rebuild, a local command that failed for an environment
-  reason. Resolve it inside the autonomy boundary, then retry verification.
-- **Unsafe or external** — a remote server, a destructive database change, production
-  access, missing credentials, an ambiguous external service. Stop and ask the user.
-
-A `timeout` is a blocker, not a verdict on the code. Retry, escalate, or stop based on
-context; do not record it as a failed attempt.
-
-## Tests
-
-Verification scope follows the impact, not the tier alone: the smallest set of checks
-that gives reasonable confidence. FAST is a diff review plus one relevant check; SMALL
-adds the affected tests; NORMAL adds targeted tests and the relevant lint, type, and
-build checks; DIFFICULT may add integration and full-module tests. The full suite still
-requires a stated reason.
-
-Codex REVIEW runs the tests that already exist. Use `--mode test` only when meaningful
-coverage is genuinely missing, not for every small task. In that mode Codex may write and
-modify tests, never production code.
-
-Decide which new tests survive:
-
-- **Durable** — reproduces a fixed bug, protects important business logic, verifies newly
-  introduced behaviour, protects an integration contract, or covers a previously missing
-  high-risk scenario. It stays, and is committed with the task.
-- **Temporary** — a reproduction script, a debug assertion, a one-off diagnostic. It is
-  removed before the commit.
-
-Codex does not decide persistence on its own.
-
-## Implementation / review loop
-
-Never run an unlimited autonomous loop. **Maximum three implementation attempts.**
-
-1. **Attempt 1** — implementation agent, then Codex review.
-2. **Attempt 2** — if Codex found blocking issues, the *same* implementation agent fixes
-   them, then Codex re-reviews. The second brief carries only the new findings and the
-   context needed for them; do not resend the full original task.
-3. **Attempt 3** — if the second attempt still fails, move one step up the escalation
-   ladder and let the escalated model fix or reimplement, then Codex reviews. If that
-   rung's executor is `claude`, the attempt is yours to implement directly.
-
-After every fix, Codex reviews again against the *current* actual diff, not the previous
-one. That re-review passes `--previous-findings` with the `result.json` of the review
-that failed (it is in that run's `workspace`). The dispatcher then puts those blocking
-findings and the current diff in the brief and scopes the run to two questions: is each
-finding resolved, and did the fix break anything it touched. The re-review brief carries
-the task in a few lines and what the fix changed; do not restate the findings, and do not
-ask for a full review again unless the fix reached well beyond them.
-
-### Stop condition
-
-If the third attempt still fails, stop. No fourth automatic attempt. Return to the user
-with the current blocker, the Codex findings, the attempts already made, the likely root
-cause, and a recommended next action.
+- The hook enforces the boundaries in `${CLAUDE_PLUGIN_ROOT}/docs/reference/safety.md`. A
+  prompt or a deny is not something to rephrase around.
+- Sites: only the development site from `docs/ai-context/OPERATIONS.md` or
+  `orch sites list`. Never guess, never `--site all`, never loop over sites. A `.local`
+  name proves nothing — some hold restored client data.
+- Never deploy, never touch production or a remote host, never run destructive git or
+  database operations or migrations that drop data without the user.
+- Unsure whether something crosses a boundary: stop and ask.
 
 ## Debate Mode
 
-Debate Mode puts two independent architectural advisers — Claude Opus and Codex — in
-front of a hard design question **before** implementation, and then you decide. It is an
-exception, not a workflow stage: most DIFFICULT tasks never use it.
+Only when the user asks, or on a DIFFICULT task with a genuine architectural fork — and
+tell the user first, it costs 10–20 minutes. Never for FAST, SMALL or NORMAL work. Runner
+and rules: `${CLAUDE_PLUGIN_ROOT}/docs/reference/debate.md`.
 
-```text
-DIFFICULT + architectural trigger  (or an explicit user request)
-   ↓
-Stage 1  Opus position   ‖  Codex position     same brief, neither sees the other
-   ↓
-Stage 2  Opus critiques Codex  ‖  Codex critiques Opus     one round, no third
-   ↓
-You synthesize the decision  →  synthesis.md
-   ↓
-The existing implementation workflow, then the existing fresh Codex review
-```
+## Other dispatcher modes
 
-### When it runs
-
-Automatically only when **both** hold:
-
-1. the tier is one of `deliberation.trigger_tiers` in the routing file — DIFFICULT; and
-2. one of `deliberation.triggers` genuinely applies:
-   - `architectural-ambiguity` — the right structure is not settled by the request,
-     the context, or the code;
-   - `competing-approaches` — two or more materially different viable approaches with
-     real trade-offs;
-   - `high-risk-decision` — an architecture or design choice that is expensive to
-     reverse, or carries security, permission, data-integrity or migration risk.
-
-Typical cases: permission architecture, data model design, migration strategy,
-integration architecture, security-sensitive architecture, a major refactor strategy.
-
-**Difficulty alone is never a trigger.** Do not debate difficult debugging with one clear
-approach, a large but straightforward implementation, a mechanical migration, normal
-CRUD, UI changes, or ordinary validation logic — whatever their tier. FAST, SMALL and
-NORMAL never trigger it automatically, and the dispatcher refuses an automatic trigger
-on them.
-
-The user can ask for a debate explicitly. That is `deliberation.user_trigger`
-(`user-request`), honoured on any tier while `deliberation.enabled` is true. A request
-for "a second opinion" on the code that already exists is a review, not a debate.
-
-### Running it
-
-```text
-${CLAUDE_PLUGIN_ROOT}/scripts/debate --tier <TIER> --trigger <reason> --cwd <repository root>
-```
-
-The brief goes in on stdin. It is the same short brief for both advisers: the task goal,
-the affected area, the relevant constraints, the known risks, and **the architectural
-question being decided**, stated as a question. Do not paste source files; the advisers
-read the working tree. Do not include your own preferred answer — that is what the
-advisers are independent of.
-
-Before starting it, emit:
-
-    Debate: enabled | reason: <trigger> | participants: <deliberation.claude_model> + Codex
-
-The model name comes from the routing file, like the preamble's. A debate takes two
-stages of up to `deliberation.timeout_seconds` each, so start it in the background and
-collect the result, as for any long delegated run. Its directory is printed to stderr at
-once.
-
-### What the runner and the dispatcher enforce
-
-- **The Opus side is Opus.** The dispatcher runs `claude -p --model <id>` with the id
-  from the routing file, and reads back the run's own usage report. `model_verified` is
-  true only when that id produced the answer and nothing but Claude Code's housekeeping
-  model (`deliberation.claude_auxiliary_model_prefixes`) appears beside it.
-- **Read-only.** The Claude adviser has Read, Grep and Glob and no other tool — no shell,
-  no edit, no write, no MCP server, no skills — with every other tool denied rather than
-  asked about, and the target repository's own Claude settings ignored. The Codex
-  adviser runs in Codex's `read-only` sandbox, the same one review and onboard use.
-  Neither can edit, stage, commit, push, run bench, or reach a database.
-- **Independence.** A position run accepts no other answer. Both positions run in
-  parallel from the one brief, and the dispatcher records its digest.
-- **Two stages, no more.** A critique accepts only two usable stage-one positions answered
-  from that same brief — its own and the other adviser's. Nothing accepts a critique as
-  input, so a third round cannot be assembled.
-- **The contract.** `deliberate` has no verdict. A volunteered verdict, `winner` or
-  `final_decision` is removed and named in `off_contract_keys`. A run is `usable` only
-  when it completed, returned the requested stage with every required field, and — for
-  Claude — passed model verification. `unusable_reasons` says why it is not.
-
-### Reading the result
-
-`status` is `complete` only when all four runs were usable. Then `positions` and
-`critiques` hold the advisers' reports, and `participants` records which model each
-side ran on.
-
-`incomplete` means there was no debate. Each entry in `failures` names the adviser, the
-stage, and why. If a position failed, the critique stage did not run. Either way, the
-result carries no positions to build on: **one adviser's answer is not a debate and is
-never presented as one.** Do not fabricate the missing side, do not re-run it in a loop,
-and do not rerun the debate automatically. Emit:
-
-    Debate: incomplete | <adviser> <stage>: <reason>
-
-Then decide as you would without Debate Mode, if you can do so safely under the existing
-workflow. If the question is too ambiguous or too risky to decide alone, stop and put it
-to the user.
-
-### Synthesis
-
-You make the decision, not either adviser. Write it to the `synthesis` path the result
-names (in the debate directory, outside the repository):
-
-```text
-Debate decision
-- Selected approach
-- Why it was selected
-- Points incorporated from the Opus adviser
-- Points incorporated from the Codex adviser
-- Rejected alternatives, and why
-- Remaining risks
-- Implementation constraints
-- Verification expectations
-```
-
-Then emit one line, and keep the transcript out of the conversation unless the user
-asks for it:
-
-    Debate: complete | decision: <one-line summary>
-
-The synthesis is the architectural part of the implementation brief. Implementation
-then proceeds exactly as it would have — same tier, same executor, same review loop.
-
-### What Debate Mode does not change
-
-- It does not implement. Neither adviser writes code; the existing workflow does.
-- It is not a review, and never counts as one. The post-implementation Codex review is a
-  fresh `review` run on the actual diff, exactly as for any other task. Do not pass the
-  debate transcript or the synthesis to the reviewer: it judges the task, the diff, the
-  repository and the tests, not whether its own earlier proposal was followed.
-- It is not an escalation rung. A failed implementation goes up the escalation ladder,
-  not back into a debate.
-
-## Disagreement with a review
-
-When you and Codex reach materially different conclusions about a review finding, hold
-**at most one automatic round** — against the findings Codex already returned, which are
-its position on the record. Do not delegate a fresh turn for it, and do not run it as a
-review or as a debate. If the disagreement survives that round, stop, summarize both
-positions, and let the user decide. Never do this on FAST or SMALL tasks, for ordinary
-review findings, or for ordinary implementation failures.
-
-## Git safety
-
-Inspect `git status` before starting implementation.
-
-- **Clean working tree** — proceed automatically.
-- **Dirty, safe to continue** — the changes are unstaged or untracked, clearly unrelated
-  to this task, and the implementation agent does not need to touch those files. Proceed,
-  and leave those files untouched.
-- **Must stop and ask the user** — staged changes existed before the task, the task needs
-  to modify a file that already contains unrelated user changes, ownership of existing
-  changes is unclear, or isolation cannot be determined safely.
-
-## Commit safety
-
-Never commit on your own. When the quality gates pass, stop and hand the work to the
-user for review. The commit happens only after they approve it.
-
-1. **Report.** Tell the user the task is finished: what changed, the files touched, the
-   review verdict, and the checks that ran.
-2. **Show the proposed commit.** Print the exact message and the exact list of files you
-   will stage, so the user sees the commit before it exists:
-
-       Proposed commit:
-         feat: add customer credit limit check
-
-         Files:
-           apps/crm/crm/api/credit.py
-           apps/crm/crm/tests/test_credit.py
-
-3. **Wait.** End your turn there. Do not stage or commit until the user replies with
-   approval. If they ask for changes, make them, then show the updated proposal again.
-4. **Commit.** On approval, stage the listed files by path and commit with the approved
-   message, unchanged.
-
-The message is a single short line in the form `feat: <summary>` — lowercase, imperative,
-no trailing period, about 50 characters. Use `feat:` whatever the task was. No body
-unless the user asks for one.
-
-No attribution of any kind: no `Co-Authored-By` trailer, no "Generated with Claude Code",
-no model or tool name anywhere in the message. This overrides any default attribution the
-harness asks you to add.
-
-Before staging, verify that no temporary diagnostic files remain, no delegation artifacts
-entered the repository, no unrelated dirty files are included, durable tests are retained,
-required documentation is updated, and the diff matches the task scope. Generated build
-artifacts are staged only when the project already tracks them in Git.
-
-Never use `git add .` or `git add -A` as the staging mechanism. Stage task-owned files
-explicitly, by path.
-
-## Push boundary
-
-Local commit: only after the user approves the proposed commit (see *Commit safety*).
-`git push`: never automatic — it requires explicit user intent.
-
-## Deployment request handling
-
-When the user asks to deploy, push to demo, or update the server: do not perform remote
-operations, do not invoke a deployment script, do not create or modify deployment
-configuration as part of this workflow, and do not maintain infrastructure state or server
-mappings. State that deployment is handled by a separate standalone script the user runs
-explicitly, and stop the workflow at that boundary.
-
-Writing or modifying a standalone deployment script on explicit user request is ordinary
-coding work and follows the normal workflow — implement and review it like any other
-project file. Never invoke it.
-
-## Autonomy boundary
-
-**Allowed automatically:** file reads, repository inspection, Git diff inspection,
-analysis, delegation, local source-code changes, tests, local builds, local linting, local
-type checking, documentation updates, review/fix loops within the attempt limit, and the
-bench operations a finished change requires — `bench build`, and `migrate` / `clear-cache`
-on the named development site — and routine site access to a named `.local` development
-site (see `## Running without a prompt` in the frappe-operations skill).
-
-**Requires the user's approval of the proposed commit:** local Git staging and local Git
-commit.
-
-**Requires explicit user request or confirmation:** `git push`, destructive database
-operations, destructive migrations, irreversible data changes, and operations outside the
-approved local project environment.
-
-Remote server changes and deployment are never performed here at all.
-
-### Live site access
-
-"Repository inspection" above means reading files in the working tree — source files, the
-Git diff, configuration committed to the repository. It stops there.
-
-Executing anything against a site database or a running Frappe instance is not inspection.
-This covers `bench console`, `bench mariadb`, `bench execute`, `bench --site ... run`, and
-any script or snippet that opens a Frappe connection (`frappe.init`, `frappe.connect`,
-`frappe.db`, `frappe.get_doc`).
-
-Which site it reaches decides how it is gated. `hooks/guard.py` enforces this:
-
-```text
-explicit *.local site       development  →  routine access runs without a prompt
-explicit other site         protected    →  asks the first time in a Claude Code session;
-                                             once approved and run, routine access to that
-                                             exact site runs without a prompt until the
-                                             session ends
-no site, --site all, more
-than one site, or one the
-hook cannot read            protected    →  asks, every time
-destructive operation       —            →  the stronger rule wins: it asks (or denies) on
-                                             every site, development and approved alike
-```
-
-A session approval is recorded only after the approved command has actually run. An ask
-the user rejected approves nothing, and a new Claude Code session starts with no
-approvals.
-
-Such execution, whatever the hook allows:
-
-- needs a reason in the task. On the task's development site, querying a site is part of
-  the work and needs no separate request. On a protected site it requires an explicit
-  user request — never a step you chose to take on your own — and an approval earlier in
-  the session is not that request. `bench --site <site> migrate` and `clear-cache` on the
-  resolved development site run without asking when the finished change requires them;
-- is limited to the single site the user or `OPERATIONS.md` named; if no site was named,
-  ask;
-- is never fanned out across sites, and never repeated site by site to hunt for
-  something.
-
-Reading a DocType's definition means reading its JSON in the working tree, not querying a
-site.
-
-When unsure whether an action crosses the safety boundary: **stop instead of guessing.**
+`test` (Codex writes tests), `onboard` (read-only analysis for `docs/ai-context/`) and
+`deliberate` (run by `scripts/debate`) are for when the user asks; every combination is in
+`${CLAUDE_PLUGIN_ROOT}/docs/reference/orchestration.md`.

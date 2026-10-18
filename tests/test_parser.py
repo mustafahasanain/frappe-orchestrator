@@ -75,6 +75,12 @@ def fixture(name):
 
 
 d = load_dispatcher()
+# The hook relaxes site access only for sites the user listed. The suite lists its own,
+# in a scratch config dir that every hook process started below inherits.
+SITES_CONFIG = tempfile.mkdtemp(prefix="orch-test-config-")
+Path(SITES_CONFIG, "sites.json").write_text(json.dumps({"development": ["dev.local"]}))
+os.environ["FRAPPE_ORCHESTRATOR_CONFIG"] = SITES_CONFIG
+
 g = load_module(ROOT / "hooks" / "guard.py", "guard")
 BOUNDARIES = json.loads((ROOT / "config" / "command-boundaries.json").read_text())
 BOUNDARY_FILE = ROOT / "config" / "command-boundaries.json"
@@ -1088,6 +1094,10 @@ def check_agent_path_record(tmp):
     env = dict(os.environ)
     env["PATH"] = "%s:/usr/bin:/bin" % bin_dir
     env["TMPDIR"] = str(work)   # so the run's workspace is cleaned up with the test
+    env["FRAPPE_ORCHESTRATOR_STATE"] = str(work / "state")
+    env["FRAPPE_ORCHESTRATOR_CONFIG"] = str(work / "config")
+    env["FRAPPE_ORCHESTRATOR_CATALOG"] = "off"
+    env["CODEX_HOME"] = str(work / "codex")
     proc = subprocess.run(
         [sys.executable, str(ROOT / "scripts" / "delegate"),
          "--agent", "opencode", "--mode", "implement", "--tier", "FAST",
@@ -1206,8 +1216,11 @@ def check_dispatcher_invocation():
                 % (option, sorted(listed), sorted(accepted))
             )
 
-    # --- the orchestration skill's delegation block ------------------------
-    skill = (ROOT / "skills" / "orchestration" / "SKILL.md").read_text()
+    # --- the documented delegation block --------------------------------------
+    # The full list lives in the reference doc (kept out of the skill's per-task context);
+    # the skill's own invocations are checked too.
+    skill = (ROOT / "skills" / "orchestration" / "SKILL.md").read_text() + "\n" + (
+        ROOT / "docs" / "reference" / "orchestration.md").read_text()
     documented = set()
     lines = [line.strip() for line in skill.splitlines()
              if line.strip().startswith("delegate --")]
@@ -1690,7 +1703,7 @@ def check_boundary_config_faults(tmp):
 # and `decide` resolves it as a global at call time, so the copy faults exactly where a
 # real engine fault would.
 INJECT_FAULT = (
-    'def check(segment):   # noqa: F811 - injected fault\n'
+    'def evaluate(segment):   # noqa: F811 - injected fault\n'
     '    raise RuntimeError("injected: rule engine fault")\n'
     '\n'
     '\n'
@@ -1765,7 +1778,7 @@ def check_internal_failure_is_fail_closed(tmp):
         )
 
     # --- in process, so the emitted reason can be inspected directly ---------
-    original = g.check
+    original = g.evaluate
 
     def exploding(_segment):
         raise RuntimeError("injected: rule engine fault")
@@ -1773,7 +1786,7 @@ def check_internal_failure_is_fail_closed(tmp):
     captured = io.StringIO()
     stdin, stdout, stderr = sys.stdin, sys.stdout, sys.stderr
     status = None
-    g.check = exploding
+    g.evaluate = exploding
     try:
         sys.stdin = io.StringIO(payload("ls -la"))
         sys.stdout = captured
@@ -1789,7 +1802,7 @@ def check_internal_failure_is_fail_closed(tmp):
         )
     finally:
         sys.stdin, sys.stdout, sys.stderr = stdin, stdout, stderr
-        g.check = original
+        g.evaluate = original
 
     if status != g.BLOCKED_EXIT:
         problems.append("main() exited %r on an internal failure, wanted %r"
@@ -1986,13 +1999,9 @@ PREAMBLE = "stub-said-this-before-hanging"
 
 
 def delegable_model():
-    """A model the routing file marks as delegated to OpenCode, or None."""
+    """The OpenCode model the routing file delegates implementation to."""
     routing = json.loads((ROOT / "config" / "model-routing.json").read_text())
-    return next(
-        (name for name, entry in routing["models"].items()
-         if entry.get("executor") == "opencode" and entry.get("id")),
-        None,
-    )
+    return routing["implementers"]["opencode"]["stable_model"]
 
 
 def reap_leaked_session(session_file, problems, label):
@@ -2067,6 +2076,10 @@ def stub_run(case, tmp, *, body, agent="opencode", mode="implement", timeout="1"
     env = dict(os.environ)
     env["PATH"] = "%s:/usr/bin:/bin" % bin_dir
     env["TMPDIR"] = str(work)       # so each run's workspace goes with the test
+    env["FRAPPE_ORCHESTRATOR_STATE"] = str(work / "state")
+    env["FRAPPE_ORCHESTRATOR_CONFIG"] = str(work / "config")
+    env["FRAPPE_ORCHESTRATOR_CATALOG"] = "off"
+    env["CODEX_HOME"] = str(work / "codex")
     env.update(env_extra or {})
     argv = [sys.executable, str(ROOT / "scripts" / "delegate"),
             "--agent", agent, "--mode", mode, "--tier", "FAST",
@@ -2907,14 +2920,14 @@ def check_group_isolation():
 # --------------------------------------------------------------------------
 
 EXPECTED_REVIEW_EFFORT = {
-    "FAST": "low", "SMALL": "medium", "NORMAL": "medium", "DIFFICULT": "high",
+    "FAST": "medium", "SMALL": "medium", "NORMAL": "medium", "DIFFICULT": "high",
 }
 
 
 def check_codex_effort():
     problems = []
     routing = json.loads((ROOT / "config" / "model-routing.json").read_text())
-    tiers = routing["tiers"]
+    tiers = routing["review"]["tiers"]
     if set(tiers) != set(EXPECTED_REVIEW_EFFORT):
         problems.append("tiers %s, expected %s" % (sorted(tiers), sorted(EXPECTED_REVIEW_EFFORT)))
 
@@ -2933,35 +2946,37 @@ def check_codex_effort():
             problems.append("%s: the effort is not passed through -c" % name)
         if argv[-1] != "-" or stdin != "b":
             problems.append("%s: the brief is no longer delivered on stdin" % name)
+        if "--ephemeral" not in argv:
+            problems.append("%s: delegated codex runs must be --ephemeral" % name)
 
-    # Refused, never a command with a bad or missing value in it. Each of these would
-    # otherwise reach Codex as an argument it rejects, or be dropped and leave the run at
-    # the CLI's own default - the behaviour being replaced.
+    # Refused, never a command with a bad or missing value in it.
     for label, tier in (
         ("missing", {"timeout_seconds": 1}),
-        ("misspelt", {"review_effort": "hgih"}),
-        ("empty", {"review_effort": ""}),
-        ("not a string", {"review_effort": 3}),
-        ("null", {"review_effort": None}),
+        ("misspelt", {"effort": "hgih"}),
+        ("empty", {"effort": ""}),
+        ("not a string", {"effort": 3}),
+        ("null", {"effort": None}),
     ):
         try:
             got = d.resolve_codex_effort("review", "FAST", tier, None, refuse)
         except Refused:
             continue
-        problems.append("a %s review_effort resolved to %r instead of being refused" % (label, got))
+        problems.append("a %s review effort resolved to %r instead of being refused" % (label, got))
     try:
-        d.resolve_codex_effort("review", "FAST", {"review_effort": "low"}, "loud", refuse)
+        d.resolve_codex_effort("review", "FAST", {"effort": "low"}, "loud", refuse)
         problems.append("an invalid --effort for codex was accepted")
     except Refused:
         pass
 
-    # --effort overrides; an empty one omits -c entirely, as it omits --variant.
+    # --effort overrides; an empty one omits -c entirely. Onboard defaults to medium, so it
+    # no longer inherits a config.toml default of high.
     cases = (
-        ("review", {"review_effort": "low"}, "high", "high"),
-        ("review", {"review_effort": "low"}, "", None),
-        ("test", {"review_effort": "low"}, None, None),
-        ("onboard", {"review_effort": "low"}, None, None),
-        ("test", {"review_effort": "low"}, "medium", "medium"),
+        ("review", {"effort": "low"}, "high", "high"),
+        ("review", {"effort": "low"}, "", None),
+        ("test", {"effort": "low"}, None, "low"),
+        ("onboard", {"effort": "low"}, None, "medium"),
+        ("test", {"effort": "low"}, "medium", "medium"),
+        ("deliberate", {"effort": "low"}, None, None),
     )
     for mode, tier, override, want in cases:
         got = d.resolve_codex_effort(mode, "FAST", tier, override, refuse)
@@ -2970,6 +2985,10 @@ def check_codex_effort():
     argv, _env, _stdin = d.adapt_codex(brief="b", mode="test", cwd="/probe")
     if "-c" in argv:
         problems.append("codex without an effort still passes -c: %r" % argv)
+    argv, _env, _stdin = d.adapt_codex(brief="b", mode="review", cwd="/probe", model_id="m1",
+                                       last_message="/w/last.txt")
+    if argv[argv.index("-m") + 1] != "m1" or argv[argv.index("-o") + 1] != "/w/last.txt":
+        problems.append("a pinned codex model or last-message path is not passed: %r" % argv)
     return problems
 
 
@@ -3087,6 +3106,10 @@ def check_review_briefs(tmp):
     env = dict(os.environ)
     env["PATH"] = "%s:%s" % (bin_dir, env.get("PATH", "/usr/bin:/bin"))
     env["TMPDIR"] = str(work)
+    env["FRAPPE_ORCHESTRATOR_STATE"] = str(work / "state")
+    env["FRAPPE_ORCHESTRATOR_CONFIG"] = str(work / "config")
+    env["FRAPPE_ORCHESTRATOR_CATALOG"] = "off"
+    env["CODEX_HOME"] = str(work / "codex")
     env["RECORD_DIR"] = str(record)
 
     def review(tier, report, *extra):
@@ -3106,31 +3129,42 @@ def check_review_briefs(tmp):
     changed_line = "+    return a + b"
     blocking = {"category": "blocking", "file": "app.py", "detail": "SENTINEL-FINDING"}
 
-    # FAST first review: low effort, lightweight scope, the diff in the brief.
+    # FAST first review: the tier's effort, the change-scoped review, the diff in the brief.
     result, argv, brief = review("FAST", {"verdict": "FAIL", "summary": "s", "findings": [blocking]})
     if result is not None:
-        if "model_reasoning_effort=low" not in argv:
-            problems.append("FAST review argv has no low effort: %r" % argv)
-        if "Review scope: lightweight" not in brief:
-            problems.append("FAST review brief has no lightweight scope")
+        if "model_reasoning_effort=medium" not in argv:
+            problems.append("FAST review argv has no medium effort: %r" % argv)
+        if "Review scope: the change" not in brief:
+            problems.append("FAST review brief has no change scope")
         if changed_line not in brief:
             problems.append("FAST review brief does not carry the diff")
         if "new_module.py" not in brief:
             problems.append("FAST review brief does not list the untracked file")
+        if "Tests the orchestrator ran\n\nNone." not in brief:
+            problems.append("a review without test results does not say none were run")
         if result.get("verdict") != "FAIL":
             problems.append("a blocking finding gave verdict %r" % result.get("verdict"))
+        if result.get("review_status") != "failed":
+            problems.append("a FAIL gave review_status %r" % result.get("review_status"))
         if brief.index("Review scope") > brief.index("## Requested output"):
             problems.append("the review scope comes after the output contract")
     first = result
 
-    # SMALL first review: medium effort, the tier's full review, no narrowing.
+    # SMALL first review: also scoped to the change; --files narrows the embedded diff, and
+    # the orchestrator's own test output is carried into the brief.
+    (work / "tests.txt").write_text("Ran 3 tests in 0.4s\nOK SENTINEL-TESTS\n")
     result, argv, brief = review("SMALL", {"verdict": "FAIL", "summary": "s", "findings": [
-        {"category": "non_blocking", "file": "app.py", "detail": "rename a"}]})
+        {"category": "non_blocking", "file": "app.py", "detail": "rename a"}]},
+        "--files", "app.py", "--test-results", str(work / "tests.txt"))
     if result is not None:
         if "model_reasoning_effort=medium" not in argv:
             problems.append("SMALL review argv has no medium effort: %r" % argv)
-        if "Review scope" in brief or changed_line in brief:
-            problems.append("SMALL first review was narrowed")
+        if "Review scope: the change" not in brief or changed_line not in brief:
+            problems.append("SMALL first review was not scoped to the diff")
+        if "new_module.py" in brief:
+            problems.append("--files did not narrow the diff")
+        if "SENTINEL-TESTS" not in brief or not result.get("test_results_supplied"):
+            problems.append("--test-results did not reach the brief")
         if "Fix total() so it adds." not in brief:
             problems.append("SMALL review brief lost the orchestrator's task context")
         if result.get("verdict") != "PASS" or not result.get("verdict_note"):

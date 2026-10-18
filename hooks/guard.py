@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
-"""PreToolUse guard: deny blanket staging and bare agent runs, ask before pushes and
-live-site execution, and let the routine end-of-task bench operations run unprompted.
+"""PreToolUse guard: deny blanket staging and bare agent runs, ask before pushes, commits,
+destructive operations and access to sites nobody authorised, and let routine work run.
 
-Reads a PreToolUse payload on stdin. Prints a JSON permission decision when a rule
-matches, and prints nothing otherwise. A payload carrying no Bash command is allowed -
-there is nothing there to decide about. A failure *inside* this hook is not allowed
-through. Once a command has been extracted, a fault in this hook blocks it: Claude Code
-treats a crashed hook as a *non-blocking* error and runs the command anyway, so a
-traceback here would authorise exactly what the hook failed to look at.
+Bash payloads: the command is lexed the way a shell reads it - separators inside quotes
+are text, a heredoc body is input to the program that opened it, and only bodies that
+reach a shell or an interpreter are matched as code (audit BUG-05: briefs, grep
+patterns and file-writing heredocs used to raise prompts). Wrappers are peeled (`env`,
+`sudo`, `nohup`, `timeout`, `xargs`, `bash -c`, `eval`, `$(...)`), so they no longer
+hide a command from a rule. Prints a JSON permission decision when a rule matches, and
+nothing otherwise.
 
-Site access is the one place the decision depends on more than the command. A command
-whose site rules all reach one explicitly named site is allowed when that site ends in
-`.local` - the plugin's development-site convention - or when the user approved a command
-reaching that exact site earlier in the same Claude Code session. That approval is
-recorded from the PostToolUse payload for the same tool call, which Claude Code sends only
-once the command has run: an ask is not an approval, and the user may have said no.
+Edit/Write payloads: denied while a delegated agent is still writing in the same
+repository (two writers on one tree is how H-1 happened), and asked for when they change
+this plugin's own site or model configuration.
 
-The rules themselves are not here. They live in config/command-boundaries.json, which
-scripts/delegate reads as well - the same boundaries have to hold whether Claude runs a
-command through the Bash tool, where this hook sees it, or a delegated agent runs it in
-its own process, where this hook sees nothing. Two hand-maintained copies of one rule set
-is how those two layers came to disagree. This file owns the matching, not the rules.
+Sites: a site runs without a prompt only when the user listed it as a development site
+(`orch sites allow <site>` -> sites.json), or approved a command reaching it earlier in
+this Claude Code session. A `.local` suffix no longer counts: some `.local` sites hold
+restored client data. Sites listed as protected ask every time.
+
+A failure *inside* this hook is not allowed through: once a command has been extracted, a
+fault blocks it. Claude Code treats a crashed hook as a non-blocking error and runs the
+command anyway, so a traceback here would authorise exactly what was not looked at.
+
+The rules are in config/command-boundaries.json, which scripts/delegate reads as well.
 """
 
 import contextlib
@@ -39,21 +42,35 @@ try:
 except ImportError:   # not on Windows; state updates there go unlocked
     fcntl = None
 
-BOUNDARIES = Path(__file__).resolve().parent.parent / "config" / "command-boundaries.json"
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+BOUNDARIES = PLUGIN_ROOT / "config" / "command-boundaries.json"
+SCRIPTS = PLUGIN_ROOT / "scripts"
 
-SEPARATORS = re.compile(r"&&|\|\||[;|&\n]")
-
-# `2>&1` and friends. The `&` in them is not a separator, and splitting on it leaves a
-# stray `1` segment that no rule covers - which is enough to cancel an allow.
+# `2>&1` and friends. The `&` in them is not a separator.
 FD_DUPLICATION = re.compile(r"\d*>&\d*-?")
 
 # Segments that may sit beside an allowed operation without cancelling it: changing into
 # the bench directory, and reading the operation's output. None of them acts on anything.
-ALLOW_COMPANIONS = frozenset({"cd", "tail", "head", "grep"})
+ALLOW_COMPANIONS = frozenset({"cd", "tail", "head", "grep", "true", "echo"})
+
+# Programs that execute what they are given as code: their heredoc bodies and their
+# `-c` arguments are commands, not text.
+SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh", "fish"})
+PYTHON = re.compile(r"(?:python[0-9.]*|pypy3?|ipython)\Z")
+
+# Leading words that run the rest of the line as a command. Peeled before matching, so
+# `env X=1 git push`, `sudo git push` and `nohup git push` are `git push` (SEC-002).
+WRAPPERS = {
+    "env": None, "sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U"},
+    "nohup": set(), "time": set(), "command": set(), "exec": set(), "nice": {"-n"},
+    "ionice": {"-c", "-n"}, "stdbuf": set(), "timeout": {"-s", "-k", "--signal",
+                                                         "--kill-after"},
+    "xargs": {"-I", "-n", "-P", "-d", "-L", "-s", "-E", "-a", "--max-args",
+              "--max-procs", "--delimiter", "--arg-file", "-i"},
+}
+ENV_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 
 # Options taking a separate argument, so the token after them is not the subcommand.
-# Matching mechanics, not rules: which token is the subcommand is a fact about each CLI's
-# argument parser, and the dispatcher's glob patterns have no equivalent question to ask.
 OPTS_WITH_ARG = {
     "git": {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"},
     "bench": {"--site", "-s"},
@@ -70,88 +87,68 @@ OPTS_WITH_ARG = {
     },
 }
 
-# What the agent is told when a rule fires, keyed by rule name. Instructions, not
-# descriptions: each names the corrective action, in the hook's own voice. The data file
-# carries each rule's intent, which is what a reader needs; this is what the blocked agent
-# needs, which is a different text for a different audience. A rule with no entry here
-# falls back to its intent rather than failing at runtime - and the test suite fails by
-# name, so the gap is loud in the one place that can afford to be.
+# What the agent is told when a rule fires, keyed by rule name. For an ask, the user
+# sees it in the prompt; for a deny, the agent reads it instead of running the command.
 REASONS = {
     "push": (
         "Pushing is never automatic. Confirm the target branch and remote with the user "
         "first, state what will be pushed, and continue only once they agree."
     ),
     "commit": (
-        "Commits need the user's approval. If you have not already shown the user the "
-        "finished work and this exact message and file list, and had them approve it, stop "
-        "and do that first. The message is one short `feat: <summary>` line with no "
-        "Co-Authored-By or other attribution."
+        "Commit approval. This prompt is the approval: the message and the staged files "
+        "are in the command. Approve to commit, or deny and say what to change. The "
+        "message is one short `feat: <summary>` line with no attribution."
     ),
     "blanket-staging": (
-        "Do not stage with `git add .` or `git add -A` - it sweeps in unrelated work. Run "
-        "`git status --porcelain` to see what changed, then stage only the files this task "
-        "created or changed, by path."
+        "Do not stage with `git add .`, `-A`, `-u` or `:/` - it sweeps in unrelated work. "
+        "Run `git status --porcelain` to see what changed, then stage only the files this "
+        "task created or changed, by path."
     ),
     "discard-tracked-changes": (
         "`git reset --hard` (and --merge/--keep) throws away every uncommitted change in "
         "the tree, not only the ones belonging to this task, and unstaged work has no "
-        "reflog entry to recover from. Run `git status --porcelain` and confirm with the "
-        "user what may be discarded. To move HEAD without touching file contents use "
-        "`git reset --soft`; to unstage, `git reset <path>`."
+        "reflog entry to recover from. Confirm with the user what may be discarded. To "
+        "move HEAD without touching files use `git reset --soft`; to unstage, "
+        "`git reset <path>`."
     ),
     "discard-pathspec-changes": (
         "This overwrites working-tree files from the index or a commit, and unstaged "
         "content in those paths is not recoverable afterwards. Confirm with the user "
-        "which files may be reverted, then revert them by path rather than with `.`. To "
-        "see what would be lost first, run `git diff -- <path>`."
+        "which files may be reverted, then revert them by path rather than with `.`."
     ),
     "discard-worktree": (
         "`git restore` overwrites working-tree files and `git clean` deletes untracked "
         "files, which Git keeps no copy of. Confirm with the user which paths may be "
-        "discarded and name them explicitly. To find out what is there without removing "
-        "anything, run `git status --porcelain`."
+        "discarded and name them explicitly."
     ),
     "drop-stash": (
-        "This deletes stashed work permanently, and a stash is where interrupted work was "
-        "put to keep it safe. Run `git stash list` and `git stash show -p` first, and "
-        "confirm with the user before dropping anything. To use a stash without "
-        "destroying it, `git stash apply` leaves the entry in place."
+        "This deletes stashed work permanently. Run `git stash list` and "
+        "`git stash show -p` first, and confirm with the user before dropping anything."
     ),
     "force-branch-ref": (
-        "This deletes an unmerged branch or moves an existing branch onto another commit, "
-        "abandoning commits nothing else points at. Confirm the branch and the target with "
-        "the user first. `git branch -d` deletes only what is already merged, and Git "
-        "refuses when it is not - use it instead of `-D` unless the loss is intended."
+        "This deletes an unmerged branch or moves an existing branch onto another commit. "
+        "Confirm the branch and the target with the user first; `git branch -d` deletes "
+        "only what is already merged."
     ),
     "expire-recovery-refs": (
-        "The reflog is what makes a bad reset or a bad rebase survivable, and this drops it "
-        "along with the objects it keeps reachable. Do not run it to tidy up. If a "
-        "repository genuinely needs pruning, that is the user's decision to make with the "
-        "reflog in front of them."
+        "The reflog is what makes a bad reset or rebase survivable, and this drops it. Do "
+        "not run it to tidy up; it is the user's decision."
     ),
     "rewrite-repository-history": (
-        "This rewrites commits or writes a ref directly, with none of the checks a "
-        "porcelain command applies. Confirm the operation and its scope with the user "
-        "before continuing. To read the same data without changing it, use `git log`, "
-        "`git rev-parse` or `git show-ref`."
+        "This rewrites commits or writes a ref directly. Confirm the operation and its "
+        "scope with the user before continuing."
     ),
     "recursive-delete": (
-        "A recursive delete takes everything below the path, tracked or not, and Git holds "
-        "no copy of untracked content. Confirm the path with the user, or delete the "
-        "specific files this task is responsible for by name. To see what would go, list "
-        "the tree first with `find <path> -maxdepth 2`."
+        "A recursive delete takes everything below the path, tracked or not. Confirm the "
+        "path with the user, or delete the specific files this task is responsible for."
     ),
     "mass-delete": (
-        "`find ... -delete` removes every path the traversal matched, and a traversal "
-        "usually reaches wider than intended. Run the same search without `-delete` first, "
-        "read the list, and then remove what belongs to this task by name."
+        "`find ... -delete` (or `-exec rm`) removes every path the traversal matched. Run "
+        "the search without it first, then remove what belongs to this task by name."
     ),
     "overwrite-file-contents": (
-        "shred, truncate and dd overwrite bytes in place, with no staging step and nothing "
-        "to restore an untracked file from. None of them is the tool for editing source: "
-        "edit the file, or write the intended contents with a normal editor operation. If "
-        "the byte-level operation really is what is wanted, the user should confirm the "
-        "exact target path."
+        "shred, truncate and dd overwrite bytes in place with nothing to restore from. "
+        "Edit the file normally, or have the user confirm the exact target."
     ),
     "asset-build": (
         "Asset build: touches no site, so it runs without a prompt. Check the output for a "
@@ -159,96 +156,98 @@ REASONS = {
     ),
     "destructive-site-operation": (
         "This destroys or overwrites site data, resets credentials or sessions, or opens a "
-        "raw database shell, and none of that is undone by running something else. It "
-        "asks on every site, development sites included, and an earlier approval of the "
-        "site does not cover it. Confirm the operation and the single target site with the "
-        "user before continuing."
+        "raw database shell. It asks on every site, development sites included. Confirm "
+        "the operation and the single target site with the user. A read-only "
+        "`bench --site <site> mariadb -e \"SELECT ...\"` does not need this."
+    ),
+    "bench-environment-change": (
+        "This changes the bench itself - apps, sites, branches, or the services setup - "
+        "and is not part of implementing a change. Confirm it with the user first."
     ),
     "site-named": (
-        "This runs against a live site database or a running Frappe instance. Confirm with "
-        "the user which single site to target before continuing, and do not repeat it across "
-        "other sites. If you only need a DocType definition or other committed configuration, "
-        "read that file in the working tree instead of querying a site."
+        "This runs against a site that is not listed as a development site. Confirm with "
+        "the user which single site to target. If you only need a DocType definition or "
+        "other committed configuration, read that file in the working tree instead."
     ),
     "site-unnamed": (
-        "This bench subcommand acts on a site, and no site is named on the command line. "
-        "That does not make it site-free: bench resolves one from configuration instead - "
-        "`default_site` in common_site_config.json, then currentsite.txt - so it will act on "
-        "whichever site the bench was last pointed at, which nobody chose for this task. "
-        "Name the site explicitly: `bench --site <site> <subcommand>`, using a site that the "
-        "project's docs/ai-context/OPERATIONS.md or the user identifies as a development "
-        "site."
+        "This bench subcommand acts on a site, and no site is named, so bench picks one "
+        "from `default_site` / currentsite.txt. Name it: `bench --site <site> <subcommand>`, "
+        "using the development site from OPERATIONS.md or `orch sites list`."
+    ),
+    "remote-execution": (
+        "This opens a shell or copies files on another machine, where nothing the hook "
+        "checks applies. Remote and production operations belong to the user's own "
+        "deployment tooling; confirm with the user before continuing."
     ),
     "database-client": (
         "This runs against a live database directly. Confirm with the user which single "
-        "site or database to target before continuing. If you only need committed "
-        "configuration, read that file in the working tree instead."
+        "site or database to target before continuing."
     ),
     "frappe-connection": (
-        "This opens a connection to a live site. Confirm with the user which single site to "
-        "target before continuing, and do not repeat it across other sites. If you only need "
-        "a DocType definition or other committed configuration, read that file in the "
-        "working tree instead of querying a site."
+        "This opens a connection to a site that is not listed as a development site, or "
+        "whose site cannot be read from the command. Confirm the single site with the user."
     ),
     "bare-agent-run": None,   # filled in below - the agent rules share one text
     "bare-agent-exec": None,
     "bare-agent-print": None,
 }
 
-DELEGATE = os.path.join(os.environ.get("CLAUDE_PLUGIN_ROOT", ""), "scripts", "delegate")
+DELEGATE = str(SCRIPTS / "delegate")
 
 AGENT_REASON = (
     "Coding agents run through the dispatcher, not directly. Use `" + DELEGATE + " "
     "--agent <opencode|codex|claude> --mode <implement|review|test|onboard|deliberate> "
-    "--tier <TIER> --cwd <repository root> [--model \"<name from the routing file>\"]` "
-    "with the brief on stdin; for Debate Mode, run `scripts/debate`, which calls it. The "
-    "dispatcher supplies the model and timeout from central routing, the permission "
-    "policy that holds a delegated run inside the same boundaries enforced here, and "
-    "the structured result contract. A bare invocation skips all three."
+    "--tier <TIER> --cwd <repository root>` with the brief on stdin; for Debate Mode, run "
+    "`scripts/debate`, which calls it. The dispatcher supplies the verified model, the "
+    "timeout, process-tree containment, the delegated permission policy and the result "
+    "contract. A bare invocation skips all of them."
 )
 REASONS["bare-agent-run"] = AGENT_REASON
 REASONS["bare-agent-exec"] = AGENT_REASON
 REASONS["bare-agent-print"] = AGENT_REASON
 
+# This plugin's own scripts run without a prompt: they are the workflow, and each one
+# already validates what it is given. These subcommands change what later runs without
+# a prompt, or spend provider usage, so they ask.
+PLUGIN_SCRIPTS = frozenset({"delegate", "debate", "orch"})
+PLUGIN_ASK = {
+    ("sites", "allow"): "This lets every routine command reach the site with no prompt, "
+                        "for every future session. Approve only for a site with no real "
+                        "client data.",
+    ("sites", "remove"): "This changes which sites need a prompt.",
+    ("models", "promote"): "This changes the OpenCode model every delegated "
+                           "implementation uses.",
+    ("models", "codex"): "This pins the model every Codex review uses.",
+    ("models", "verify"): "This runs a real OpenCode task on the candidate model and "
+                          "spends provider usage.",
+    ("models", "reset"): "This changes which models run.",
+    ("claude-default", "--apply"): "This writes \"model\": \"opus\" to "
+                                   "~/.claude/settings.json (a backup is kept).",
+}
+
 # Last resort, and deliberately not a second copy of the rules: the programs any rule has
 # ever been about. If the boundary data cannot be loaded there are no rules to apply, and
-# silently enforcing nothing is the one failure mode this hook must not have. Asking on
-# these programs turns a total, invisible lapse into a visible degraded one.
+# silently enforcing nothing is the one failure mode this hook must not have.
 GUARDED_PROGRAMS = frozenset({
     "git", "bench", "mysql", "mariadb", "opencode", "codex", "claude",
-    # The destructive filesystem programs. Listed for the same reason as the rest: with
-    # the rule data unloadable there is nothing to narrow `rm` down to its recursive
-    # forms, and asking on every `rm` for as long as the file is broken is the failure
-    # this list exists to prefer.
     "rm", "find", "shred", "truncate", "dd",
 })
 
-# The match kinds this hook implements, and the fields each needs in order to be matched
-# at all. Checked when the data is loaded, because "unreadable" and "unusable" amount to
-# the same thing here: a rule set this file cannot match enforces nothing, and enforcing
-# nothing while looking installed is the failure this hook must not have. Reading the file
-# successfully was never the property that mattered.
+# The match kinds this hook implements, and the fields each needs in order to be matched.
 MATCH_FIELDS = {
     "segment_text": {"lists": ("identifiers",)},
     "program": {"lists": ("programs",)},
     "program_option": {"names": ("program",), "lists": ("options",)},
     "program_subcommand": {"names": ("program",), "lists": ("subcommands",)},
 }
-
-# Not required by any kind, but matched against wherever they appear, so they are checked
-# on the same terms as the required ones.
 OPTIONAL_LISTS = ("any_argument", "unless_flags")
 
-# What this hook can decide. `allow` is an explicit decision, not the absence of one: it
-# skips Claude Code's own permission prompt, where printing nothing leaves that prompt in
-# place. `null` is a decision too - the data stating that a rule is not the hook's to
-# enforce - and is the only other value accepted.
+# `allow` skips Claude Code's own prompt; printing nothing leaves that prompt in place.
 HOOK_DECISIONS = frozenset({"ask", "deny", "allow"})
 
 # Strongest first. One command is one unit, so the strongest decision any segment earns
 # is the decision for all of it - an allowed migrate chained to a push still asks.
 DECISION_STRENGTH = ("deny", "ask", "allow")
-
 
 def _string_list(value):
     """A non-empty list of non-empty strings, the only shape these fields can match on."""
@@ -367,10 +366,12 @@ def degraded_reason():
         "rules is not protecting anything."
     ) % (RULES_FAULT or "The reason was not recorded")
 
+RULES_BY_NAME = {rule["name"]: rule for rule in RULES or []}
+
 
 def split_tokens(segment):
     try:
-        return shlex.split(segment)
+        return shlex.split(segment, comments=False)
     except ValueError:  # unbalanced quotes - fall back to a plain split
         return segment.split()
 
@@ -394,15 +395,492 @@ def subcommand(tokens, opts_with_arg):
     return None
 
 
-def rule_matches(rule, segment, tokens, name):
-    """Does this command segment fall under this rule?"""
+GROUPING = frozenset({"(", ")", "{", "}", "!", "if", "then", "else", "elif", "fi", "do",
+                      "done", "while", "until", "for", "in", "esac", ";;"})
+
+
+def normalize(tokens):
+    """The tokens of the command that actually runs: grouping and wrappers peeled off.
+
+    `( cd x && git push )`, `env A=1 git push`, `sudo -u u git push`, `timeout 30 git push`,
+    `xargs git push`, `env -S 'git push'` and a `case` arm `a) git push` all come back as
+    `git push ...`, so a wrapper is never a way around a rule.
+    """
+    tokens = list(tokens)
+    for _ in range(8):
+        while tokens and tokens[0] in GROUPING:
+            tokens = tokens[1:]
+        if tokens and tokens[0] == "case":
+            arm = next((i for i, t in enumerate(tokens) if t.endswith(")")), None)
+            tokens = tokens[arm + 1:] if arm is not None else []
+            continue
+        if len(tokens) > 1 and tokens[0].endswith(")") and not tokens[0].startswith("("):
+            tokens = tokens[1:]   # a case arm pattern: `a)`, `*)`
+            continue
+        break
+    if tokens and tokens[0][:1] in "({":
+        tokens[0] = tokens[0].lstrip("({")
+    while tokens and tokens[-1] in (")", "}", ";;"):
+        tokens = tokens[:-1]
+    for _ in range(8):
+        if not tokens:
+            break
+        if ENV_ASSIGNMENT.match(tokens[0]):
+            tokens = tokens[1:]
+            continue
+        name = program(tokens)
+        if name not in WRAPPERS:
+            break
+        options = WRAPPERS[name] or set()
+        i, split = 1, None
+        while i < len(tokens):
+            token = tokens[i]
+            if name == "env" and ENV_ASSIGNMENT.match(token):
+                i += 1
+            elif name == "env" and token in ("-S", "--split-string") and i + 1 < len(tokens):
+                split = split_tokens(tokens[i + 1])
+                i += 2
+                break
+            elif name == "env" and token.startswith(("-S", "--split-string=")):
+                split = split_tokens(token.split("=", 1)[1] if "=" in token else token[2:])
+                i += 1
+                break
+            elif token == "--":
+                i += 1
+                break
+            elif token.startswith("-"):
+                i += 2 if token in options or (name == "env" and token in ("-u", "-C"))\
+                    else 1
+            else:
+                break
+        if name == "timeout" and split is None and i < len(tokens):
+            i += 1   # the duration
+        tokens = (split or []) + tokens[i:]
+    return tokens
+
+
+class Segment:
+    """One unit the hook decides about.
+
+    kind "command" is a command line; "code" is program text an interpreter runs (a
+    python heredoc, `python -c`), matched only by segment_text rules; "body" is a heredoc
+    body not yet classified. `owner` is the Segment whose input it is.
+    """
+
+    __slots__ = ("text", "kind", "owner", "tokens", "name", "has_heredoc")
+
+    def __init__(self, text, kind="command", owner=None):
+        self.text, self.kind, self.owner = text, kind, owner
+        self.has_heredoc = False
+        # $'...' is ANSI-C quoting: `$'git' push` runs git.
+        self.tokens = normalize(split_tokens(ANSI_C_QUOTE.sub("'", text))) \
+            if kind == "command" else []
+        self.name = program(self.tokens)
+
+
+HEREDOC_OP = re.compile(r"<<(-?)[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
+ANSI_C_QUOTE = re.compile(r"\$'")
+
+# Command and process substitution: a command inside another, wherever it sits.
+SUBSTITUTION = re.compile(r"\$\(|`|<\(|>\(")
+
+
+def _substitution(text, i):
+    """(inner text, end index) of the substitution starting at text[i].
+
+    Parentheses inside quotes do not count: `$(echo ")"; git push)` ends at the last `)`.
+    """
+    if text[i] == "`":
+        end = text.find("`", i + 1)
+        end = len(text) if end < 0 else end
+        return text[i + 1:end], min(end + 1, len(text))
+    depth, j, quote = 0, i + 1, None
+    while j < len(text):
+        c = text[j]
+        if quote:
+            if c == "\\" and quote == '"':
+                j += 1
+            elif c == quote:
+                quote = None
+        elif c == "\\":
+            j += 1
+        elif c in "'\"":
+            quote = c
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return text[i + 2:j], j + 1
+        j += 1
+    return text[i + 2:], len(text)
+
+
+def _substitutions_in(text, depth):
+    """Commands inside `$(...)` and backticks anywhere in `text` (an unquoted heredoc body,
+    which bash expands before the program reads it)."""
+    found, i = [], 0
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == "`" or text.startswith("$(", i):
+            inner, end = _substitution(text, i)
+            found += _lex(inner, depth + 1) if depth < 4 else [Segment(inner)]
+            i = end
+            continue
+        i += 1
+    return found
+
+
+def _lex(command, depth=0):
+    """[Segment] in order: commands, heredoc bodies after their owners, then the commands
+    found inside substitutions. Quotes are honoured - a `;` or `|` inside quotes is text -
+    a comment runs to the end of its line, and a backslash-newline joins two lines, as in
+    bash. A body's `owner` is the Segment object that opened it. Linear in the input."""
+    text = FD_DUPLICATION.sub(" ", command.replace("\\\n", ""))
+    out, extra, buf, pending = [], [], [], []
+    quote = None
+    word_start = True   # the next character would begin a word (so `#` starts a comment)
+    arith = 0           # inside a bare `(( ... ))`, where `<<` is a shift, not a heredoc
+    i, n = 0, len(text)
+
+    def flush():
+        chunk = "".join(buf)
+        buf.clear()
+        if chunk.strip():
+            segment = Segment(chunk)
+            out.append(segment)
+            for entry in pending:
+                if entry["owner"] is None:
+                    entry["owner"] = segment
+
+    while i < n:
+        c = text[i]
+        if quote == "'":
+            buf.append(c)
+            if c == "'":
+                quote = None
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            buf.append(text[i:i + 2])
+            i += 2
+            word_start = False
+            continue
+        if c == "`" or text.startswith("$(", i) or (
+                quote is None and (text.startswith("<(", i) or text.startswith(">(", i))):
+            inner, end = _substitution(text, i)
+            extra += _lex(inner, depth + 1) if depth < 4 else [Segment(inner)]
+            buf.append(text[i:end])
+            i = end
+            word_start = False
+            continue
+        if quote == '"':
+            buf.append(c)
+            if c == '"':
+                quote = None
+            i += 1
+            continue
+        if c in "'\"":
+            quote = c
+            buf.append(c)
+            i += 1
+            word_start = False
+            continue
+        if text.startswith("((", i):
+            arith += 1
+            buf.append("((")
+            i += 2
+            word_start = False
+            continue
+        if arith and text.startswith("))", i):
+            arith -= 1
+            buf.append("))")
+            i += 2
+            continue
+        if not arith and text.startswith("<<", i) and not text.startswith("<<<", i):
+            found = HEREDOC_OP.match(text, i)
+            if found:
+                pending.append({"delimiter": found.group(3), "strip": found.group(1) == "-",
+                                "expands": not found.group(2), "owner": None})
+                buf.append(found.group(0))
+                i = found.end()
+                word_start = False
+                continue
+        if c == "#" and word_start:
+            end = text.find("\n", i)
+            i = n if end < 0 else end
+            continue
+        if c == "&" and text.startswith("&>", i):
+            buf.append("&>")
+            i += 2
+            word_start = True
+            continue
+        if c in ";&|\n":
+            flush()
+            i += 1
+            word_start = True
+            if c == "\n" and pending:
+                i = _bodies(text, i, pending, out, extra, depth)
+                pending = []
+            continue
+        buf.append(c)
+        word_start = c in " \t()"
+        i += 1
+    flush()
+    return out + extra
+
+
+def _bodies(text, i, pending, out, extra, depth):
+    """Consume the heredoc bodies opened on the line just ended. Returns the new index.
+    An unquoted delimiter means bash expands `$(...)` in the body: those are commands."""
+    for entry in pending:
+        lines = []
+        while i < len(text):
+            end = text.find("\n", i)
+            end = len(text) if end < 0 else end
+            line = text[i:end]
+            i = end + 1
+            if (line.lstrip("\t") if entry["strip"] else line) == entry["delimiter"]:
+                break
+            lines.append(line)
+        body = "\n".join(lines)
+        if entry["expands"]:
+            extra += _substitutions_in(body, depth)
+        if entry["owner"] is not None:
+            entry["owner"].has_heredoc = True
+            out.append(Segment(body, kind="body", owner=entry["owner"]))
+    return i
+
+
+def _inner(segment):
+    """Command strings a segment runs as code of its own: `bash -c`, `eval`, `find -exec`,
+    and the program text of `python -c`."""
+    tokens, name = segment.tokens, segment.name
+    if name in SHELLS:
+        for i, token in enumerate(tokens[1:-1], 1):
+            if re.match(r"-[A-Za-z]*c[A-Za-z]*\Z", token):
+                rest = tokens[i + 1:]
+                if rest and rest[0] == "--":
+                    rest = rest[1:]
+                return [(rest[0], "command")] if rest else []
+    if name == "eval" and len(tokens) > 1:
+        return [(" ".join(tokens[1:]), "command")]
+    if name == "find":
+        found, i = [], 1
+        while i < len(tokens):
+            if tokens[i] in ("-exec", "-execdir", "-ok", "-okdir"):
+                j = i + 1
+                while j < len(tokens) and tokens[j] not in (";", "+", "\\;"):
+                    j += 1
+                found.append((" ".join(tokens[i + 1:j]), "command"))
+                i = j
+            i += 1
+        return found
+    if name and PYTHON.match(name) and "-c" in tokens:
+        index = tokens.index("-c")
+        if index + 1 < len(tokens):
+            return [(tokens[index + 1], "code")]
+    return []
+
+
+MAX_EXPANSIONS = 32
+
+
+def _reads_stdin(segment):
+    """A bare python interpreter: it runs whatever arrives on stdin."""
+    if segment.kind != "command" or not (segment.name and PYTHON.match(segment.name)):
+        return False
+    if segment.has_heredoc:
+        return False   # the heredoc body is classified on its own
+    args = segment.tokens[1:]
+    if any(a in ("-c", "-m") for a in args):
+        return False
+    positional = [a for a in args if not a.startswith("-") or a == "-"]
+    return not positional or positional[0] == "-"
+
+
+def lex_command(command):
+    """Every Segment of a command, with inner commands expanded and heredoc bodies
+    classified by who reads them.
+
+    A body is a command list only when a shell is in the command (`bash <<EOF`,
+    `cat <<EOF | sh`), program text when Python or bench reads it (`python - <<EOF`,
+    `bench --site s console <<EOF`), and otherwise data - a brief for the dispatcher, a
+    file being written, a commit message - which no rule looks at.
+    """
+    segments = _lex(command)
+    index, expansions = 0, 0
+    while index < len(segments):
+        segment = segments[index]
+        index += 1
+        if segment.kind != "command" or expansions >= MAX_EXPANSIONS:
+            continue
+        for text, kind in _inner(segment):
+            expansions += 1
+            segments += [Segment(text, "code", segment)] if kind == "code" else _lex(text, 1)
+    names = {s.name for s in segments if s.kind == "command"}
+    shell = bool(names & SHELLS)
+    python = any(n and (PYTHON.match(n) or n == "bench") for n in names)
+    if any(_reads_stdin(s) for s in segments):
+        # `echo '...' | python3`: what flows into it is program text.
+        segments += [Segment(s.text, "code", s) for s in segments
+                     if s.kind == "command" and not _reads_stdin(s)]
+    result = []
+    for segment in segments:
+        if segment.kind != "body":
+            result.append(segment)
+        elif shell:
+            result += _lex(segment.text, 1)
+        elif python:
+            result.append(Segment(segment.text, "code", segment.owner))
+    return result
+
+
+# A plain hostname: dot-separated labels of letters, digits and inner hyphens. Anything
+# else - a variable, a glob, a brace list, a path - is not something this hook can say
+# which site it means.
+SITE_NAME = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\Z"
+)
+SITE_OPTIONS = ("--site", "-s")
+
+# Calls that choose which site a snippet is connected to.
+SITE_CALL = re.compile(r"\bfrappe\.(?:init_site|init|connect)\b")
+SITE_CALL_LITERAL = re.compile(
+    r"""frappe\.(?:init_site|init|connect)\(\s*(?:site\s*=\s*)?\\?(['"])([^'"\\\s]+)\\?\1\s*[,)]"""
+)
+SITE_REUSE = re.compile(r"frappe\.connect\(\s*\)")
+
+AMBIGUOUS = object()   # a bench command that names a site option, but not one usable site
+
+# Statements a read-only `mariadb -e` may contain. Anything else, or any of the words in
+# SQL_WRITES anywhere outside a string literal, keeps the destructive-operation ask.
+SQL_READS = frozenset({"select", "show", "describe", "desc", "explain", "with"})
+SQL_WRITES = re.compile(
+    r"\b(insert|update|delete|replace|drop|alter|create|truncate|grant|revoke|rename|"
+    r"call|handler|load|lock|unlock|set|use|into|outfile|dumpfile|sleep|benchmark|"
+    r"load_file|flush|kill|shutdown|install|uninstall|prepare|execute|do)\b", re.I)
+
+
+def readonly_sql(sql):
+    # MariaDB executes /*! ... */ comments, the client runs `\!` and `system` commands, and
+    # `--` starts a comment only before whitespace: none of those is treated as harmless.
+    if "/*!" in sql or "\\" in sql or re.search(r"\b(system|source|pager|tee)\b", sql, re.I):
+        return False
+    stripped = re.sub(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"|`[^`]*`", "''", sql)
+    stripped = re.sub(r"--(?=\s|$)[^\n]*|#[^\n]*|/\*.*?\*/", " ", stripped, flags=re.S)
+    statements = [s.strip() for s in stripped.split(";") if s.strip()]
+    if not statements or SQL_WRITES.search(stripped):
+        return False
+    return all(s.split(None, 1)[0].lower() in SQL_READS for s in statements)
+
+
+def readonly_mariadb(segment):
+    """`bench --site <s> mariadb|db-console -e "<read-only SQL>"`, fed nothing else."""
+    tokens = segment.tokens
+    if segment.name != "bench" or segment.has_heredoc or "<" in tokens:
+        return False
+    if subcommand(tokens, OPTS_WITH_ARG["bench"]) not in ("mariadb", "db-console"):
+        return False
+    statements = []
+    for i, token in enumerate(tokens):
+        if token in ("-e", "--execute") and i + 1 < len(tokens):
+            statements.append(tokens[i + 1])
+        elif token.startswith(("--execute=", "-e")) and token not in ("-e", "--execute"):
+            statements.append(token.split("=", 1)[1] if "=" in token else token[2:])
+    # Exactly one: the client runs the last -e it is given, not the first.
+    return len(statements) == 1 and readonly_sql(statements[0])
+
+
+# Program text that does more than read a site: writes or deletes files, runs commands,
+# reaches the network, or changes site data. The site allowlist authorises routine
+# *inspection*; code like this is left to Claude Code's own permission check instead of
+# being allowed by the hook.
+CODE_EFFECTS = re.compile(
+    r"\bos\.(system|popen|remove|unlink|rmdir|removedirs|rename|replace|kill|exec\w*|"
+    r"spawn\w*|chmod|chown|truncate)\b|\bsubprocess\b|\bshutil\.|\bPopen\b|\bpty\.|"
+    r"\bsocket\b|\bctypes\b|__import__|\bimportlib\b|\b(exec|eval|compile)\s*\(|"
+    r"\bopen\s*\([^)]*['\"][wax]|\.write_(text|bytes)\s*\(|\.(unlink|rmdir|rename)\s*\(|"
+    r"\brequests\.|\burllib\b|\bhttp\.client\b|"
+    r"\bfrappe\.db\.(delete|truncate|commit|set_value|set_single_value|bulk_insert|"
+    r"multisql|sql_ddl)\b|\bdelete_doc\b|\brename_doc\b|\bdb_set\s*\(|"
+    r"\.(save|insert|submit|cancel|delete|db_update)\s*\(|\bfrappe\.(set_user|enqueue)\b")
+SQL_IN_CODE_WRITES = re.compile(
+    r"\b(insert|update|delete|drop|alter|truncate|replace|create|grant)\b", re.I)
+
+
+def code_has_effects(segment):
+    """Program text (or a python command line) that would do more than inspect."""
+    if segment.kind == "code" or (segment.name and PYTHON.match(segment.name)):
+        text = segment.text
+        if CODE_EFFECTS.search(text):
+            return True
+        return "frappe.db.sql" in text and bool(SQL_IN_CODE_WRITES.search(text))
+    return False
+
+
+# An output redirect: `> file`, `>> file`, `2> file`, `&> file`, `>| file`.
+REDIRECT = re.compile(r"(?:^|[\s;])(?:\d*|&)>>?\|?\s*([^\s;&|]+)")
+QUOTED = re.compile(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"")
+
+
+def writes_file(segment):
+    """A command segment that redirects output into a file. Text inside quotes does not
+    count; `/dev/null` and fd duplication do not count."""
+    if segment.kind != "command":
+        return False
+    text = QUOTED.sub("''", segment.text)
+    return any(target not in ("/dev/null", "/dev/stdout", "/dev/stderr")
+               for target in REDIRECT.findall(text))
+
+
+def plugin_script(segment):
+    """(script name, its arguments) when the segment runs one of this plugin's scripts."""
+    tokens = list(segment.tokens)
+    if tokens and PYTHON.match(program(tokens) or "") and len(tokens) > 1:
+        tokens = tokens[1:]
+    if not tokens or program(tokens) not in PLUGIN_SCRIPTS:
+        return None
+    path = os.path.expandvars(os.path.expanduser(tokens[0]))
+    try:
+        if Path(path).resolve().parent != SCRIPTS.resolve():
+            return None
+    except OSError:
+        return None
+    return program(tokens), tokens[1:]
+
+
+def plugin_decision(script):
+    name, args = script
+    positional = [a for a in args if not a.startswith("-")]
+    if name == "orch":
+        # Any option to claude-default counts as --apply: argparse would accept `--app`.
+        key = tuple(positional[:2]) if positional[:1] != ["claude-default"] else (
+            "claude-default", "--apply" if any(a.startswith("-") for a in args) else "")
+        reason = PLUGIN_ASK.get(key)
+        if reason:
+            return "ask", reason
+    return "allow", "frappe-orchestrator's own %s; it runs without a prompt." % name
+
+
+def rule_matches(rule, segment):
+    """Does this segment fall under this rule?"""
     match = rule["match"]
     kind = match.get("kind")
+    tokens, name = segment.tokens, segment.name
 
     if kind == "segment_text":
-        # Runs on the raw segment, so it also catches python -c "..." payloads and
-        # heredoc bodies, where there is no program name to look at.
-        return bool(rule["_pattern"].search(segment))
+        # Only where the text is code something will run: program text of an
+        # interpreter, or the command line of python/bench itself. A grep pattern, an
+        # echo, a brief and a file-writing heredoc are text (audit BUG-05).
+        if segment.kind == "code" or (name and (PYTHON.match(name) or name == "bench")):
+            return bool(rule["_pattern"].search(segment.text))
+        return False
+    if segment.kind != "command":
+        return False
 
     if kind == "program":
         return name in match.get("programs", ())
@@ -414,13 +892,7 @@ def rule_matches(rule, segment, tokens, name):
         return any(option in tokens for option in match.get("options", ()))
 
     if kind == "program_subcommand":
-        # An informational flag means the CLI prints text and exits, so there is nothing
-        # to route anywhere. Whole tokens, never a substring of the segment: a brief is an
-        # argument, so `codex exec "explain the --help output"` mentions the flag without
-        # carrying it, and a substring test would exempt a real run for quoting a word.
-        # Only rules that declare it get the exemption - `--help` is inert rather than
-        # suppressing for an interpreter, which ignores the extra argument and runs the
-        # snippet anyway.
+        # An informational flag means the CLI prints text and exits. Whole tokens only.
         unless = match.get("unless_flags")
         if unless and set(unless).intersection(tokens):
             return False
@@ -434,31 +906,46 @@ def rule_matches(rule, segment, tokens, name):
     return False   # a kind this hook does not implement; the suite fails by rule name
 
 
+def _as_segment(segment):
+    return segment if isinstance(segment, Segment) else Segment(segment)
+
+
 def match_rule(segment):
     """The first rule this segment falls under, or None. Data order is precedence."""
     if RULES is None:
         return None
-    tokens = split_tokens(segment)
-    name = program(tokens)
+    segment = _as_segment(segment)
+    if segment.kind == "command" and readonly_mariadb(segment):
+        return RULES_BY_NAME.get("site-named")
     for rule in RULES:
-        if rule_matches(rule, segment, tokens, name):
+        if rule_matches(rule, segment):
             return rule
     return None
 
 
-def check(segment):
-    """Return (decision, reason) if a rule matches this command segment, else None."""
+def evaluate(segment):
+    """(decision, reason, rule or None) for one segment, or None when nothing applies."""
+    segment = _as_segment(segment)
     if RULES is None:
-        # Degraded: no rules loaded. Ask on the programs the rules are about rather than
-        # enforcing nothing at all.
-        return ("ask", degraded_reason()) if program(
-            split_tokens(segment)
-        ) in GUARDED_PROGRAMS else None
-
+        # Degraded: no rules loaded. Ask on the programs the rules are about.
+        if segment.name in GUARDED_PROGRAMS:
+            return "ask", degraded_reason(), None
+        return None
+    if segment.kind == "command":
+        script = plugin_script(segment)
+        if script:
+            decision, reason = plugin_decision(script)
+            return decision, reason, None
     rule = match_rule(segment)
     if rule is None:
         return None
-    return rule["hook"], REASONS.get(rule["name"]) or rule.get("intent", "")
+    return rule["hook"], REASONS.get(rule["name"]) or rule.get("intent", ""), rule
+
+
+def check(segment):
+    """Return (decision, reason) if a rule matches this command segment, else None."""
+    found = evaluate(segment)
+    return found[:2] if found else None
 
 
 INTERNAL_FAILURE_REASON = (
@@ -546,46 +1033,14 @@ def read_command(payload):
 
 
 # --------------------------------------------------------------------------
-# Site environments and per-session approval
+# Sites and per-session approval
 #
-# Which rules this applies to is data - `site_access` in the boundary file. What a site
-# name means, and what this session has approved, is enforcement, and lives here.
+# Which rules this applies to is data - `site_access` in the boundary file. Which sites
+# run without a prompt is the user's list, in sites.json under the plugin's config dir
+# (`orch sites`). What this session approved is session state.
 # --------------------------------------------------------------------------
 
-# A plain hostname: dot-separated labels of letters, digits and inner hyphens. Anything
-# else - a variable, a glob, a brace list, a path - is not something this hook can say
-# which site it means, so it reaches no site that could be relaxed.
-SITE_NAME = re.compile(
-    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
-    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\Z"
-)
-DEVELOPMENT_SUFFIX = ".local"
-SITE_OPTIONS = ("--site", "-s")
-
-# Calls that choose which site a snippet is connected to. A literal first argument, or a
-# literal `site=`, is a site this hook can name; any other form of these calls is a site it
-# cannot, and the snippet then reaches no site that could be relaxed. `frappe.connect()`
-# with no arguments reuses the site already chosen, so it names nothing new.
-SITE_CALL = re.compile(r"\bfrappe\.(?:init_site|init|connect)\b")
-SITE_CALL_LITERAL = re.compile(
-    r"""frappe\.(?:init_site|init|connect)\(\s*(?:site\s*=\s*)?\\?(['"])([^'"\\\s]+)\\?\1\s*[,)]"""
-)
-SITE_REUSE = re.compile(r"frappe\.connect\(\s*\)")
-
-# Command and process substitution run a command of their own wherever they sit - inside
-# double quotes, inside an unquoted heredoc, inside an argument to `cd`. None of the
-# matching here looks inside one, so no command carrying one is allowed by this hook.
-SUBSTITUTION = re.compile(r"\$\(|`|<\(|>\(")
-
-# A heredoc operator and its delimiter, as bash reads them. Only consulted on a line that
-# has already been shown to hold no quoted `<`, no backslash and no unbalanced quote, so
-# every match is a real operator rather than text that happens to look like one.
-HEREDOC = re.compile(
-    r"(?<!<)<<(?!<)(-?)[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2(?=[\s;&|<>()]|\Z)"
-)
-
-# Claude Code's session id is a UUID. Anything else - including the `served:` form, which
-# can fall back to a shared placeholder - gets no stored approvals at all.
+# Claude Code's session id is a UUID. Anything else gets no stored approvals at all.
 SESSION_ID = re.compile(r"[A-Za-z0-9_-]{8,128}\Z")
 TOOL_USE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 
@@ -593,24 +1048,51 @@ STALE_STATE_SECONDS = 7 * 24 * 3600
 MAX_PENDING = 32
 
 DEVELOPMENT_REASON = (
-    "Routine access to %s, which ends in .local - this plugin's convention for a "
-    "development site - so it runs without a prompt. Keep to the one site the task "
-    "resolved, and stop for the user before a migration that may drop or transform data. "
-    "Destructive site operations, any other site, and a command that does not name its "
-    "site still ask."
+    "Routine access to %s, listed as a development site in the frappe-orchestrator "
+    "sites list, so it runs without a prompt. Keep to the sites the task needs, and stop "
+    "for the user before a migration that may drop or transform data. Destructive site "
+    "operations and unlisted sites still ask."
 )
 SESSION_REASON = (
     "Routine access to %s, which the user approved earlier in this Claude Code session, "
-    "so it runs without a prompt. That approval covers this exact site until the session "
-    "ends. Destructive site operations, any other site, and a command that does not name "
-    "its site still ask."
+    "so it runs without a prompt until the session ends. Destructive site operations and "
+    "other sites still ask."
 )
 AWAITING_NOTE = (
     " If the user approves and the command runs, routine access to %s runs without a "
-    "prompt for the rest of this Claude Code session; other sites still ask."
+    "prompt for the rest of this Claude Code session. To stop being asked in every "
+    "session, the user can list it with `orch sites allow %s` - only for a site with no "
+    "real client data."
+)
+PROTECTED_NOTE = (
+    " %s is listed as protected, so this asks every time and is never remembered."
 )
 
-AMBIGUOUS = object()   # a bench command that names a site option, but not one usable site
+
+def config_dir():
+    override = os.environ.get("FRAPPE_ORCHESTRATOR_CONFIG")
+    if override:
+        return Path(override)
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return Path(base) / "frappe-orchestrator"
+
+
+def site_lists():
+    """(development sites, protected sites) from sites.json. Unreadable reads as empty -
+    the safe direction, since an unlisted site asks."""
+    try:
+        data = json.loads((config_dir() / "sites.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return frozenset(), frozenset()
+    if not isinstance(data, dict):
+        return frozenset(), frozenset()
+
+    def names(key):
+        value = data.get(key)
+        return frozenset(s for s in value if valid_site(s)) if isinstance(value, list) \
+            else frozenset()
+
+    return names("development"), names("protected")
 
 
 def valid_site(site):
@@ -624,16 +1106,15 @@ def valid_site(site):
 
 
 def is_development_site(site):
-    """A site whose name ends in `.local`. The plugin's convention; nothing else counts."""
-    return valid_site(site) and site.lower().endswith(DEVELOPMENT_SUFFIX)
+    """Listed by the user as a development site, and not also listed as protected."""
+    development, protected = site_lists()
+    # Exact, not case-folded: a Frappe site is a directory name, and on Linux `DEMO.x` is
+    # not `demo.x`.
+    return valid_site(site) and site in development and site not in protected
 
 
 def bench_site(tokens):
-    """The one site a bench command names, None if it names none, AMBIGUOUS otherwise.
-
-    Every spelling of the option anywhere in the command counts, so a second `--site`, a
-    missing value, or a value that is not a plain site name leaves nothing to relax.
-    """
+    """The one site a bench command names, None if it names none, AMBIGUOUS otherwise."""
     named = []
     i = 1
     while i < len(tokens):
@@ -653,7 +1134,7 @@ def bench_site(tokens):
 
 
 def snippet_sites(command):
-    """The literal sites Frappe snippets in this command connect to, or None.
+    """The literal sites Frappe snippets in this text connect to, or None.
 
     None when any site-choosing call is not in a form whose site can be read off the text.
     An empty set when there are no such calls at all.
@@ -668,166 +1149,118 @@ def snippet_sites(command):
     return sites
 
 
-def command_site(command, segments):
-    """The one site this whole command reaches, or None.
+def segment_sites(segment, segments):
+    """The sites one site-access segment reaches: a non-empty set, or None if unreadable.
 
-    Every bench command in it counts, relaxed by a rule or not, and every site a snippet
-    connects to. A second site, an unreadable one, or none at all gives None.
+    A bench command reaches the one site it names. A heredoc fed to `bench --site s
+    console` reaches s. Anything else reaches the literal sites its snippets connect to,
+    or, with none of its own, the one site the rest of the command names - the
+    `bench --site s execute ...; python -c "frappe.connect()"` shape.
     """
-    sites = set()
-    for segment in segments:
-        tokens = split_tokens(segment)
-        if program(tokens) == "bench":
-            named = bench_site(tokens)
-            if named is AMBIGUOUS:
+    if segment.kind == "command" and segment.name == "bench":
+        named = bench_site(segment.tokens)
+        return {named} if named and named is not AMBIGUOUS else None
+    owner = segment.owner
+    own = snippet_sites(segment.text)
+    if own is None:
+        return None
+    if owner is not None and owner.kind == "command" and owner.name == "bench":
+        # A console heredoc reaches the bench's site and anything it connects to itself.
+        named = segment_sites(owner, segments)
+        return named | own if named and all(valid_site(s) for s in own) else None
+    if own:
+        return own if all(valid_site(s) for s in own) else None
+    named = set()
+    for other in segments:
+        if other.kind == "command" and other.name == "bench":
+            site = bench_site(other.tokens)
+            if site is AMBIGUOUS:
                 return None
-            if named:
-                sites.add(named)
-    from_snippets = snippet_sites(command)
-    if from_snippets is None:
-        return None
-    sites |= from_snippets
-    if len(sites) != 1:
-        return None
-    site = sites.pop()
-    return site if valid_site(site) else None
-
-
-def reaches(segment, site):
-    """Does this site-access segment reach exactly `site`?
-
-    A bench segment has to name it itself - an unnamed bench command reaches whichever
-    site configuration picks. A snippet segment reaches the command's site, which
-    command_site() has already reduced to one.
-    """
-    tokens = split_tokens(segment)
-    if program(tokens) == "bench":
-        return bench_site(tokens) == site
-    return True
-
-
-def heredocs(line, first):
-    """[(owner, delimiter, strip_tabs)] for the heredocs a line opens, in order.
-
-    `owner` indexes the segment the operator sits in, the line's segments being numbered
-    from `first`. A line this cannot read with certainty opens none, so its following lines
-    stay ordinary command segments.
-    """
-    if "<<" not in line or "\\" in line:
-        return []
-    lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
-    lexer.whitespace_split = True
-    try:
-        words = list(lexer)
-    except ValueError:
-        return []
-    # A `<` inside a word was quoted: text that looks like an operator and is not one.
-    if any("<" in word and not set(word) <= set("();<>|&") for word in words):
-        return []
-    opened = []
-    for offset, part in enumerate(p for p in SEPARATORS.split(line) if p.strip()):
-        for found in HEREDOC.finditer(part):
-            opened.append((first + offset, found.group(3), found.group(1) == "-"))
-    return opened
-
-
-def split_segments(command):
-    """(segments, owners): the command's segments, and for each the index of the segment
-    whose heredoc it is the body of, or None.
-
-    A heredoc body is still split and matched like any other text, so a rule still sees
-    it. What it is not is a command of its own: it is input to the segment that opened it.
-    """
-    segments, owners = [], []
-    lines = FD_DUPLICATION.sub(" ", command).split("\n")
-    i = 0
-    while i < len(lines):
-        first = len(segments)
-        for part in SEPARATORS.split(lines[i]):
-            if part.strip():
-                segments.append(part)
-                owners.append(None)
-        opened = heredocs(lines[i], first)
-        i += 1
-        for owner, delimiter, strip_tabs in opened:
-            while i < len(lines):
-                text = lines[i]
-                i += 1
-                if (text.lstrip("\t") if strip_tabs else text) == delimiter:
-                    break
-                for part in SEPARATORS.split(text):
-                    if part.strip():
-                        segments.append(part)
-                        owners.append(owner)
-    return segments, owners
+            if site:
+                named.add(site)
+        elif other is not segment:
+            more = snippet_sites(other.text)
+            if more is None:
+                return None
+            named |= more
+    return named if len(named) == 1 and all(valid_site(s) for s in named) else None
 
 
 def assess(command, approved=None):
     """((decision, reason) or None, awaiting) for a whole command.
 
     deny outranks ask outranks allow, whichever segment each came from: the command is
-    submitted as one unit, so the strongest decision any part of it earns is the decision
-    for all of it. Among equals the first segment wins.
+    submitted as one unit.
 
-    An ask from a `site_access` rule becomes an allow when every such ask in the command
-    reaches the one site the whole command reaches, and that site is a development site
-    or `approved(site)` says the user approved it this session. Any other rule's decision
-    is untouched, so a destructive operation still asks and a deny still denies.
+    Site asks (`site_access` rules) become allows when every site they reach is listed as
+    a development site or was approved this session, and none is listed as protected.
+    `awaiting` is the one unlisted site an ask is waiting on - the site a PostToolUse for
+    this call may record as approved. None for every other outcome, and always None for
+    a protected site, which is never remembered.
 
-    `awaiting` is the protected site an ask is waiting on - the site a PostToolUse for
-    this call may record as approved. None for every other outcome.
-
-    An allow covers the whole command only when every other segment is either allowed too,
-    one of ALLOW_COMPANIONS, or the body of an allowed segment's heredoc, and the command
-    carries no substitution. Anything else is left to Claude Code's own permission check:
-    an allow for `bench build` must not wave through whatever was chained after it.
+    An allow covers the whole command only when every other segment is allowed too, a
+    harmless companion (cd, tail, grep, ...), or input to an allowed segment, and no
+    substitution is present. Anything else is left to Claude Code's own permission check.
     """
-    segments, owners = split_segments(command)
-    matches = [check(segment) for segment in segments]
-    awaiting = None
+    segments = lex_command(command)
+    found = [evaluate(segment) for segment in segments]
+    awaiting, protected_hit = None, None
 
-    site_asks = [
-        i for i, m in enumerate(matches)
-        if m and m[0] == "ask" and (match_rule(segments[i]) or {}).get("site_access")
-    ]
+    site_asks = [i for i, f in enumerate(found)
+                 if f and f[0] == "ask" and f[2] and f[2].get("site_access")]
     if site_asks:
-        site = command_site(command, segments)
-        if site is not None and all(reaches(segments[i], site) for i in site_asks):
-            if is_development_site(site):
-                granted = DEVELOPMENT_REASON % site
-            elif approved is not None and approved(site):
-                granted = SESSION_REASON % site
-            else:
-                granted, awaiting = None, site
-            if granted:
+        reached = [segment_sites(segments[i], segments) for i in site_asks]
+        if all(reached):
+            sites = set().union(*reached)
+            development, protected = site_lists()
+            pending = sorted(s for s in sites if s in protected or not (
+                s in development or (approved is not None and approved(s))))
+            if not pending:
+                listed = sorted(sites & development)
+                reason = (DEVELOPMENT_REASON if listed == sorted(sites) else SESSION_REASON) \
+                    % ", ".join(sorted(sites))
                 for i in site_asks:
-                    matches[i] = ("allow", granted)
+                    # Code that writes, deletes, shells out or changes site data is not
+                    # routine inspection: no allow from the hook, Claude Code decides.
+                    found[i] = None if code_has_effects(segments[i]) \
+                        else ("allow", reason, found[i][2])
+            elif len(pending) == 1 and pending[0] not in protected:
+                awaiting = pending[0]
+            else:
+                protected_hit = next((s for s in pending if s in protected), None)
 
-    decided = [m for m in matches if m]
+    decided = [f for f in found if f]
     if not decided:
         return None, None
+    by_segment = {id(s): f for s, f in zip(segments, found)}
     for decision in DECISION_STRENGTH:
-        strongest = next((m for m in decided if m[0] == decision), None)
+        strongest = next((f for f in decided if f[0] == decision), None)
         if strongest is None:
             continue
         if decision == "allow" and (SUBSTITUTION.search(command) or any(
-            m is None
-            and program(split_tokens(segment)) not in ALLOW_COMPANIONS
-            and (owner is None or matches[owner] is None)
-            for m, segment, owner in zip(matches, segments, owners)
+            writes_file(segment) or code_has_effects(segment) for segment in segments
+        ) or any(
+            f is None
+            and not (segment.kind == "command" and segment.name in ALLOW_COMPANIONS)
+            and not (segment.owner is not None
+                     and (by_segment.get(id(segment.owner)) or ("",))[0] == "allow")
+            for f, segment in zip(found, segments)
         )):
             return None, None
+        reason = strongest[1]
         if decision == "ask" and awaiting:
-            return (decision, strongest[1] + AWAITING_NOTE % awaiting), awaiting
-        return strongest, None
-    return decided[0], None
+            return ("ask", reason + AWAITING_NOTE % (awaiting, awaiting)), awaiting
+        if decision == "ask" and protected_hit:
+            return ("ask", reason + PROTECTED_NOTE % protected_hit), None
+        return (decision, reason), None
+    return decided[0][:2], None
 
 
 def decide(command):
     """(decision, reason) for a whole command, or None when no rule covers it.
 
-    The decision with no session behind it: development sites are relaxed, and every
-    other site asks. See assess().
+    The decision with no session behind it: listed development sites are relaxed, and
+    every other site asks. See assess().
     """
     return assess(command)[0]
 
@@ -984,13 +1417,14 @@ def await_approval(payload, site):
     update_state(payload.get("session_id"), note)
 
 
+
 def record_approval(payload):
     """PostToolUse: the command ran, so the site its ask was waiting on is now approved.
 
     Only a pending note for this exact tool call, naming the site this exact command
     reaches, is promoted. A call the user rejected never runs, never gets a PostToolUse,
     and leaves its note pending - which approves nothing. Never raises and never writes
-    output: the command has already run, and nothing here can change that.
+    output.
     """
     try:
         command = read_command(payload)
@@ -1013,11 +1447,75 @@ def record_approval(payload):
         pass
 
 
+# --------------------------------------------------------------------------
+# File edits
+# --------------------------------------------------------------------------
+
+EDIT_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
+
+CONFIG_EDIT_REASON = (
+    "This edits frappe-orchestrator's own configuration (%s), which decides which sites "
+    "run without a prompt and which models run. Approve only if you asked for it."
+)
+ACTIVE_WRITER_REASON = (
+    "A delegated %s run (pid %s) is still active in %s, and editing the same tree now "
+    "would race it. Wait for its result, or stop it with `%s stop --cwd %s` and then "
+    "inspect `git status` before continuing."
+)
+
+
+def _within(path, root):
+    root = root.rstrip(os.sep)
+    return path == root or path.startswith(root + os.sep)
+
+
+def edit_decision(payload):
+    """(decision, reason) for an Edit/Write call, or None to leave it to Claude Code."""
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return None
+    path = tool_input.get("file_path") or tool_input.get("notebook_path")
+    if not isinstance(path, str) or not path.strip():
+        return None
+    base = payload.get("cwd") if isinstance(payload.get("cwd"), str) else os.getcwd()
+    target = os.path.realpath(os.path.join(base, os.path.expanduser(path)))
+
+    config = os.path.realpath(str(config_dir()))
+    if _within(target, config):
+        return "ask", CONFIG_EDIT_REASON % target
+
+    # Only consulted when the registry of delegated runs is non-empty, so an ordinary edit
+    # costs one directory listing. A fault here is reported, not turned into a block: it
+    # cannot authorise anything, and blocking every edit everywhere is worse.
+    try:
+        sys.path.insert(0, str(SCRIPTS))
+        import orchlib
+        writers = orchlib.active_writers()
+    except Exception as exc:   # pragma: no cover - reported, never silent
+        print("frappe-orchestrator: active-run check failed: %s" % exc, file=sys.stderr)
+        return None
+    for proc in writers:
+        if proc.get("cwd") and _within(target, proc["cwd"]):
+            return "deny", ACTIVE_WRITER_REASON % (
+                proc.get("mode"), proc.get("pid"), proc["cwd"], SCRIPTS / "orch", proc["cwd"])
+    return None
+
+
 def main():
     """Read one payload, emit one decision, or block. Raises only SystemExit."""
     payload = read_payload()
     if payload.get("hook_event_name") == "PostToolUse":
         record_approval(payload)
+        return
+
+    if payload.get("tool_name") in EDIT_TOOLS:
+        try:
+            outcome = edit_decision(payload)
+        except Exception as exc:
+            fail_closed(("%s: %s" % (type(exc).__name__, exc))[:400])
+            return
+        if outcome:
+            emit(*outcome)
         return
 
     command = read_command(payload)
@@ -1030,10 +1528,7 @@ def main():
         )
     except Exception as exc:
         # A command is in hand and is about to run unless this hook stops it, and the
-        # hook has just established that it cannot say whether a boundary applies. Not an
-        # allow, and not an ask either: asking hands that question to someone with
-        # strictly less information than the code that failed to answer it, and an
-        # approved-anyway command is the same outcome as never having checked.
+        # hook cannot say whether a boundary applies. Not an allow, and not an ask either.
         detail = ("%s: %s" % (type(exc).__name__, exc))[:400]
         fail_closed(detail)
         return   # unreachable; kept so a future edit to fail_closed cannot fall through
@@ -1047,9 +1542,6 @@ def main():
     try:
         emit(*outcome)
     except Exception as exc:
-        # A decision was reached and could not be delivered. For an ask or a deny that is
-        # indistinguishable, at the far end, from no decision at all - so it blocks rather
-        # than returning, which is what this used to do.
         detail = "the decision could not be written - %s: %s" % (type(exc).__name__, exc)
         fail_closed(detail[:400])
 
@@ -1060,9 +1552,6 @@ if __name__ == "__main__":
     except SystemExit:
         raise   # fail_closed's blocking status, on its way out
     except BaseException as exc:
-        # main() is written to raise nothing else. Kept because the cost of being wrong is
-        # an uncaught traceback, which exits 1, which Claude Code reports as a
-        # non-blocking error before running the command. BaseException rather than
-        # Exception for the same reason: a hook killed mid-evaluation has not evaluated
-        # anything, and exit 130 is as non-blocking as exit 1.
+        # main() is written to raise nothing else. An uncaught traceback exits 1, which
+        # Claude Code treats as non-blocking before running the command.
         fail_closed(("%s: %s" % (type(exc).__name__, exc))[:400])

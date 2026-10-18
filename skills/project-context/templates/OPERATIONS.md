@@ -8,13 +8,13 @@
 
 <!-- What must already exist for commands here to work: bench path, package manager,
      required services.
-     Name the development site explicitly — "Development site: dev.local". Operations
-     that target a site refuse to guess one, and this file is where that answer lives;
-     without it every migrate and clear-cache stops to ask. The guard treats any site
-     ending in `.local` as a development site and every other site as protected, but a
-     bench usually holds several `.local` sites: this line is what says which one this
-     project's work uses. List any other sites with what they are (demo, staging,
-     production) — they stay protected whatever is written here. -->
+     Name the bench path and the development site explicitly — "Bench: ~/frappe-bench",
+     "Development site: dev.local". Operations that target a site refuse to guess one,
+     and this file is where that answer lives. Writing a site here does not let it run
+     without prompts: only `orch sites allow <site>` (the user's own list) does that, and
+     only for a site with no real client data. List any other sites with what they are
+     (restored client copy, demo, staging, production) - they stay protected.
+     Say whether the bench runs under `bench start` (no restarts needed) or supervisor. -->
 
 ## Development
 

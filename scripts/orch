@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+"""frappe-orchestrator control: everything that is not running one agent.
+
+    orch status  --cwd <repo>                 delegated agents alive in the repo, tree state
+    orch stop    --cwd <repo>                 stop every delegated agent process in the repo
+    orch gate    --cwd <repo> --tier <TIER>   does this diff need a Codex review?
+                 [--files P ...] [--base REV] [--tests-failed] [--fix-rounds N] [--user-requested]
+
+    orch models status                        Claude aliases, OpenCode and Codex models in use
+    orch models discover [--refresh]          newer OpenCode candidates in the configured families
+    orch models verify <id>                   one real smoke task on a candidate (costs usage)
+    orch models promote <id>                  use a verified candidate for every implementation
+    orch models codex <id>                    pin the Codex review model
+    orch models reset                         back to the routing file's stable defaults
+
+    orch sites list | allow <site> | protect <site> | remove <site>
+    orch claude-default [--apply]             is "model": "opus" the default for new sessions?
+    orch metrics [--days N]                   local per-run metrics summary
+
+stdout is JSON. Exit 0 on success, 1 when a check or action failed, 2 on bad usage.
+Nothing here runs on the task path except `status`, `stop` and `gate`, and none of those
+touch the network.
+"""
+
+import argparse
+import fnmatch
+import json
+import os
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import orchlib  # noqa: E402
+
+DELEGATE = Path(__file__).resolve().parent / "delegate"
+VERIFY_DAYS = 14
+
+
+def out(data, ok=True):
+    json.dump(data, sys.stdout, indent=2, sort_keys=False)
+    print()
+    return 0 if ok else 1
+
+
+def repo_root(raw):
+    path = os.path.realpath(os.path.expanduser(raw))
+    if not os.path.exists(os.path.join(path, ".git")):
+        sys.exit("orch: --cwd must be a repository root: %s" % path)
+    return path
+
+
+def porcelain(cwd):
+    text = orchlib.git(cwd, "status", "--porcelain=v1")
+    return None if text is None else [line for line in text.splitlines() if line.strip()]
+
+
+# --------------------------------------------------------------------------
+# status / stop / gate
+# --------------------------------------------------------------------------
+
+
+def cmd_status(args):
+    cwd = repo_root(args.cwd)
+    agents = orchlib.marked_processes(cwd=cwd)
+    writers = [p for p in agents if p["mode"] in orchlib.WRITER_MODES]
+    return out({
+        "cwd": cwd,
+        "active_agents": agents,
+        "safe_to_start_writer": not writers,
+        "working_tree": porcelain(cwd),
+    })
+
+
+def cmd_stop(args):
+    cwd = repo_root(args.cwd)
+    agents = orchlib.marked_processes(cwd=cwd)
+    survivors = orchlib.stop_processes(agents) if agents else []
+    for entry in orchlib.active_dir().glob("*.json"):
+        if (orchlib.read_json(entry, {}) or {}).get("cwd") == cwd:
+            orchlib.unregister_run(entry.stem)
+    return out({
+        "cwd": cwd,
+        "stopped": [p["pid"] for p in agents if p["pid"] not in survivors],
+        "survivors": survivors,
+        "working_tree": porcelain(cwd),
+        "next": "Inspect the working tree before continuing; nothing was reverted.",
+    }, ok=not survivors)
+
+
+def cmd_gate(args):
+    """Prints a gate result whatever happens; exits 3 unless the gate is complete, so a
+    failure here can never read as "nothing to review"."""
+    try:
+        cwd = os.path.realpath(os.path.expanduser(args.cwd))
+        gate = orchlib.review_gate(cwd, args.tier, orchlib.load_routing(), files=args.files,
+                                   base=args.base, files_claimed=bool(args.files),
+                                   tests_failed=args.tests_failed,
+                                   fix_rounds=args.fix_rounds,
+                                   user_requested=args.user_requested)
+    except Exception as exc:   # noqa: BLE001 - load_routing on a broken file, mostly
+        gate = orchlib.gate_failure(args.tier, "the review gate failed: %s: %s"
+                                    % (type(exc).__name__, exc))
+    out(gate)
+    return 0 if gate.get("gate_status") == "complete" else 3
+
+
+# --------------------------------------------------------------------------
+# models
+# --------------------------------------------------------------------------
+
+
+def verified_models():
+    return orchlib.read_json(orchlib.state_dir() / "verified-models.json", {}) or {}
+
+
+def health():
+    return orchlib.read_json(orchlib.state_dir() / "model-health.json", {}) or {}
+
+
+def cmd_models_status(_args):
+    routing = orchlib.load_routing()
+    opencode = routing["implementers"]["opencode"]
+    stable = opencode["stable_model"]
+    effective, source, notes = orchlib.opencode_model(routing)
+    codex, codex_source = orchlib.codex_model(routing)
+    stats = health()
+    return out({
+        "claude": {
+            "orchestrator": routing["orchestrator"]["claude_model_alias"],
+            "sonnet_subagent": routing["implementers"]["sonnet"]["claude_model_alias"],
+            "settings": claude_layers(),
+        },
+        "opencode": {
+            "stable": stable,
+            "promoted": orchlib.user_models().get("opencode_model"),
+            "effective": effective,
+            "source": source,
+            "notes": notes,
+            "in_catalog": orchlib.catalog_status("opencode", effective),
+            "operational": stats.get("opencode:%s" % effective),
+        },
+        "codex": {
+            "model": codex,
+            "source": codex_source,
+            "in_catalog": orchlib.catalog_status("codex", codex) if codex else "unknown",
+            "operational": stats.get("codex:%s" % codex) if codex else None,
+        },
+    })
+
+
+def cmd_models_discover(args):
+    routing = orchlib.load_routing()
+    opencode = routing["implementers"]["opencode"]
+    provider = opencode["stable_model"].split("/", 1)[0]
+    if args.refresh:
+        orchlib._query(["opencode", "models", provider, "--refresh"])
+    ids, age = orchlib.catalog("opencode", provider, refresh=args.refresh)
+    if ids is None:
+        return out({"error": "the OpenCode catalog could not be read"}, ok=False)
+    effective, _source, _notes = orchlib.opencode_model(routing)
+    verified, stats = verified_models(), health()
+    candidates = [
+        {"id": model_id, "verified": verified.get(model_id),
+         "operational": stats.get("opencode:%s" % model_id)}
+        for model_id in ids
+        if model_id != effective
+        and any(fnmatch.fnmatch(model_id, f) for f in opencode["candidate_families"])
+    ]
+    return out({
+        "effective": effective,
+        "catalog_age_seconds": round(age or 0),
+        "candidates": candidates,
+        "next": "A candidate is only a name in a catalog. `orch models verify <id>` runs one "
+                "real smoke task on it (it costs provider usage); `orch models promote "
+                "<id>` then makes it the implementation model.",
+    })
+
+
+SMOKE_BRIEF = (
+    "In greet.py, change the function greet so it returns 'hello, world' instead of "
+    "'hello'. Change nothing else."
+)
+
+
+def cmd_models_verify(args):
+    """One real, tiny implementation through the real dispatcher, in a throwaway repo."""
+    model_id = args.model
+    if orchlib.catalog_status("opencode", model_id) == "absent":
+        return out({"model": model_id, "ok": False,
+                    "error": "not in the OpenCode catalog"}, ok=False)
+    with tempfile.TemporaryDirectory(prefix="orch-verify-") as tmp:
+        repo = Path(tmp)
+        (repo / "greet.py").write_text("def greet():\n    return 'hello'\n")
+        for command in (["init", "-q"], ["add", "greet.py"],
+                        ["-c", "user.email=v@v", "-c", "user.name=v", "commit", "-qm", "init"]):
+            subprocess.run(["git", "-C", str(repo)] + command, check=True,
+                           capture_output=True)
+        started = time.monotonic()
+        proc = subprocess.run(
+            [sys.executable, str(DELEGATE), "--agent", "opencode", "--mode", "implement",
+             "--tier", "SMALL", "--cwd", str(repo), "--model", model_id, "--timeout", "300"],
+            input=SMOKE_BRIEF, capture_output=True, text=True, timeout=400)
+        try:
+            result = json.loads(proc.stdout)
+        except ValueError:
+            result = {"status": "no_result", "error": proc.stderr[-800:]}
+        body = (repo / "greet.py").read_text()
+        ok = (result.get("status") == "completed" and "hello, world" in body
+              and result.get("files_changed") == ["greet.py"])
+    record = {"ok": ok, "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+              "seconds": round(time.monotonic() - started, 1),
+              "status": result.get("status"), "error_category": result.get("error_category"),
+              "error": (result.get("error") or "")[:400] or None}
+    verified = verified_models()
+    verified[model_id] = record
+    orchlib.write_json(orchlib.state_dir() / "verified-models.json", verified)
+    return out(dict(record, model=model_id), ok=ok)
+
+
+def cmd_models_promote(args):
+    routing = orchlib.load_routing()
+    stable = routing["implementers"]["opencode"]["stable_model"]
+    model_id = args.model
+    record = verified_models().get(model_id) or {}
+    problems = []
+    if not record.get("ok"):
+        problems.append("it has no passing `orch models verify` run")
+    else:
+        age = time.time() - time.mktime(time.strptime(record["at"], "%Y-%m-%dT%H:%M:%S"))
+        if age > VERIFY_DAYS * 86400:
+            problems.append("its verification is older than %d days" % VERIFY_DAYS)
+    if model_id.split("/", 1)[0] != stable.split("/", 1)[0] and not args.allow_provider_change:
+        problems.append("it is from a different provider than %s (a different account or "
+                        "price); pass --allow-provider-change if that is intended" % stable)
+    if orchlib.catalog_status("opencode", model_id) == "absent":
+        problems.append("it is not in the OpenCode catalog")
+    if problems:
+        return out({"model": model_id, "promoted": False, "problems": problems}, ok=False)
+    models = orchlib.user_models()
+    models.update(opencode_model=model_id, promoted_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+                  promoted_from=stable)
+    orchlib.write_json(orchlib.config_dir() / "models.json", models)
+    return out({"model": model_id, "promoted": True,
+                "revert": "orch models reset"})
+
+
+def cmd_models_codex(args):
+    state = orchlib.catalog_status("codex", args.model)
+    if state == "absent":
+        ids, _ = orchlib.catalog("codex")
+        return out({"model": args.model, "pinned": False,
+                    "error": "not in this Codex CLI's catalog", "offered": ids}, ok=False)
+    models = orchlib.user_models()
+    models["codex_model"] = args.model
+    orchlib.write_json(orchlib.config_dir() / "models.json", models)
+    return out({"model": args.model, "pinned": True, "catalog": state})
+
+
+def cmd_models_reset(_args):
+    path = orchlib.config_dir() / "models.json"
+    models = orchlib.user_models()
+    removed = {k: models.pop(k) for k in ("opencode_model", "codex_model", "promoted_at",
+                                          "promoted_from") if k in models}
+    if models:
+        orchlib.write_json(path, models)
+    elif path.exists():
+        path.unlink()
+    return out({"removed": removed})
+
+
+# --------------------------------------------------------------------------
+# sites
+# --------------------------------------------------------------------------
+
+
+def cmd_sites(args):
+    path = orchlib.sites_file()
+    sites = orchlib.load_sites()
+    if args.action == "list":
+        return out(dict(sites, file=str(path)))
+    site = args.site
+    if not site or site.lower() == "all" or "/" in site or " " in site:
+        sys.exit("orch sites %s: give one site name" % args.action)
+    development, protected = set(sites["development"]), set(sites["protected"])
+    if args.action == "allow":
+        development.add(site)
+        protected.discard(site)
+    elif args.action == "protect":
+        protected.add(site)
+        development.discard(site)
+    else:
+        development.discard(site)
+        protected.discard(site)
+    orchlib.write_json(path, {"development": sorted(development),
+                              "protected": sorted(protected)})
+    return out(dict(orchlib.load_sites(), file=str(path)))
+
+
+# --------------------------------------------------------------------------
+# Claude default model
+# --------------------------------------------------------------------------
+
+
+def claude_layers(cwd=None):
+    """Every place that can set the main model, in the precedence Claude Code documents:
+    /model in a session > --model > ANTHROPIC_MODEL > the `model` setting."""
+    home = Path(os.path.expanduser("~/.claude"))
+    cwd = Path(cwd or os.getcwd())
+    layers = []
+    for label, path in (
+        ("managed", Path("/etc/claude-code/managed-settings.json")),
+        ("project local", cwd / ".claude" / "settings.local.json"),
+        ("project", cwd / ".claude" / "settings.json"),
+        ("user", home / "settings.json"),
+    ):
+        data = orchlib.read_json(path, None)
+        if isinstance(data, dict) and data.get("model"):
+            layers.append({"layer": label, "path": str(path), "model": data["model"]})
+    env = os.environ.get("ANTHROPIC_MODEL")
+    return {
+        "env_ANTHROPIC_MODEL": env,
+        "settings_with_model": layers,
+        "new_session_default": env or (layers[0]["model"] if layers else "(Claude Code default)"),
+        "note": "A `--model` flag or `/model` in a session overrides all of these, and a "
+                "change applies to new sessions only.",
+    }
+
+
+def cmd_claude_default(args):
+    path = Path(os.path.expanduser("~/.claude/settings.json"))
+    data = orchlib.read_json(path, {}) if path.exists() else {}
+    if not isinstance(data, dict):
+        return out({"error": "%s is not a JSON object; not touched" % path}, ok=False)
+    layers = claude_layers()
+    if data.get("model") == "opus":
+        return out(dict(layers, user_setting="opus", changed=False))
+    if not args.apply:
+        return out(dict(layers, user_setting=data.get("model"), changed=False,
+                        next="orch claude-default --apply"), ok=False)
+    backup = path.with_name("settings.json.bak-%s" % time.strftime("%Y%m%d%H%M%S"))
+    if path.exists():
+        shutil.copy2(path, backup)
+    data["model"] = "opus"
+    orchlib.write_json(path, data)
+    return out(dict(claude_layers(), user_setting="opus", changed=True,
+                    backup=str(backup) if path.exists() else None,
+                    note="Takes effect in new sessions."))
+
+
+# --------------------------------------------------------------------------
+# metrics
+# --------------------------------------------------------------------------
+
+
+def cmd_metrics(args):
+    path = orchlib.state_dir() / "metrics.jsonl"
+    cutoff = time.time() - args.days * 86400
+    rows = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+                at = time.mktime(time.strptime(row["at"], "%Y-%m-%dT%H:%M:%S"))
+            except (ValueError, KeyError):
+                continue
+            if at >= cutoff:
+                rows.append(row)
+    except OSError:
+        pass
+    groups = {}
+    for row in rows:
+        groups.setdefault("%s %s" % (row["agent"], row["mode"]), []).append(row)
+    summary = {}
+    for key, items in sorted(groups.items()):
+        seconds = [r["seconds"] for r in items if r.get("status") == "completed"]
+        statuses = {}
+        for r in items:
+            statuses[r.get("status")] = statuses.get(r.get("status"), 0) + 1
+        summary[key] = {
+            "runs": len(items), "statuses": statuses,
+            "median_seconds_completed": round(statistics.median(seconds), 1) if seconds else None,
+            "tokens_reported": sum(r.get("tokens_reported") or 0 for r in items) or None,
+        }
+    return out({"days": args.days, "runs": len(rows), "by_agent_mode": summary,
+                "file": str(path)})
+
+
+def main():
+    # No abbreviations anywhere: the hook asks before the subcommands that change state,
+    # and it matches them by their full spelling.
+    parser = argparse.ArgumentParser(prog="orch", description=__doc__.split("\n\n")[0],
+                                     allow_abbrev=False)
+    sub = parser.add_subparsers(dest="command", required=True)
+    _add = sub.add_parser
+    sub.add_parser = lambda *a, **k: _add(*a, allow_abbrev=False, **k)
+
+    p = sub.add_parser("status")
+    p.add_argument("--cwd", required=True)
+    p.set_defaults(run=cmd_status)
+    p = sub.add_parser("stop")
+    p.add_argument("--cwd", required=True)
+    p.set_defaults(run=cmd_stop)
+    p = sub.add_parser("gate")
+    p.add_argument("--cwd", required=True)
+    p.add_argument("--tier", required=True, choices=("FAST", "SMALL", "NORMAL", "DIFFICULT"))
+    p.add_argument("--files", nargs="+")
+    p.add_argument("--base", default="HEAD")
+    p.add_argument("--tests-failed", action="store_true")
+    p.add_argument("--fix-rounds", type=int, default=0)
+    p.add_argument("--user-requested", action="store_true")
+    p.set_defaults(run=cmd_gate)
+
+    models = sub.add_parser("models").add_subparsers(dest="action", required=True)
+    _add_model = models.add_parser
+    models.add_parser = lambda *a, **k: _add_model(*a, allow_abbrev=False, **k)
+    models.add_parser("status").set_defaults(run=cmd_models_status)
+    p = models.add_parser("discover")
+    p.add_argument("--refresh", action="store_true",
+                   help="refresh OpenCode's catalog from models.dev first (network)")
+    p.set_defaults(run=cmd_models_discover)
+    for name, run in (("verify", cmd_models_verify), ("promote", cmd_models_promote),
+                      ("codex", cmd_models_codex)):
+        p = models.add_parser(name)
+        p.add_argument("model")
+        if name == "promote":
+            p.add_argument("--allow-provider-change", action="store_true")
+        p.set_defaults(run=run)
+    models.add_parser("reset").set_defaults(run=cmd_models_reset)
+
+    p = sub.add_parser("sites")
+    p.add_argument("action", choices=("list", "allow", "protect", "remove"))
+    p.add_argument("site", nargs="?")
+    p.set_defaults(run=cmd_sites)
+
+    p = sub.add_parser("claude-default")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(run=cmd_claude_default)
+
+    p = sub.add_parser("metrics")
+    p.add_argument("--days", type=int, default=7)
+    p.set_defaults(run=cmd_metrics)
+
+    args = parser.parse_args()
+    if args.command == "sites" and args.action != "list" and not args.site:
+        parser.error("orch sites %s needs a site name" % args.action)
+    return args.run(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

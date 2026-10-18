@@ -330,16 +330,19 @@ def check_triggers():
         if not refused(lambda: d.load_deliberation(broken, tiers, refuse)):
             problems.append("a routing file with %s was accepted" % label)
 
-    # The Opus pin comes from the routing file, and is refused without an exact id.
-    name, model_id = d.resolve_deliberation_model(ROUTING, config, refuse)
-    if (name, model_id) != ("Claude Opus 5.5", "claude-opus-5-5"):
-        problems.append("deliberation model resolved to %r" % ((name, model_id),))
-    broken = json.loads(json.dumps(ROUTING))
-    del broken["models"]["Claude Opus 5.5"]["id"]
-    if not refused(lambda: d.resolve_deliberation_model(broken, config, refuse)):
-        problems.append("an Opus entry without an id was accepted")
-    # Opus having an id does not make it delegable for implementation.
-    if not refused(lambda: d.resolve_model(ROUTING, "Claude Opus 5.5", refuse)):
+    # The Opus pin is an alias plus the served-model family it must verify against, both
+    # from the routing file - so a new Opus release needs no edit.
+    alias, prefix = d.resolve_deliberation_model(ROUTING, config, refuse)
+    if (alias, prefix) != ("opus", "claude-opus-"):
+        problems.append("deliberation model resolved to %r" % ((alias, prefix),))
+    for key, value in (("claude_model_alias", None), ("claude_model_prefix", "opus-"),
+                       ("claude_model_alias", "--model")):
+        broken = json.loads(json.dumps(config))
+        broken[key] = value
+        if not refused(lambda: d.resolve_deliberation_model(ROUTING, broken, refuse)):
+            problems.append("deliberation %s=%r was accepted" % (key, value))
+    # A Claude alias is not an OpenCode implementation model.
+    if not refused(lambda: d.resolve_model(ROUTING, "opus", refuse)):
         problems.append("Claude Opus became an OpenCode implementation model")
     return problems
 
@@ -358,6 +361,7 @@ def check_model_verification():
     aux = ROUTING["deliberation"]["claude_auxiliary_model_prefixes"]
     cases = [
         ("opus alone", envelope({"claude-opus-5-5": 400}), True),
+        ("a newer opus, same alias", envelope({"claude-opus-6-0": 400}), True),
         ("opus with housekeeping", envelope({"claude-opus-5-5": 400,
                                              "claude-haiku-4-5-20251001": 9}), True),
         ("a different model answered", envelope({"claude-sonnet-5-5": 400}), False),
@@ -369,7 +373,7 @@ def check_model_verification():
         ("no envelope", None, False),
     ]
     for name, env, want in cases:
-        verified, _served, note = d.verify_claude_model(env, "claude-opus-5-5", aux)
+        verified, _served, note = d.verify_claude_model(env, "claude-opus-", aux)
         if verified != want:
             problems.append("%s: verified=%s" % (name, verified))
         if not verified and not note:
@@ -434,6 +438,10 @@ def make_env(tmp):
     env = dict(os.environ)
     env["PATH"] = "%s:%s" % (bin_dir, env.get("PATH", "/usr/bin:/bin"))
     env["TMPDIR"] = str(work)
+    env["FRAPPE_ORCHESTRATOR_STATE"] = str(work / "state")
+    env["FRAPPE_ORCHESTRATOR_CONFIG"] = str(work / "config")
+    env["FRAPPE_ORCHESTRATOR_CATALOG"] = "off"
+    env["CODEX_HOME"] = str(work / "codex")
     return env, repo
 
 
@@ -451,7 +459,8 @@ def run_debate(tmp, tier="DIFFICULT", trigger="competing-approaches", **behaviou
         capture_output=True, text=True, env=env, timeout=120,
     )
     calls = [json.loads(p.read_text()) | {"file": p.name} for p in sorted(record.iterdir())]
-    result = json.loads(proc.stdout) if proc.returncode == 0 and proc.stdout.strip() else None
+    result = (json.loads(proc.stdout)
+              if proc.returncode in (0, 3) and proc.stdout.strip() else None)
     return proc, result, calls
 
 
@@ -499,14 +508,14 @@ def check_runner(tmp):
     # The Opus side was Opus, and that is on the record.
     claude = result["participants"].get("claude") or {}
     if (claude.get("model"), claude.get("model_id"), claude.get("model_verified")) != (
-            "Claude Opus 5.5", "claude-opus-5-5", True):
+            "opus", "opus", True):
         problems.append("claude participant recorded as %r" % claude)
     if (result["participants"].get("codex") or {}).get("model_verified") is not None:
         problems.append("codex claims a model verification it never had")
     for call in calls:
         if "claude" in call["file"]:
             argv = call["argv"]
-            if argv[argv.index("--model") + 1] != "claude-opus-5-5":
+            if argv[argv.index("--model") + 1] != "opus":
                 problems.append("claude was run with --model %r" % argv[argv.index("--model") + 1])
         if Path(call["cwd"]).resolve() != (tmp / "repo").resolve():
             problems.append("%s ran in %s" % (call["file"], call["cwd"]))
@@ -561,6 +570,11 @@ def check_failures(tmp):
         if result["status"] != "incomplete":
             problems.append("%s: status %r - a failed side became a debate"
                             % (name, result["status"]))
+        if proc.returncode != 3:
+            problems.append("%s: exit %s - an incomplete debate must not exit 0"
+                            % (name, proc.returncode))
+        if stage == "critique" and len(result.get("partial", {}).get("positions", {})) != 2:
+            problems.append("%s: the two usable positions were thrown away" % name)
         if result["stages_run"] != ran:
             problems.append("%s: stages run %r, wanted %r" % (name, result["stages_run"], ran))
         if result["positions"] or result["critiques"]:
@@ -642,24 +656,25 @@ def check_position_inputs(tmp):
 
 def check_workflow_text():
     problems = []
-    flow = SKILL[SKILL.index("## Workflow"):SKILL.index("## Task classification")]
-    order = ["Debate Mode", "Implementation", "Codex REVIEW"]
-    positions = [flow.find(step) for step in order]
+    doc = (ROOT / "docs" / "reference" / "debate.md").read_text()
+    order = ["Stage 1", "Stage 2", "synthesis.md", "The normal implementation"]
+    positions = [doc.find(step) for step in order]
     if -1 in positions or positions != sorted(positions):
-        problems.append("the workflow does not place Debate Mode before implementation "
-                        "and the Codex review after it")
-    section = SKILL[SKILL.index("## Debate Mode"):SKILL.index("## Disagreement with a review")]
-    for phrase in ("fresh `review` run", "never counts as one", "Difficulty alone is never a trigger",
-                   "Debate: enabled | reason:", "Debate: complete | decision:",
-                   "Debate: incomplete", "Do not fabricate the missing side"):
+        problems.append("the debate flow does not run positions, critiques, synthesis, "
+                        "then implementation")
+    for phrase in ("fresh `review` run", "never counts as one",
+                   "Difficulty alone is never a trigger", "Debate: enabled | reason:",
+                   "Debate: complete | decision:", "Debate: incomplete",
+                   "Do not fabricate the missing side", "Exit 3"):
+        if phrase not in doc:
+            problems.append("debate.md lacks %r" % phrase)
+    section = SKILL[SKILL.index("## Debate Mode"):SKILL.index("## Other dispatcher modes")]
+    for phrase in ("Never for FAST, SMALL or NORMAL work", "tell the user first",
+                   "docs/reference/debate.md"):
         if phrase not in section:
-            problems.append("Debate Mode section lacks %r" % phrase)
-    fast = SKILL[SKILL.index("## Fast path"):SKILL.index("## Delegation")]
-    if "agent debate" not in fast:
-        problems.append("the fast path no longer excludes debate")
-    if "Claude Opus 5.5" in section:
-        problems.append("the skill hardcodes the Opus model name instead of reading routing")
-    # The review contract and its verdict semantics are what they were.
+            problems.append("the skill's Debate Mode section lacks %r" % phrase)
+    if "Opus 5" in doc or "Opus 5" in section:
+        problems.append("a hardcoded Opus version instead of the alias")
     if d.VERDICT_MODES != frozenset({"review", "test"}):
         problems.append("verdict modes changed: %r" % sorted(d.VERDICT_MODES))
     return problems

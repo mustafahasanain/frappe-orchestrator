@@ -1,9 +1,20 @@
 {
-  "description": "Enforces the push, staging, and live-site boundaries whether or not the orchestration skill loaded. PostToolUse records a protected site as approved for the session once a command the user approved has actually run.",
+  "description": "Enforces the push, commit, staging, destructive-operation and site boundaries whether or not the orchestration skill loaded. Blocks file edits while a delegated agent is still writing in the same repository. PostToolUse records a site as approved for the session once a command the user approved has actually run.",
   "hooks": {
     "PreToolUse": [
       {
         "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/guard.py",
+            "args": [],
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
         "hooks": [
           {
             "type": "command",

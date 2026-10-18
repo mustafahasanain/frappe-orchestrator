@@ -6,13 +6,13 @@
     "hook": "What hooks/guard.py decides for a command Claude runs: ask, deny, or allow (runs with no permission prompt). null means this rule is not the hook's to enforce.",
     "delegated": "What scripts/delegate's permission policy decides inside a delegated run. null means the rule cannot be expressed there, or does not apply.",
     "not_enforced_because": "Required whenever hook or delegated is null. A rule that no longer applies to a consumer has to say why, in the data, where the next reader sees it. Without this field a decision could be quietly dropped to null and nothing would notice - which is the shape of the divergence this file exists to prevent, not a hypothetical.",
-    "site_access": "Optional, true only on a rule the hook asks on. It marks an ask that is about reaching a site at all, not about what is done there, and lets hooks/guard.py answer it itself when the whole command reaches one explicitly named site: a site ending in .local is a development site and is allowed, and any other site is allowed once the user has approved a command reaching that exact site earlier in the same Claude Code session. What a site name means and what a session approved are the hook's mechanics, not rules, so they live there. A rule without this flag is never relaxed by the site it reaches - which is why destructive-site-operation is its own rule, ahead of the site rules. The delegated policy ignores it: a delegated run never reaches a site."
+    "site_access": "Optional, true only on a rule the hook asks on. It marks an ask that is about reaching a site at all, not about what is done there, and lets hooks/guard.py answer it itself: allowed when every site the command reaches is listed as a development site in the user's sites.json (`orch sites allow`), or was approved by the user earlier in the same Claude Code session, and none is listed as protected. A `.local` suffix alone grants nothing. The delegated policy ignores it: a delegated run never reaches a site."
   },
   "match_kinds": {
     "program_subcommand": "program name, plus the subcommand that follows it, options skipped",
     "program_option": "program name, plus an option appearing anywhere in the command",
     "program": "program name alone",
-    "segment_text": "an identifier appearing anywhere in the command text, including inside a quoted snippet or a heredoc body"
+    "segment_text": "an identifier appearing in program text an interpreter runs: a python/bench command line, `python -c`, or a heredoc read by python or bench. Text given to grep, echo, the dispatcher or a file is not matched."
   },
   "rules": [
     {
@@ -29,8 +29,8 @@
       "delegated": "deny",
       "documented_in": [
         {
-          "file": "skills/orchestration/SKILL.md",
-          "heading": "## Push boundary"
+          "file": "docs/reference/safety.md",
+          "heading": "## Git"
         }
       ],
       "examples": [
@@ -45,7 +45,7 @@
     },
     {
       "name": "blanket-staging",
-      "intent": "Staging everything sweeps in unrelated work. Stage the files the task created or changed, by path.",
+      "intent": "Staging everything sweeps in unrelated work. `.`, `./`, `:/`, `-A`, `--all`, `-u` and `--update` all stage more than the task's own files. Stage the files the task created or changed, by path.",
       "match": {
         "kind": "program_subcommand",
         "program": "git",
@@ -54,23 +54,32 @@
         ],
         "any_argument": [
           ".",
+          "./",
+          ":/",
+          ":",
           "-A",
-          "--all"
+          "--all",
+          "-u",
+          "--update"
         ]
       },
       "hook": "deny",
       "delegated": "deny",
       "documented_in": [
         {
-          "file": "skills/orchestration/SKILL.md",
-          "heading": "## Commit safety"
+          "file": "docs/reference/safety.md",
+          "heading": "## Git"
         }
       ],
       "examples": [
-        "git add .",
-        "git add -A",
+        "git add -- .",
         "git add --all",
-        "git add -- ."
+        "git add --update",
+        "git add -A",
+        "git add -u",
+        "git add .",
+        "git add ./",
+        "git add :/"
       ],
       "not_examples": [
         "git add hooks/guard.py",
@@ -91,8 +100,8 @@
       "delegated": "deny",
       "documented_in": [
         {
-          "file": "skills/orchestration/SKILL.md",
-          "heading": "## Commit safety"
+          "file": "docs/reference/safety.md",
+          "heading": "## Git"
         }
       ],
       "examples": [
@@ -122,8 +131,8 @@
       "delegated": "deny",
       "documented_in": [
         {
-          "file": "skills/orchestration/SKILL.md",
-          "heading": "## Git safety"
+          "file": "docs/reference/safety.md",
+          "heading": "## Git"
         }
       ],
       "examples": [
@@ -161,8 +170,8 @@
       "delegated": "deny",
       "documented_in": [
         {
-          "file": "skills/orchestration/SKILL.md",
-          "heading": "## Git safety"
+          "file": "docs/reference/safety.md",
+          "heading": "## Git"
         }
       ],
       "examples": [
@@ -195,8 +204,8 @@
       "delegated": "deny",
       "documented_in": [
         {
-          "file": "skills/orchestration/SKILL.md",
-          "heading": "## Git safety"
+          "file": "docs/reference/safety.md",
+          "heading": "## Git"
         }
       ],
       "examples": [
@@ -236,8 +245,8 @@
       "delegated": "deny",
       "documented_in": [
         {
-          "file": "skills/orchestration/SKILL.md",
-          "heading": "## Git safety"
+          "file": "docs/reference/safety.md",
+          "heading": "## Git"
         }
       ],
       "examples": [
@@ -275,8 +284,8 @@
       "delegated": "deny",
       "documented_in": [
         {
-          "file": "skills/orchestration/SKILL.md",
-          "heading": "## Git safety"
+          "file": "docs/reference/safety.md",
+          "heading": "## Git"
         }
       ],
       "examples": [
@@ -313,8 +322,8 @@
       "delegated": "deny",
       "documented_in": [
         {
-          "file": "skills/orchestration/SKILL.md",
-          "heading": "## Git safety"
+          "file": "docs/reference/safety.md",
+          "heading": "## Git"
         }
       ],
       "examples": [
@@ -345,8 +354,8 @@
       "delegated": "deny",
       "documented_in": [
         {
-          "file": "skills/orchestration/SKILL.md",
-          "heading": "## Git safety"
+          "file": "docs/reference/safety.md",
+          "heading": "## Git"
         }
       ],
       "examples": [
@@ -375,8 +384,8 @@
       "delegated": "deny",
       "documented_in": [
         {
-          "file": "skills/orchestration/SKILL.md",
-          "heading": "## Git safety"
+          "file": "docs/reference/safety.md",
+          "heading": "## Git"
         }
       ],
       "examples": [
@@ -412,8 +421,8 @@
       "delegated": "deny",
       "documented_in": [
         {
-          "file": "skills/orchestration/SKILL.md",
-          "heading": "## Autonomy boundary"
+          "file": "docs/reference/safety.md",
+          "heading": "## Destructive operations"
         }
       ],
       "examples": [
@@ -447,8 +456,8 @@
       "delegated": "deny",
       "documented_in": [
         {
-          "file": "skills/orchestration/SKILL.md",
-          "heading": "## Autonomy boundary"
+          "file": "docs/reference/safety.md",
+          "heading": "## Destructive operations"
         }
       ],
       "examples": [
@@ -477,8 +486,8 @@
       "delegated": "deny",
       "documented_in": [
         {
-          "file": "skills/orchestration/SKILL.md",
-          "heading": "## Autonomy boundary"
+          "file": "docs/reference/safety.md",
+          "heading": "## Destructive operations"
         }
       ],
       "examples": [
@@ -517,15 +526,11 @@
         ]
       },
       "hook": "ask",
-      "delegated": "deny",
+      "delegated": null,
       "documented_in": [
         {
-          "file": "skills/frappe-operations/SKILL.md",
-          "heading": "## Running without a prompt"
-        },
-        {
-          "file": "skills/orchestration/SKILL.md",
-          "heading": "### Live site access"
+          "file": "docs/reference/safety.md",
+          "heading": "## Sites"
         }
       ],
       "examples": [
@@ -541,6 +546,85 @@
         "bench --site dev.local list-apps",
         "bench --site dev.local backup",
         "bench build"
+      ],
+      "not_enforced_because": {
+        "delegated": "Covered inside a delegated run by bench-in-delegated-run, which denies every bench command: a delegated agent never runs bench at all."
+      }
+    },
+    {
+      "name": "bench-environment-change",
+      "intent": "Commands that change the bench itself rather than a site's data: updating every app and migrating every site (`bench update`), creating sites, fetching or removing apps, switching branches, regenerating the services setup. None is part of implementing a change, and `bench update` reaches every site at once (audit BUG-07).",
+      "match": {
+        "kind": "program_subcommand",
+        "program": "bench",
+        "subcommands": [
+          "update",
+          "setup",
+          "new-site",
+          "get-app",
+          "remove-app",
+          "switch-to-branch",
+          "switch-to-develop",
+          "migrate-env",
+          "init"
+        ]
+      },
+      "hook": "ask",
+      "delegated": null,
+      "documented_in": [
+        {
+          "file": "docs/reference/safety.md",
+          "heading": "## Destructive operations"
+        }
+      ],
+      "examples": [
+        "bench update",
+        "bench update --pull",
+        "bench new-site test.local",
+        "bench get-app erpnext",
+        "bench remove-app hrms",
+        "bench setup supervisor",
+        "bench switch-to-branch version-15"
+      ],
+      "not_examples": [
+        "bench build",
+        "bench --site dev.local migrate",
+        "bench start"
+      ],
+      "not_enforced_because": {
+        "delegated": "Covered inside a delegated run by bench-in-delegated-run, which denies every bench command: a delegated agent never runs bench at all."
+      }
+    },
+    {
+      "name": "bench-in-delegated-run",
+      "intent": "A delegated agent never runs bench: every Frappe operation is the orchestrator's, where the hook and the user can see it. One rule instead of a pattern per subcommand also keeps the delegated policy small enough for the environment variable that carries it.",
+      "match": {
+        "kind": "program",
+        "programs": [
+          "bench"
+        ]
+      },
+      "hook": null,
+      "delegated": "deny",
+      "not_enforced_because": {
+        "hook": "The hook decides bench commands per subcommand and site with the rules above; bench itself is not a boundary for Claude."
+      },
+      "documented_in": [
+        {
+          "file": "docs/reference/safety.md",
+          "heading": "## Agents"
+        }
+      ],
+      "examples": [
+        "bench build",
+        "bench --site dev.local migrate",
+        "bench restart",
+        "bench update",
+        "bench --site prod.example.com console"
+      ],
+      "not_examples": [
+        "benchmark run",
+        "git log"
       ]
     },
     {
@@ -557,8 +641,8 @@
       "delegated": null,
       "documented_in": [
         {
-          "file": "skills/frappe-operations/SKILL.md",
-          "heading": "## Running without a prompt"
+          "file": "docs/reference/safety.md",
+          "heading": "## Sites"
         }
       ],
       "examples": [
@@ -586,15 +670,11 @@
       },
       "hook": "ask",
       "site_access": true,
-      "delegated": "deny",
+      "delegated": null,
       "documented_in": [
         {
-          "file": "skills/orchestration/SKILL.md",
-          "heading": "### Live site access"
-        },
-        {
-          "file": "skills/frappe-operations/SKILL.md",
-          "heading": "## Site resolution"
+          "file": "docs/reference/safety.md",
+          "heading": "## Sites"
         }
       ],
       "examples": [
@@ -605,7 +685,10 @@
       "not_examples": [
         "bench build",
         "bench start"
-      ]
+      ],
+      "not_enforced_because": {
+        "delegated": "Covered inside a delegated run by bench-in-delegated-run, which denies every bench command: a delegated agent never runs bench at all."
+      }
     },
     {
       "name": "site-unnamed",
@@ -694,15 +777,11 @@
       },
       "hook": "ask",
       "site_access": true,
-      "delegated": "deny",
+      "delegated": null,
       "documented_in": [
         {
-          "file": "skills/frappe-operations/SKILL.md",
-          "heading": "## Site resolution"
-        },
-        {
-          "file": "skills/orchestration/SKILL.md",
-          "heading": "### Live site access"
+          "file": "docs/reference/safety.md",
+          "heading": "## Sites"
         }
       ],
       "examples": [
@@ -720,6 +799,38 @@
         "bench setup requirements",
         "bench init newbench",
         "bench version"
+      ],
+      "not_enforced_because": {
+        "delegated": "Covered inside a delegated run by bench-in-delegated-run, which denies every bench command: a delegated agent never runs bench at all."
+      }
+    },
+    {
+      "name": "remote-execution",
+      "intent": "A shell or file copy on another machine. Whatever runs there - including production, as in incident H-15 - is invisible to this hook, so the connection itself is the boundary.",
+      "match": {
+        "kind": "program",
+        "programs": [
+          "ssh",
+          "scp",
+          "sftp"
+        ]
+      },
+      "hook": "ask",
+      "delegated": "deny",
+      "documented_in": [
+        {
+          "file": "docs/reference/safety.md",
+          "heading": "## Destructive operations"
+        }
+      ],
+      "examples": [
+        "ssh prod",
+        "ssh frappe@erp.example.com 'bench --site x backup'",
+        "scp db.sql.gz prod:/tmp/"
+      ],
+      "not_examples": [
+        "ssh-keygen -l -f key.pub",
+        "git status"
       ]
     },
     {
@@ -736,8 +847,8 @@
       "delegated": "deny",
       "documented_in": [
         {
-          "file": "skills/orchestration/SKILL.md",
-          "heading": "### Live site access"
+          "file": "docs/reference/safety.md",
+          "heading": "## Sites"
         }
       ],
       "examples": [
@@ -768,17 +879,19 @@
       "delegated": null,
       "documented_in": [
         {
-          "file": "skills/orchestration/SKILL.md",
-          "heading": "### Live site access"
+          "file": "docs/reference/safety.md",
+          "heading": "## Sites"
         }
       ],
       "examples": [
         "python3 -c \"frappe.get_all('Customer')\"",
-        "echo 'frappe.get_doc(\"User\", \"x\")' | python3"
+        "python3 - <<'EOF'\nimport frappe\nfrappe.connect()\nEOF"
       ],
       "not_examples": [
         "python3 -c \"print('hello')\"",
-        "grep -r frappe_utils ."
+        "grep -r frappe_utils .",
+        "grep -rn 'frappe.get_all' apps/",
+        "echo frappe.db.sql"
       ],
       "not_enforced_because": {
         "delegated": "Not expressible as a command pattern: it matches an identifier anywhere in the command text, including inside a quoted snippet. The bench and database-client rules deny the delegated routes to the same place."
@@ -803,8 +916,8 @@
       "delegated": null,
       "documented_in": [
         {
-          "file": "skills/orchestration/SKILL.md",
-          "heading": "## Delegation"
+          "file": "docs/reference/safety.md",
+          "heading": "## Agents"
         }
       ],
       "examples": [
@@ -840,8 +953,8 @@
       "delegated": null,
       "documented_in": [
         {
-          "file": "skills/orchestration/SKILL.md",
-          "heading": "## Delegation"
+          "file": "docs/reference/safety.md",
+          "heading": "## Agents"
         }
       ],
       "examples": [
@@ -873,8 +986,8 @@
       "delegated": null,
       "documented_in": [
         {
-          "file": "skills/orchestration/SKILL.md",
-          "heading": "## Delegation"
+          "file": "docs/reference/safety.md",
+          "heading": "## Agents"
         }
       ],
       "examples": [

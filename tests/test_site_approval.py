@@ -39,6 +39,18 @@ def load_guard():
     return module
 
 
+# Development sites are the ones the user lists (`orch sites allow`), not a name suffix.
+# The suite lists its own in a scratch config dir that every hook process inherits;
+# unlisted.local proves that `.local` alone grants nothing, and client.local that a
+# protected site is never relaxed.
+SITES_CONFIG = tempfile.mkdtemp(prefix="orch-test-config-")
+Path(SITES_CONFIG, "sites.json").write_text(json.dumps({
+    "development": ["atyaf.local", "safeer.local", "masa.local", "falafel.local",
+                    "mysite.local", "a.b.local", "a.local", "b.local"],
+    "protected": ["client.local"],
+}))
+os.environ["FRAPPE_ORCHESTRATOR_CONFIG"] = SITES_CONFIG
+
 g = load_guard()
 
 
@@ -105,7 +117,9 @@ SESSION_B = "22222222-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 
 DEVELOPMENT = [
     ("atyaf.local", True), ("safeer.local", True), ("masa.local", True),
-    ("falafel.local", True), ("MYSITE.LOCAL", True), ("a.b.local", True),
+    ("falafel.local", True), ("mysite.local", True), ("MYSITE.LOCAL", False),
+    ("a.b.local", True),
+    ("unlisted.local", False), ("client.local", False),
     ("demo.example.com", False), ("erp.example.com", False), ("10.0.0.20", False),
     ("staging", False), ("dev-server", False), ("localhost", False), ("local", False),
     (".local", False), ("atyaf.local.", False), ("atyaf.localhost", False),
@@ -170,7 +184,8 @@ NO_SESSION = [
      "allow"),
     ("bench --site masa.local run-tests --app erpnext", "allow"),
     ("bench --site falafel.local list-apps", "allow"),
-    ("bench --site MYSITE.LOCAL list-apps", "allow"),
+    ("bench --site mysite.local list-apps", "allow"),
+    ("bench --site MYSITE.LOCAL list-apps", "ask"),   # a different directory
     ("bench -s atyaf.local console", "allow"),
     ("bench --site=atyaf.local list-apps", "allow"),
     ("cd ~/frappe-bench && bench --site atyaf.local list-apps 2>&1 | tail -20", "allow"),
@@ -184,6 +199,15 @@ NO_SESSION = [
     ("bench -s atyaf.local migrate --skip-failing", "allow"),
     ("bench --site=safeer.local clear-cache", "allow"),
     ("cd ~/frappe-bench && bench --site atyaf.local migrate 2>&1 | tail -40", "allow"),
+
+    # --- a .local name nobody listed, and one listed as protected --------------
+    ("bench --site unlisted.local console", "ask"),
+    ("bench --site unlisted.local migrate", "ask"),
+    ("bench --site client.local list-apps", "ask"),
+    ("bench --site atyaf.local migrate && bench --site client.local migrate", "ask"),
+
+    # --- several listed sites in one command: each reached site is listed --------
+    ("bench --site atyaf.local migrate && bench --site safeer.local migrate", "allow"),
 
     # --- not development: explicit, but protected -----------------------------
     ("bench --site demo.example.com console", "ask"),
@@ -214,15 +238,17 @@ NO_SESSION = [
     ("python3 -c \"frappe.init(site=s)\"", "ask"),
     ("bench --site $SITE console", "ask"),
 
-    # --- more than one site: nothing is relaxed -------------------------------
-    ("bench --site a.local console && bench --site b.local console", "ask"),
+    # --- more than one site: relaxed only when every one is listed --------------
+    # (audit recommendation 10: a rebuild across two listed dev sites asked 41 times)
+    ("bench --site a.local console && bench --site b.local console", "allow"),
     ("bench --site a.local --site b.local console", "ask"),
     ("bench --site atyaf.local console && bench --site demo.example.com console", "ask"),
     ("bench --site atyaf.local console && bench console", "ask"),
     ("bench --site atyaf.local console <<'EOF'\nfrappe.init(site='prod.example.com')\nEOF",
      "ask"),
     ("bench --site atyaf.local console && bench --site prod.example.com migrate", "ask"),
-    ("for s in a.local b.local; do bench --site $s console; done", None),
+    # The loop's site is a variable, so no site can be read: it asks.
+    ("for s in a.local b.local; do bench --site $s console; done", "ask"),
 
     # --- destructive operations: the stronger rule wins on a .local site ------
     ("bench --site atyaf.local reinstall --yes", "ask"),
@@ -242,7 +268,10 @@ NO_SESSION = [
     ("bench --site atyaf.local console && git reset --hard", "ask"),
     ("bench --site atyaf.local console && rm -rf sites/atyaf.local", "ask"),
     ("bench --site atyaf.local console && mysql -u root", "ask"),
-    ("bench --site atyaf.local console <<'EOF'\ngit push\nEOF", "ask"),
+    # The body is Python fed to the console, not shell: `git push` there is not a command.
+    # A shell reading the body is what makes it one.
+    ("bench --site atyaf.local console <<'EOF'\ngit push\nEOF", "allow"),
+    ("cat <<'EOF' | bash\ngit push\nEOF", "ask"),
 
     # --- an allow never carries something it did not look at ------------------
     ("bench --site atyaf.local console && curl http://example.com", None),
@@ -252,9 +281,11 @@ NO_SESSION = [
     ("bench --site atyaf.local console \\<<EOF\ncurl http://example.com\nEOF", None),
     ("grep \"x; bench --site a.local console <<EOF; tail \" f\ncurl http://example.com\nEOF",
      None),
-    ("echo 'print(1)' | bench --site atyaf.local console", None),
+    # The same input as a heredoc; echo itself acts on nothing.
+    ("echo 'print(1)' | bench --site atyaf.local console", "allow"),
     ("bench --site atyaf.local console <<'EOF'\nprint(1)\nEOF\ncurl http://example.com", None),
-    ("bench build && cd $(rm -rf ~)", None),
+    # The substitution is lexed now, so the recursive delete inside it is seen.
+    ("bench build && cd $(rm -rf ~)", "ask"),
 ]
 
 

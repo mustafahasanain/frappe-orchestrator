@@ -1,93 +1,343 @@
 {
-  "version": 1,
-  "models": {
-    "Kimi K2.6": {
-      "executor": "opencode",
-      "id": "opencode-go/kimi-k2.6"
+  "version": 2,
+  "description": "The single routing source. Orchestrator, implementers, fallback and review policy are separate concepts here. Claude models are family aliases; OpenCode and Codex models are ids, checked against each CLI's own catalog by scripts/orchlib.py. Model changes go through `scripts/orch models`, never through editing this file per release.",
+  "orchestrator": {
+    "claude_model_alias": "opus",
+    "note": "The main session's model comes from Claude Code settings (`\"model\": \"opus\"` in ~/.claude/settings.json; see `scripts/orch claude-default`). The plugin cannot change the model of a session that is already running."
+  },
+  "implementers": {
+    "opencode": {
+      "stable_model": "opencode-go/kimi-k2.7-code",
+      "candidate_families": [
+        "opencode-go/kimi-*",
+        "opencode-go/glm-*"
+      ],
+      "variants": {
+        "opencode-go/glm-5.3": "high",
+        "opencode-go/kimi-k3": "max"
+      },
+      "note": "Kimi K2.7 Code: 36 of 40 historical runs completed. Its catalog entry has no reasoning variants, so none is passed. A newer model replaces it only through `orch models verify` then `orch models promote`."
     },
-    "Kimi K2.7 Code": {
-      "executor": "opencode",
-      "id": "opencode-go/kimi-k2.7-code"
+    "sonnet": {
+      "subagent": "frappe-orchestrator:implementer",
+      "claude_model_alias": "sonnet"
     },
-    "Kimi K3": {
-      "executor": "opencode",
-      "id": "opencode-go/kimi-k3"
-    },
-    "GLM-5.3": {
-      "executor": "opencode",
-      "id": "opencode-go/glm-5.3"
-    },
-    "Claude Sonnet 5.5": {
-      "executor": "claude"
-    },
-    "Claude Opus 5.5": {
-      "executor": "claude",
-      "id": "claude-opus-5-5"
+    "opus": {
+      "executor": "session",
+      "claude_model_alias": "opus"
     }
   },
   "tiers": {
     "FAST": {
-      "model": "Kimi K2.6",
-      "effort": "low",
-      "timeout_seconds": 180,
-      "review_effort": "low",
-      "description": "Extremely clear, low risk, mechanical, very limited scope; latency is the priority."
+      "implementer": "sonnet",
+      "timeout_seconds": 300,
+      "description": "Text, labels, minor styling, mechanical one-liners. Sonnet subagent; no Codex by default."
     },
     "SMALL": {
-      "model": "Kimi K2.7 Code",
-      "effort": "low",
+      "implementer": "opencode",
       "timeout_seconds": 420,
-      "review_effort": "medium",
-      "description": "Clear requirement, limited scope, one or a few related files, no architecture impact, low regression risk."
+      "description": "Simple bug fix, minor UI change, isolated adjustment. OpenCode; Codex only when the review gate finds risk."
     },
     "NORMAL": {
-      "model": "Kimi K2.7 Code",
-      "effort": "medium",
+      "implementer": "opencode",
       "timeout_seconds": 900,
-      "review_effort": "medium",
-      "description": "Normal feature development, several related files, moderate business logic, manageable regression risk."
+      "description": "Typical feature, several files, moderate business logic. OpenCode; risk-based Codex review."
     },
     "DIFFICULT": {
-      "model": "Claude Sonnet 5.5",
-      "effort": "medium",
-      "effort_upgrade": "high",
+      "implementer": "opus-or-opencode",
       "timeout_seconds": 1800,
-      "review_effort": "high",
-      "description": "Subtle business logic, hard debugging, permissions, integration behaviour, data integrity, concurrency, complex migrations, architectural decisions, high ambiguity, or previous implementation failure. Raise effort to high when reasoning complexity or risk justifies it."
+      "description": "Hard debugging, architecture, data integrity, permissions, sensitive logic. Opus implements directly when it needs the control; otherwise OpenCode with a precise brief. Review required for significant code changes."
     }
   },
-  "escalation_ladder": [
-    {
-      "stage": "FAST",
-      "model": "Kimi K2.6",
-      "effort": "low"
+  "fallback": {
+    "from": "opencode",
+    "to": "sonnet",
+    "max_transitions_per_task": 1,
+    "note": "Allowed only when scripts/delegate reports fallback.allowed: the agent's whole process tree is confirmed gone and no other writer is active in the repository."
+  },
+  "review": {
+    "agent": "codex",
+    "codex_model": null,
+    "max_fix_rounds": 2,
+    "tiers": {
+      "FAST": {
+        "effort": "medium",
+        "expected_max_files": 2,
+        "expected_max_lines": 40
+      },
+      "SMALL": {
+        "effort": "medium",
+        "expected_max_files": 5,
+        "expected_max_lines": 200
+      },
+      "NORMAL": {
+        "effort": "medium",
+        "expected_max_files": 15,
+        "expected_max_lines": 800
+      },
+      "DIFFICULT": {
+        "effort": "high",
+        "expected_max_files": 40,
+        "expected_max_lines": 3000,
+        "significant_code_lines": 10
+      }
     },
-    {
-      "stage": "SMALL",
-      "model": "Kimi K2.7 Code",
-      "effort": "low"
-    },
-    {
-      "stage": "NORMAL",
-      "model": "Kimi K2.7 Code",
-      "effort": "medium"
-    },
-    {
-      "stage": "DIFFICULT / first escalation",
-      "model": "Claude Sonnet 5.5",
-      "effort": "medium or high"
-    },
-    {
-      "stage": "fallback",
-      "model": "GLM-5.3",
-      "effort": "medium"
-    },
-    {
-      "stage": "exceptional escalation",
-      "model": "Claude Opus 5.5",
-      "effort": "high"
+    "triggers": [
+      {
+        "name": "auth-or-permissions",
+        "level": "mandatory",
+        "paths": [
+          "*permission*.py",
+          "*/auth/*",
+          "*/auth.*",
+          "*middleware.ts",
+          "*middleware.js"
+        ],
+        "lines": [
+          "has_permission",
+          "permission_query_conditions",
+          "ignore_permissions",
+          "only_for\\(",
+          "check_permission",
+          "allow_guest\\s*=\\s*True",
+          "frappe\\.set_user",
+          "session\\.user\\s*=",
+          "\\bpassword\\b",
+          "api_(key|secret)",
+          "\\boauth",
+          "\\bjwt\\b",
+          "csrf",
+          "authori[sz]",
+          "authenticat",
+          "\\blogin\\(",
+          "getServerSession|next-auth|auth\\(\\)"
+        ]
+      },
+      {
+        "name": "doctype-permissions",
+        "level": "mandatory",
+        "paths": [
+          "*/doctype/*/*.json",
+          "*/custom/*.json",
+          "*/report/*/*.json",
+          "*/page/*/*.json",
+          "*/web_form/*/*.json"
+        ],
+        "lines": [
+          "\"(permlevel|role|roles|if_owner|share|export|delete|submit|cancel|amend|set_user_permissions|allow_guest|login_required|apply_user_permissions|query)\""
+        ],
+        "require_both": true,
+        "code_only": false,
+        "note": "Who may see or change records: DocType permission rows, report and page roles, web-form guest access, Query Report SQL."
+      },
+      {
+        "name": "financial-calculation",
+        "level": "mandatory",
+        "lines": [
+          "gl_entr",
+          "make_gl_entries",
+          "ledger",
+          "exchange_rate",
+          "conversion_rate",
+          "outstanding_amount",
+          "grand_total",
+          "net_total",
+          "rounded_total",
+          "base_\\w*(amount|total)",
+          "taxes_and_charges",
+          "valuation_rate",
+          "\\bdebit\\b",
+          "\\bcredit\\b",
+          "paid_amount",
+          "allocated_amount",
+          "flt\\(.*(amount|rate|total|qty)",
+          "round\\(.*(amount|rate|total)"
+        ]
+      },
+      {
+        "name": "data-integrity-or-destructive",
+        "level": "mandatory",
+        "lines": [
+          "delete_doc",
+          "db\\.delete",
+          "db\\.sql\\(.*\\b(delete|update|insert|drop|alter|truncate)\\b",
+          "DELETE\\s+FROM",
+          "UPDATE\\s+\\S+\\s+SET",
+          "DROP\\s+(TABLE|COLUMN|DATABASE)",
+          "TRUNCATE",
+          "ALTER\\s+TABLE",
+          "rename_doc",
+          "db_set\\(",
+          "db\\.set_value\\(",
+          "bulk_(update|delete)",
+          "db\\.commit\\(",
+          "ignore_(validate|mandatory|links)",
+          "flags\\.ignore_"
+        ]
+      },
+      {
+        "name": "schema-or-migration",
+        "level": "mandatory",
+        "paths": [
+          "*patches.txt",
+          "*/patches/*",
+          "*/migrations/*",
+          "*.sql",
+          "*/fixtures/*",
+          "*schema.prisma"
+        ]
+      },
+      {
+        "name": "doctype-schema-change",
+        "level": "mandatory",
+        "paths": [
+          "*/doctype/*/*.json"
+        ],
+        "removed_lines": [
+          "\"(fieldname|fieldtype|options|unique|reqd|autoname|naming_rule|is_submittable|istable|issingle)\""
+        ],
+        "added_lines": [
+          "\"(unique|reqd|is_submittable|istable|issingle)\"\\s*:\\s*1",
+          "\"(autoname|naming_rule)\""
+        ],
+        "require_both": true,
+        "code_only": false,
+        "note": "Changing or removing existing schema, or adding constraints, can lose or reject data."
+      },
+      {
+        "name": "doctype-new-fields",
+        "level": "advisory",
+        "paths": [
+          "*/doctype/*/*.json"
+        ],
+        "added_lines": [
+          "\"fieldname\""
+        ],
+        "require_both": true,
+        "code_only": false,
+        "note": "Additive fields: migrate needed, review not forced."
+      },
+      {
+        "name": "concurrency-locking",
+        "level": "mandatory",
+        "lines": [
+          "for_update\\s*=\\s*True",
+          "for update",
+          "get_lock",
+          "filelock",
+          "threading\\.",
+          "multiprocessing",
+          "savepoint",
+          "rollback\\("
+        ]
+      },
+      {
+        "name": "global-hooks",
+        "level": "mandatory",
+        "paths": [
+          "*hooks.py"
+        ],
+        "lines": [
+          "override_whitelisted_methods",
+          "override_doctype_class",
+          "permission_query_conditions",
+          "has_permission",
+          "auth_hooks",
+          "on_session_creation",
+          "on_login",
+          "before_request",
+          "after_request"
+        ],
+        "require_both": true
+      },
+      {
+        "name": "secrets-or-deployment",
+        "level": "mandatory",
+        "paths": [
+          "*.env",
+          "*.env.*",
+          "*site_config.json",
+          "*Dockerfile*",
+          "*docker-compose*",
+          "*.github/workflows/*",
+          "*nginx*",
+          "*supervisor*",
+          "*Procfile*",
+          "*deploy*"
+        ]
+      },
+      {
+        "name": "dependencies-or-tooling",
+        "level": "mandatory",
+        "paths": [
+          "*package.json",
+          "*package-lock.json",
+          "*yarn.lock",
+          "*pnpm-lock.yaml",
+          "*requirements*.txt",
+          "*pyproject.toml",
+          "*setup.py",
+          "*setup.cfg",
+          "*Pipfile",
+          "*Pipfile.lock",
+          "*poetry.lock",
+          "*uv.lock",
+          "*.pre-commit-config.yaml",
+          "*Makefile",
+          "*.mk",
+          "*.sh",
+          "*.bash",
+          "*.zsh"
+        ],
+        "note": "Dependencies, install hooks and scripts run code outside the app's own review surface."
+      },
+      {
+        "name": "hooks-change",
+        "level": "risk",
+        "paths": [
+          "*hooks.py"
+        ]
+      },
+      {
+        "name": "background-jobs",
+        "level": "risk",
+        "lines": [
+          "frappe\\.enqueue",
+          "enqueue_doc",
+          "scheduler_events"
+        ]
+      },
+      {
+        "name": "external-integration",
+        "level": "risk",
+        "lines": [
+          "requests\\.(get|post|put|delete|patch)",
+          "make_(get|post|put)_request",
+          "\\bfetch\\(",
+          "axios",
+          "httpx",
+          "urllib",
+          "webhook",
+          "frappe\\.sendmail",
+          "smtplib"
+        ]
+      },
+      {
+        "name": "api-surface",
+        "level": "advisory",
+        "lines": [
+          "@frappe\\.whitelist",
+          "export async function (GET|POST|PUT|DELETE|PATCH)",
+          "['\"]use server['\"]"
+        ]
+      }
+    ],
+    "levels": {
+      "mandatory": "review required on every tier",
+      "risk": "review required on NORMAL and DIFFICULT; advisory on FAST and SMALL",
+      "advisory": "recorded in the gate's advisories; never forces a review"
     }
-  ],
+  },
   "deliberation": {
     "enabled": true,
     "trigger_tiers": [
@@ -99,19 +349,13 @@
       "high-risk-decision"
     ],
     "user_trigger": "user-request",
-    "claude_model": "Claude Opus 5.5",
+    "claude_model_alias": "opus",
+    "claude_model_prefix": "claude-opus-",
     "claude_auxiliary_model_prefixes": [
       "claude-haiku-"
     ],
     "effort": "high",
     "timeout_seconds": 900,
-    "description": "Debate Mode: Claude (claude_model) and Codex as independent, read-only architectural advisers before implementation. Two stages only - independent positions, then one cross-critique - fixed in scripts/delegate, not here. Automatic only on trigger_tiers and only with one of triggers; user_trigger is an explicit user request and is honoured on any tier. claude_auxiliary_model_prefixes are the only models other than claude_model allowed to appear in a Claude run's model usage: Claude Code's own housekeeping model, never the one answering."
-  },
-  "special_models": {
-    "Kimi K3": {
-      "effort": "medium",
-      "default_for_tier": false,
-      "description": "Not a default implementation model. Selective use when a task particularly benefits from large repository context, long-horizon reasoning, or broad codebase analysis. Not for routine implementation where Kimi K2.7 Code is sufficient."
-    }
+    "description": "Debate Mode: Claude Opus (by alias) and Codex as independent, read-only architectural advisers before implementation. Two stages only. Never automatic for ordinary work; see the orchestration skill."
   }
 }

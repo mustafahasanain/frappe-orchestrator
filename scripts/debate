@@ -23,10 +23,11 @@ stage two does not run, because a critique of a missing side would be a fabricat
 either critique is unusable, the debate is incomplete. Incomplete is reported as
 incomplete, with the reasons, and never as a debate that happened.
 
-Exit status is 0 whenever a result was produced, complete or incomplete; read "status".
-Exit status 2 means the invocation was refused - by this runner or by the dispatcher's
-own validation, which is run first as a dry run so that nothing starts when it would be
-refused.
+Exit status is 0 for a complete debate and 3 for an incomplete or interrupted one (a
+result is still printed; read "status"). Exit status 2 means the invocation was refused -
+by this runner or by the dispatcher's own validation, which is run first as a dry run so
+that nothing starts when it would be refused. SIGTERM, SIGHUP and SIGINT are passed on to
+the running dispatchers, which stop their agents' process trees.
 """
 
 import argparse
@@ -38,6 +39,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import orchlib  # noqa: E402
+
 DELEGATE = Path(__file__).resolve().parent / "delegate"
 
 # Who takes part. Fixed, not configured: these are the two agents the dispatcher accepts
@@ -46,6 +50,15 @@ PARTICIPANTS = ("claude", "codex")
 STAGES = ("position", "critique")
 
 ENCODING = "utf-8"
+INCOMPLETE_EXIT = 3
+
+
+class Interrupted(Exception):
+    pass
+
+
+def _interrupt(_signum, _frame):
+    raise Interrupted()
 
 
 def artifact(directory, agent, stage):
@@ -100,6 +113,8 @@ def preflight(args, brief):
 def run_stage(stage, args, brief, directory):
     """Run one stage for both advisers in parallel. {agent: result dict or None}."""
     procs = {}
+    for name in ("SIGTERM", "SIGHUP", "SIGINT"):
+        signal.signal(getattr(signal, name), _interrupt)
     try:
         for agent in PARTICIPANTS:
             out = open(artifact(directory, agent, stage), "w", encoding=ENCODING)
@@ -115,12 +130,19 @@ def run_stage(stage, args, brief, directory):
             proc.stdin.close()
         for proc, out, err in procs.values():
             proc.wait()
-    except KeyboardInterrupt:
-        # The dispatcher passes SIGINT on to the agent's own process group; SIGTERM would
-        # stop the dispatcher and leave the agent running.
+    except Interrupted:
+        # Each dispatcher stops its own agent's process tree on SIGTERM and still writes
+        # its result, so the signal is passed on and the runner waits for them.
+        for name in ("SIGTERM", "SIGHUP", "SIGINT"):
+            signal.signal(getattr(signal, name), signal.SIG_IGN)
         for proc, _out, _err in procs.values():
             if proc.poll() is None:
-                proc.send_signal(signal.SIGINT)
+                proc.send_signal(signal.SIGTERM)
+        for proc, _out, _err in procs.values():
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
         raise
     finally:
         for _proc, out, err in procs.values():
@@ -193,7 +215,8 @@ def main():
         parser.error(refused)
 
     # Outside the repository, like every delegation artifact.
-    directory = Path(tempfile.mkdtemp(prefix="debate-"))
+    directory = Path(tempfile.mkdtemp(
+        prefix="debate-", dir=str(orchlib.private(orchlib.state_dir() / "runs"))))
     (directory / "brief.md").write_text(brief, encoding=ENCODING)
     print("debate: %s" % directory, file=sys.stderr)
 
@@ -213,7 +236,13 @@ def main():
     }
 
     for stage in STAGES:
-        results = run_stage(stage, args, brief, directory)
+        try:
+            results = run_stage(stage, args, brief, directory)
+        except Interrupted:
+            result["status"] = "interrupted"
+            result["failures"].append({"stage": stage, "status": "interrupted",
+                                       "reasons": ["the debate was stopped by a signal"]})
+            break
         result["stages_run"].append(stage)
         for agent in PARTICIPANTS:
             data = results.get(agent)
@@ -224,8 +253,13 @@ def main():
         failed = failures_of(stage, results, directory)
         if failed:
             result["failures"] = failed
-            # One side is not a debate. What was produced stays on disk for the record,
-            # but the result carries no positions or critiques to build a decision on.
+            # One side is not a debate, so "positions" and "critiques" stay empty. What
+            # was usable is kept under "partial" - never presented as a debate, but not
+            # thrown away either (audit BUG-13).
+            result["partial"] = {
+                "positions": {a: r for a, r in result["positions"].items() if r},
+                "critiques": {a: r for a, r in result["critiques"].items() if r},
+            }
             result["positions"], result["critiques"] = {}, {}
             break
     else:
@@ -235,7 +269,8 @@ def main():
                                            encoding=ENCODING)
     json.dump(result, sys.stdout, indent=2)
     print()
+    return 0 if result["status"] == "complete" else INCOMPLETE_EXIT
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,153 +1,118 @@
 # frappe-orchestrator
 
-A Claude Code plugin that makes Claude the orchestrator rather than the implementer:
-it classifies a task, picks a model from central routing, delegates the work to an
-external coding-agent CLI (OpenCode or Codex) through a single dispatcher, runs a
-bounded review loop over the result, and holds every run inside the same Git, staging
-and live-site boundaries.
+A Claude Code plugin for Frappe/ERPNext and Next.js work. The main session (Opus)
+orchestrates; OpenCode implements routine coding to save Claude tokens; a Sonnet subagent
+handles trivial edits and takes over when OpenCode fails; Codex reviews only the changes
+that carry real risk. A hook holds every run inside the same Git, site and destructive-
+operation boundaries, with as few prompts as that allows.
+
+| Tier | Implementer | Codex review |
+|---|---|---|
+| FAST — text, labels, minor styling | Sonnet subagent | only on a mandatory trigger |
+| SMALL — simple fix, minor UI | OpenCode | only when the gate finds risk |
+| NORMAL — typical feature | OpenCode | risk-based |
+| DIFFICULT — architecture, data integrity, permissions | Opus directly, or OpenCode | required for significant changes |
+
+Mandatory review triggers, on any tier: authentication/authorization and permissions,
+financial calculations, data integrity and destructive data operations, schema changes and
+migrations, locking, global hook overrides, secrets and deployment files, dependencies and
+shell scripts, and whitelisted endpoints, public pages or Jinja templates that read, write
+or expose data. The gate reads the actual diff (`orch gate`) and fails closed: anything it
+could not assess, or a gate that errored, requires a review. A skipped review is recorded
+as `review: not_required`, never as a pass.
 
 | Component | Where |
-| :-- | :-- |
-| Skills | `skills/orchestration`, `skills/project-context`, `skills/frappe-operations`, `skills/development-report` |
-| Enforcement hook | `hooks/guard.py` (`PreToolUse` and `PostToolUse` on `Bash`) |
-| Delegation dispatcher | `scripts/delegate` |
-| Debate Mode runner | `scripts/debate` |
-| Development report | `scripts/dev-report` (on request only) |
-| Boundaries and routing | `config/command-boundaries.json`, `config/model-routing.json` |
-
-The hook and the dispatcher's permission policy are the two enforcement layers, and
-they read their rules from `config/command-boundaries.json` rather than keeping copies.
-
-## Debate Mode
-
-For a DIFFICULT task that genuinely needs architectural deliberation — ambiguous
-structure, competing approaches, or a high-risk design decision — or when the user asks
-for one, `scripts/debate` puts Claude Opus and Codex in front of the question as
-independent, read-only advisers before anything is implemented. Two stages and no more:
-each states a position without seeing the other's, then each critiques the other's.
-Claude, the orchestrator, makes the decision and the normal implementation and review
-workflow follows; the debate never replaces the post-implementation Codex review.
-Difficulty alone does not trigger it. Configuration is the `deliberation` block of
-`config/model-routing.json`; the rules are in `skills/orchestration/SKILL.md` under
-*Debate Mode*.
+|---|---|
+| Skills | `skills/orchestration` (runtime rules, ~8 KB), `skills/frappe-operations`, `skills/project-context`, `skills/development-report` |
+| Sonnet subagent | `agents/implementer.md` (`model: sonnet`) |
+| Hook | `hooks/guard.py` — Bash (Pre/Post) and Edit/Write (Pre) |
+| Dispatcher | `scripts/delegate` — one agent run, structured JSON result |
+| Control | `scripts/orch` — status/stop, review gate, models, sites, Claude default, metrics |
+| Shared mechanics | `scripts/orchlib.py` |
+| Debate Mode | `scripts/debate` (on request only) |
+| Rules and routing | `config/command-boundaries.json`, `config/model-routing.json` |
+| Reference | `docs/reference/` (safety, orchestration, debate); history in `docs/history/` |
 
 ## Requirements
 
-- **Claude Code with the `plugin` CLI** (`claude plugin --help`). Verified on 2.1.240.
-- **Python 3.** `hooks/guard.py` and `scripts/delegate` run under the system
-  interpreter; no packages beyond the standard library.
-- **[OpenCode](https://opencode.ai), Linux build.** The only agent that runs `implement`.
-- **[Codex CLI](https://github.com/openai/codex).** Runs `review`, `test`, and `onboard` —
-  a reviewer that wrote the code it reviews is not an independent reviewer, so the two
-  agents never overlap — and the Codex side of `deliberate`.
-- **The `claude` CLI, logged in, for Debate Mode only.** Runs the Opus side of
-  `deliberate`, read-only and pinned to the model id in the routing file. Verified
-  against 2.1.288; the flags it relies on are listed in `adapt_claude`.
-- **For the development report only:** Google Chrome or Chromium, poppler-utils, and an
-  Arabic font (Noto Sans Arabic / Noto Kufi Arabic). Nothing else in the plugin needs
-  them. Ask for a report in so many words — "Create today's development report" — and it
-  is written to `reports/<date>-development-report-ar.pdf`; it never runs on its own.
+- Claude Code with the `plugin` CLI (verified on 2.1.302), and Python 3 (standard library only).
+- [OpenCode](https://opencode.ai), Linux build first on `PATH` (`which -a opencode`). On
+  WSL a Windows build would not receive the permission policy.
+- [Codex CLI](https://github.com/openai/codex) for reviews.
+- For the development report only: Chrome/Chromium, poppler-utils, an Arabic font.
 
-### PATH order matters
-
-On WSL, an npm install on the Windows side puts a second `opencode` and `codex` on your
-PATH. The Linux build must resolve first:
+## One-time setup
 
 ```bash
-which -a opencode   # the Linux path must be the first line
-which -a codex
+scripts/orch claude-default            # new sessions default to "model": "opus"? (--apply sets it, with a backup)
+scripts/orch models status             # OpenCode and Codex models, and whether each CLI offers them
+scripts/orch sites allow <dev-site>    # each development site with NO real client data
+scripts/orch sites protect <site>      # sites holding restored client data: always ask
 ```
 
-This is not a preference. The dispatcher delivers OpenCode's deny-list through
-`OPENCODE_CONFIG_CONTENT` in the child environment. A Linux OpenCode reads it directly.
-A *Windows* OpenCode only receives an environment variable that `WSLENV` names, and if it
-does not arrive the permission policy is not weakened but **absent** — zero bash rules,
-after which `--auto` approves everything. A delegated run has executed `bench migrate`
-unrefused that way. `scripts/delegate` sets `WSLENV` unconditionally to cover the case,
-but which binary `opencode` resolves to is a property of PATH, which nothing in this
-repo controls. Each result records the binary that actually ran in `agent_path`.
+A `.local` name no longer makes a site a development site. Until a site is listed, the
+first routine command reaching it asks once per Claude Code session.
 
-## Installation
+## Models without editing the plugin
 
-This repository is its own single-plugin marketplace (`.claude-plugin/marketplace.json`),
-so it installs from the working tree. Run both commands once, from anywhere:
+- Claude: aliases only (`opus` for the session, `sonnet` for the subagent).
+- OpenCode: the stable model is `opencode-go/kimi-k2.7-code`. `orch models discover` lists
+  newer candidates in the configured families; `orch models verify <id>` runs one real smoke
+  task (it costs usage, so the hook asks); `orch models promote <id>` switches to a verified
+  candidate; `orch models reset` goes back. A promoted model that leaves the catalog falls
+  back to the stable one automatically.
+- Codex: its own `config.toml` model, or `orch models codex <id>`. A model the installed CLI
+  does not offer fails in under a second as `invalid_model`, listing what it does offer.
+
+## Installation and activation
+
+The marketplace source is a `directory`, so **the checkout it points at is what runs** —
+for every session in every repository. Develop in a separate worktree, never in the
+installed checkout, and only point the marketplace at a commit whose tests pass.
 
 ```bash
 claude plugin marketplace add /path/to/frappe-orchestrator
 claude plugin install frappe-orchestrator@frappe-orchestrator --scope user
 ```
 
-`--scope user` registers it in `~/.claude/settings.json`, so it loads in every session in
-every repository with no `--plugin-dir` flag. Confirm:
+Hooks and scripts reload on the next command; skills on the next session or
+`/reload-plugins`. To try a checkout for one session without touching the install:
+`claude --plugin-dir /path/to/checkout`.
+
+## Tests
 
 ```bash
-claude plugin list          # frappe-orchestrator@frappe-orchestrator — enabled
-claude plugin details frappe-orchestrator@frappe-orchestrator   # 4 skills; hooks: PreToolUse, PostToolUse
+for t in tests/test_*.py; do python3 "$t" || break; done
 ```
 
-A `directory` marketplace source is used **in place**. `CLAUDE_PLUGIN_ROOT` resolves to
-this checkout, so the `hooks/guard.py` that runs, the `config/` it reads its boundaries
-from, the `scripts/delegate` its messages point at, and the skills Claude loads are all
-the files in this directory — not a copy. Keep the repository where it is: the
-marketplace entry is a path to it, and moving or deleting the directory disables
-enforcement everywhere.
+All stub-based: no provider is called. `test_lifecycle` (signals, timeouts, orphans,
+fallback safety), `test_permissions` and `test_scenarios` (prompt counts against the
+baseline hook, protected commands, the edit guard, the delegated policy under OpenCode's
+matcher), `test_review_gate`, `test_parser`, `test_site_approval`, `test_debate`,
+`test_dev_report`.
 
-## Updating after a commit
+## Limits
 
-Because the plugin runs from the working tree, a change is live as soon as a session
-loads it. There is nothing to sync:
-
-| What you changed | When it takes effect |
-| :-- | :-- |
-| `skills/**/SKILL.md` body | Immediately, in sessions already open |
-| `hooks/`, `config/`, `scripts/` | Next session, or `/reload-plugins` in an open one |
-
-The cost of that is worth stating plainly: a broken working tree is broken enforcement in
-every session, not just this repository's. Run `python3 tests/test_parser.py`,
-`python3 tests/test_debate.py` and `python3 tests/test_dev_report.py` before you leave a
-change in the tree.
-
-The two update commands are bookkeeping. `plugin.json` carries **no `version` field**, so
-Claude Code stamps the install with the source commit SHA; a pinned version would freeze
-that stamp and, if this marketplace ever moves to a git or GitHub source — where plugins
-*are* copied into `~/.claude/plugins/cache` — would silently keep serving a stale copy.
-Re-stamp after a commit:
-
-```bash
-claude plugin marketplace update frappe-orchestrator
-claude plugin update frappe-orchestrator@frappe-orchestrator
-```
-
-The stamp should then match `HEAD`. This tells you the recorded version is current; it is
-not what decides which code runs.
-
-```bash
-git rev-parse --short=12 HEAD                     # repository
-claude plugin list | grep -A1 frappe-orchestrator # installed stamp
-```
+- The hook reads command text. It cannot see a site chosen inside a script file, or what
+  runs on a remote host (remote connections ask instead).
+- The delegated OpenCode policy is a deny list under `--auto`, where everything else is
+  approved. Wrapped and path-qualified forms are covered; interpreters and variables are
+  not. The real containment is the tree snapshot around every run, the diff, and the
+  review gate. An interactive OpenCode "Allow always" and its server's shell endpoint are
+  outside the dispatcher's reach.
+- The edit guard covers Claude's Edit/Write tools. A Bash command that writes files
+  (`sed -i`) while a delegated writer is running is not blocked by it.
+- A commit's approval is the hook's prompt. Whether a hook `ask` still prompts in a session
+  running with permissions bypassed is not documented by Claude Code; do not rely on that
+  mode for work whose commits you want to approve.
+- An agent that escapes both its process group and the run marker (clearing its own
+  environment) would not be found by `orch status`. Nothing observed does this.
 
 ## Disabling
 
-Turn it off without losing the install — reversible with `enable`:
-
 ```bash
-claude plugin disable frappe-orchestrator@frappe-orchestrator
-claude plugin enable  frappe-orchestrator@frappe-orchestrator
+claude plugin disable frappe-orchestrator@frappe-orchestrator   # reversible: enable
+claude --safe-mode                                              # one session, no plugins
 ```
 
-To remove it completely:
-
-```bash
-claude plugin uninstall frappe-orchestrator@frappe-orchestrator
-claude plugin marketplace remove frappe-orchestrator
-```
-
-For one session only, `claude --safe-mode` starts with all customizations disabled,
-this plugin included.
-
-Disabling removes the enforcement hook along with the skills. The push, blanket-staging,
-live-site and bare-agent boundaries stop being enforced.
-
-To turn off Debate Mode alone, set `deliberation.enabled` to `false` in
-`config/model-routing.json`; the dispatcher then refuses every `deliberate` run,
-including one the user asked for.
+Disabling removes the hook along with the skills, and with it every boundary above.

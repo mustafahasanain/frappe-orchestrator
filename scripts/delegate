@@ -5,22 +5,34 @@ Reads a brief on stdin, runs the requested agent CLI in the repository working t
 and prints a structured result as JSON. Execution mechanics only - it makes no task,
 model, or review decisions. Those belong to the orchestrator.
 
-Exit status is 0 whenever a result was produced, including a failed, timed out, or
-missing-CLI run; read the "status" field. Exit status 2 means the invocation itself
-was wrong.
+Exit status is 0 whenever a result was produced, including a failed, timed out,
+interrupted, or missing-CLI run; read the "status" field. Exit status 2 means the
+invocation itself was wrong.
+
+Lifecycle guarantees (audit BUG-01): the agent runs in its own process group and carries
+marker variables in its environment; SIGTERM, SIGHUP and SIGINT to this dispatcher
+terminate that whole group and still write result.json; the agent is given
+PR_SET_PDEATHSIG so it dies with the dispatcher even on SIGKILL; and a writer-mode run
+refuses to start while another delegated writer is alive in the same repository.
 """
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import orchlib  # noqa: E402
 
 ROUTING = Path(__file__).resolve().parent.parent / "config" / "model-routing.json"
 
@@ -147,7 +159,9 @@ def rule_patterns(rule):
     kind = match.get("kind")
 
     if kind == "program":
-        return ["%s*" % name for name in match["programs"]]
+        # The program alone or with arguments - never a longer name: `ssh*` would also
+        # deny `ssh-keygen`, and `dd*` every program starting with dd.
+        return [form % name for name in match["programs"] for form in ("%s", "%s *")]
 
     program = match.get("program")
 
@@ -197,13 +211,32 @@ def rule_patterns(rule):
     return []   # a kind this consumer does not implement; the suite fails by rule name
 
 
+# OpenCode matches each parsed command's source text from its first character
+# (docs/history/OPENCODE_MATCHER_REPORT.md §2.5, §4.2-4.5), so `git push*` misses
+# `/usr/bin/git push`, `env X=1 git push`, `sudo git push` and `bash -c 'git push'`. Each
+# deny pattern is therefore also emitted after a space or a slash (wrapped or
+# path-qualified) and after a quote (inside a `-c` script). That over-matches text such as
+# `echo git push` or `grep mysql notes`, which is the right direction for an unattended
+# agent. It still cannot see through interpreters (`python -c "subprocess.run(...)"`) or
+# variables: the delegated policy is best-effort, and the real containment is the
+# pre/post tree snapshot plus the diff the orchestrator inspects. See
+# docs/reference/safety.md "Agents".
+WRAPPER_PREFIXES = ("* ", "*/")
+QUOTE_PREFIXES = ("*'", '*"')
+
+
 def denied_bash(rules):
     """Every pattern denied inside a delegated run, from the shared boundary data."""
     patterns = []
     for rule in rules:
-        if rule.get("delegated") == "deny":
-            patterns += rule_patterns(rule)
-    return patterns
+        if rule.get("delegated") != "deny":
+            continue
+        for pattern in rule_patterns(rule):
+            tail = pattern if pattern.endswith("*") else pattern + "*"
+            patterns.append(pattern)
+            patterns += [prefix + pattern for prefix in WRAPPER_PREFIXES]
+            patterns += [prefix + tail for prefix in QUOTE_PREFIXES]
+    return list(dict.fromkeys(patterns))
 
 
 def opencode_permissions(rules):
@@ -232,7 +265,11 @@ CONTRACTS = {
     "implement": """## Requested output
 
 Make the change in the repository working tree. Read the files you need directly;
-do not ask for them to be pasted.
+do not ask for them to be pasted. Stay inside the requested scope: no unrelated
+refactors or reformatting. Do not run bench, migrations, database commands, or any git
+command that writes (add, commit, checkout, reset, stash, push) - the orchestrator owns
+those. Run only quick local checks (a syntax check, a targeted unit test that needs no
+site or database).
 
 """
     + _TAIL
@@ -255,8 +292,14 @@ you could not finish.
     "review": """## Requested output
 
 You are reviewing, not implementing. Do not modify production code. Inspect the
-actual diff and the affected code, run the tests that the change actually warrants,
-and report what you find.
+actual diff and the affected code, and report what you find.
+
+Your sandbox is read-only with no network: MariaDB, Redis, a Frappe site and a browser
+are unreachable, so tests that need them cannot run here. That is expected and is not a
+reason for BLOCKED. Review statically, run only checks that work without services, list
+what you could not run under "tests_not_run", and use the orchestrator's test results
+when the brief includes them. Never say a test passed unless you ran it or it appears in
+those results.
 
 Use "blocking" only for findings that must be fixed before this can be committed:
 incorrect behaviour, a broken requirement, a runtime error, a clear regression, a
@@ -271,9 +314,8 @@ issues without a concrete failure mode.
 Return FAIL only when at least one finding is "blocking". A review whose findings are
 all "non_blocking" is a PASS; report those findings anyway.
 
-Return BLOCKED, not FAIL, when verification could not be completed reliably - a
-missing dependency, an unavailable service, a broken test environment. BLOCKED is
-not a verdict on the implementation.
+Return BLOCKED, not FAIL, only when you could not review the change at all - the diff
+or the affected code could not be read. BLOCKED is not a verdict on the implementation.
 
 """
     + _TAIL
@@ -289,7 +331,8 @@ not a verdict on the implementation.
                     "detail": "<what is wrong and why it matters>",
                 }
             ],
-            "tests_run": ["<command>"],
+            "tests_run": ["<command you actually ran>"],
+            "tests_not_run": ["<test that applies but needs a service you cannot reach>"],
             "missing_coverage": ["<behaviour a test should protect but none does>"],
         },
         indent=2,
@@ -467,36 +510,31 @@ DECISION_KEYS = ("winner", "final_decision")
 # --------------------------------------------------------------------------
 # Review scope
 #
-# The review contract is the same on every tier; how far a review reaches is not. A
-# review was the slow half of every task - two to five minutes against one for the
-# implementation - and most of that was a reviewer re-establishing the whole change from
-# scratch: on a one-line FAST fix, and again on every re-review after a FAIL, where the
-# only open questions are the findings it already reported.
-#
-# So two reviews are narrowed, and both by the dispatcher rather than by the brief, for
-# the same reason the contract is appended here: the scope holds even when the
-# orchestrator forgets to state it. A FAST first review looks at the diff. A re-review
-# looks at its own previous blocking findings and at what the fix changed. Both get the
-# diff in the brief, so the reviewer starts from the change instead of looking for it.
-# Every other review keeps the full reach of its tier.
-#
-# Neither relaxes the contract. A re-review that finds a real regression still reports
-# it as blocking, and a finding that is not resolved is blocking again.
+# A review was the slow half of every task (median ~135 s), mostly spent re-establishing
+# the change from scratch. Every review is therefore scoped by the dispatcher, not left
+# to the brief: a first review gets the diff (optionally narrowed to --files) and is
+# told to review the change, not the repository; a re-review gets its previous blocking
+# findings and checks only those plus what the fix touched. Neither relaxes the
+# contract: a real regression is still blocking.
 # --------------------------------------------------------------------------
 
-REVIEW_SCOPE_FAST = """## Review scope: lightweight
+REVIEW_SCOPE_FIRST = """## Review scope: the change
 
-This is a FAST-tier change: small, mechanical, low risk. Keep the review short and
-targeted.
-
-- Review the changed lines in the diff below, and read surrounding code only where it
-  is needed to judge them.
-- Check correctness, obvious bugs, clear regressions, and whether the change does what
-  the task asked.
-- Do not audit the architecture or review unchanged code unless the diff clearly
-  requires it.
-- Run a test only when an existing one directly covers the changed code and is quick.
+Review the change shown in the diff below, not the repository. Read surrounding code,
+callers and callees only where you need them to judge the change. Check correctness,
+regressions, whether it does what the task asked, and %s. Do not audit unchanged code or
+the architecture unless the diff clearly requires it, and do not report style.
 """
+
+REVIEW_DEPTH = {
+    "FAST": "nothing more",
+    "SMALL": "obvious edge cases",
+    "NORMAL": "edge cases and the integration with direct callers",
+    "DIFFICULT": "edge cases, integration, data integrity, permissions and concurrency "
+                 "where they apply",
+}
+
+MAX_TEST_RESULT_CHARS = 20000
 
 REVIEW_SCOPE_RECHECK = """## Review scope: re-review after a fix
 
@@ -523,7 +561,6 @@ you see a concrete failure.
 MAX_EMBEDDED_DIFF_CHARS = 50000
 MAX_FINDING_CHARS = 4000
 MAX_LISTED_UNTRACKED = 50
-GIT_SECONDS = 30
 
 
 def is_blocking(finding):
@@ -583,24 +620,11 @@ def format_findings(findings):
     return "\n".join(lines)
 
 
-def working_tree_diff(cwd):
+def working_tree_diff(cwd, files=None):
     """(diff, untracked paths) of the uncommitted change, or (None, None) if git cannot say."""
-    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
-
-    def git(*args):
-        proc = subprocess.run(
-            ["git", "-C", cwd, "--no-pager"] + list(args),
-            stdin=subprocess.DEVNULL, capture_output=True, env=env, timeout=GIT_SECONDS,
-        )
-        if proc.returncode != 0:
-            return None
-        return proc.stdout.decode(TEXT_ENCODING, TEXT_ERRORS)
-
-    try:
-        diff = git("diff", "--no-color", "--no-ext-diff", "HEAD")
-        listed = git("ls-files", "--others", "--exclude-standard", "-z")
-    except (OSError, subprocess.SubprocessError):
-        return None, None
+    pathspec = ["--"] + list(files) if files else []
+    diff = orchlib.git(cwd, "diff", "--no-color", "--no-ext-diff", "HEAD", *pathspec)
+    listed = orchlib.git(cwd, "ls-files", "--others", "--exclude-standard", "-z", *pathspec)
     if diff is None or listed is None:
         return None, None
     return diff, [path for path in listed.split("\0") if path]
@@ -615,8 +639,8 @@ def fence_for(text):
     return "`" * max(3, longest + 1)
 
 
-def diff_section(cwd):
-    diff, untracked = working_tree_diff(cwd)
+def diff_section(cwd, files=None):
+    diff, untracked = working_tree_diff(cwd, files)
     if diff is None:
         return (
             "## Current diff\n\nThe diff could not be read when this brief was written. "
@@ -647,17 +671,31 @@ def diff_section(cwd):
     return "\n".join(parts)
 
 
-def review_scope(mode, tier, previous, cwd):
-    """The scope section of a review brief, or "" where the tier's full review applies."""
+def test_results_section(text):
+    if not text or not text.strip():
+        return (
+            "## Tests the orchestrator ran\n\nNone. Do not report any test as passing "
+            "unless you ran it yourself.\n"
+        )
+    if len(text) > MAX_TEST_RESULT_CHARS:
+        text = "[... earlier output cut ...]\n" + text[-MAX_TEST_RESULT_CHARS:]
+    fence = fence_for(text)
+    return (
+        "## Tests the orchestrator ran\n\nRun outside your sandbox, against the "
+        "development site, on the current diff:\n\n%stext\n%s\n%s\n"
+        % (fence, text.rstrip("\n"), fence)
+    )
+
+
+def review_scope(mode, tier, previous, cwd, files=None, test_results=None):
+    """The scope section of a review brief; empty outside review mode."""
     if mode != "review":
         return ""
     if previous:
         scope = REVIEW_SCOPE_RECHECK % format_findings(previous)
-    elif tier == "FAST":
-        scope = REVIEW_SCOPE_FAST
     else:
-        return ""
-    return scope + "\n" + diff_section(cwd)
+        scope = REVIEW_SCOPE_FIRST % REVIEW_DEPTH.get(tier, REVIEW_DEPTH["NORMAL"])
+    return "\n".join([scope, diff_section(cwd, files), test_results_section(test_results)])
 
 
 def derive_verdict(report):
@@ -700,7 +738,7 @@ def derive_verdict(report):
 # --------------------------------------------------------------------------
 
 
-def adapt_opencode(*, brief, model_id, effort, mode, cwd, rules=()):
+def adapt_opencode(*, brief, model_id, effort, mode, cwd, rules=(), **_):
     # --dir, not the process working directory. Setting the child's cwd is not enough:
     # OpenCode resolved its working directory from the inherited PWD instead, so a run
     # launched from one repository with --cwd pointing at another operated on the first
@@ -717,25 +755,12 @@ def adapt_opencode(*, brief, model_id, effort, mode, cwd, rules=()):
     env = dict(os.environ)
     env["OPENCODE_CONFIG_CONTENT"] = json.dumps(opencode_permissions(rules))
     env["PWD"] = cwd
-    # A Linux opencode reads OPENCODE_CONFIG_CONTENT from the environment directly, and
-    # measurement says so: with WSLENV unset, the resolved config is this policy - 173
-    # bash rules, base "*": "ask", no allow - and the hostile project config contributes
-    # nothing. WSLENV is not what makes delivery work here.
-    #
-    # It stays anyway, for the build this dispatcher does not choose. WSL hands a variable
-    # to a *Windows* process only if WSLENV names it, and without that the policy is not
-    # weakened but absent: zero bash rules, not even the "*": "ask" base, after which
-    # --auto approves everything. That is not hypothetical - a delegated run executed
-    # `bench migrate` unrefused - and a Windows opencode is still on PATH one position
-    # behind the Linux one on the machine this was measured on. Which one `opencode`
-    # resolves to is a property of PATH, which nothing here controls, so the line is kept
-    # unconditional rather than made to depend on a guess about the build. It is inert
-    # when the CLI is a Linux process, and `agent_path` in the result records which one
-    # actually ran.
-    #
-    # /w is the direction that matters here (WSL -> Win32); /u is the opposite one and
-    # does nothing for this. No path translation: the value is JSON, and /p would mangle
-    # it. Already-named is left alone so a nested run does not repeat the entry.
+    # A Linux opencode reads OPENCODE_CONFIG_CONTENT directly. A *Windows* opencode on
+    # WSL receives it only if WSLENV names it, and without it the policy is absent, after
+    # which --auto approves everything (a delegated `bench migrate` once ran that way).
+    # Which build PATH resolves is not ours to choose, so this stays unconditional; it is
+    # inert for a Linux binary, and `agent_path` records which one ran. /w = WSL->Win32,
+    # no /p because the value is JSON.
     existing = env.get("WSLENV")
     if "OPENCODE_CONFIG_CONTENT/" not in (existing or ""):
         env["WSLENV"] = (
@@ -745,7 +770,7 @@ def adapt_opencode(*, brief, model_id, effort, mode, cwd, rules=()):
     return argv, env, None
 
 
-def adapt_codex(*, brief, mode, cwd, effort=None, **_):
+def adapt_codex(*, brief, mode, cwd, effort=None, model_id=None, last_message=None, **_):
     # Both sandboxes execute model-generated shell commands - the CLI's own help for
     # --sandbox says so. What they restrict is reach: read-only permits no write and no
     # network, workspace-write confines writes to the working tree and still has no
@@ -762,13 +787,20 @@ def adapt_codex(*, brief, mode, cwd, effort=None, **_):
     # is stated rather than inherited: the failure is silent and the run looks normal.
     env = dict(os.environ)
     env["PWD"] = cwd
-    argv = ["codex", "exec", "--sandbox", sandbox, "-C", cwd]
-    # Stated, not inherited, for the reason the directory is: left out, the effort is
-    # whatever ~/.codex/config.toml says, and that was "high" for every review on every
-    # tier - a one-line FAST fix reviewed as hard as a migration. The value is checked
-    # against CODEX_EFFORTS before it gets here, so nothing unvalidated reaches -c.
+    # --ephemeral: delegated runs no longer accumulate session files (audit BUG-14).
+    argv = ["codex", "exec", "--sandbox", sandbox, "-C", cwd, "--ephemeral"]
+    # Pinned only when the routing file or `orch models codex` says so; otherwise the
+    # user's config.toml model, which main() has already checked against Codex's catalog.
+    if model_id:
+        argv += ["-m", model_id]
+    # Stated, not inherited: left out, effort is whatever config.toml says. Checked
+    # against CODEX_EFFORTS before it gets here.
     if effort:
         argv += ["-c", "model_reasoning_effort=%s" % effort]
+    # The agent's final message on its own, so the report is parsed from that rather than
+    # from a transcript full of tool output. The transcript stays the fallback.
+    if last_message:
+        argv += ["-o", str(last_message)]
     return argv + ["-"], env, brief
 
 
@@ -861,12 +893,13 @@ def unwrap_claude_output(out):
     return "", None
 
 
-def verify_claude_model(envelope, model_id, auxiliary_prefixes):
+def verify_claude_model(envelope, model_prefix, auxiliary_prefixes):
     """(verified, {model: output tokens}, note) for one Claude run.
 
-    Verified means: the pinned id produced output, and every other model that produced
-    output is an auxiliary one. Anything that cannot be read is unverified - this is the
-    check that lets a result claim which model it came from, so it fails closed.
+    The adviser is requested by family alias (`opus`), so what is verified is the family:
+    some model whose id starts with `model_prefix` produced output, and every other model
+    that produced output is an auxiliary one. Anything unreadable is unverified - this is
+    the check that lets a result claim which model it came from, so it fails closed.
     """
     if not isinstance(envelope, dict):
         return False, {}, "no Claude result envelope, so the serving model is unknown"
@@ -877,16 +910,17 @@ def verify_claude_model(envelope, model_id, auxiliary_prefixes):
     for name, entry in usage.items():
         tokens = entry.get("outputTokens") if isinstance(entry, dict) else None
         served[name] = tokens if isinstance(tokens, int) else 0
-    if served.get(model_id, 0) <= 0:
-        return False, served, "%s produced no output in this run" % model_id
+    if not any(name.startswith(model_prefix) and tokens > 0 for name, tokens in served.items()):
+        return False, served, "no %s* model produced output in this run" % model_prefix
     others = [
         name for name, tokens in served.items()
-        if name != model_id and tokens > 0
+        if not name.startswith(model_prefix) and tokens > 0
         and not any(name.startswith(prefix) for prefix in auxiliary_prefixes)
     ]
     if others:
         return False, served, (
-            "models other than %s produced output: %s" % (model_id, ", ".join(sorted(others)))
+            "models other than %s* produced output: %s"
+            % (model_prefix, ", ".join(sorted(others)))
         )
     return True, served, None
 
@@ -903,29 +937,19 @@ def load_routing(fail):
         fail("cannot read %s: %s" % (ROUTING, exc))
 
 
-def resolve_model(routing, name, fail):
-    """Display name -> provider CLI id, refusing anything not delegable."""
-    models = routing.get("models") or {}
-    entry = models.get(name)
-    if entry is None:
-        fail(
-            'unknown model "%s". Names in %s: %s'
-            % (name, ROUTING, ", ".join(sorted(models)) or "none")
-        )
-    executor = entry.get("executor")
-    if executor != "opencode":
-        fail(
-            '"%s" has executor "%s" in the routing file, not "opencode". Claude '
-            "implements that tier directly with its own access, then delegates the "
-            "review to Codex. Do not delegate it to OpenCode." % (name, executor)
-        )
-    model_id = entry.get("id")
-    if not model_id or (model_id.startswith("<") and model_id.endswith(">")):
-        fail(
-            '"%s" has no provider CLI id in %s (found %r). Fill it in before '
-            "delegating to this model." % (name, ROUTING, model_id)
-        )
-    return model_id
+def resolve_model(routing, requested, fail):
+    """(OpenCode model id, source, notes). `requested` is an explicit id, or None.
+
+    No display names and no per-tier models any more: the stable model in the routing file,
+    or a model the user promoted with `orch models promote`, is the implementation model
+    for every tier. An explicit --model must be a provider/model id.
+    """
+    if requested:
+        if "/" not in requested or requested.startswith("-") or " " in requested:
+            fail('--model %r is not an OpenCode provider/model id, such as %s'
+                 % (requested, routing["implementers"]["opencode"]["stable_model"]))
+        return requested, "explicit", []
+    return orchlib.opencode_model(routing)
 
 
 # Values Codex accepts for model_reasoning_effort. Checked here, before the command is
@@ -934,27 +958,29 @@ def resolve_model(routing, name, fail):
 CODEX_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 
-def resolve_codex_effort(mode, tier_name, tier, override, fail):
+def resolve_codex_effort(mode, tier_name, review_tier, override, fail):
     """The reasoning effort for a Codex run, or None to leave Codex at its own default.
 
-    A review runs at the tier's review_effort, and a tier without a valid one is refused
-    rather than quietly falling back to ~/.codex/config.toml, which is the behaviour this
-    replaces. `--effort` overrides it in any Codex mode; an empty `--effort` omits it.
-    Test and onboard runs are unchanged unless `--effort` is passed.
+    A review or test run uses `review.tiers.<tier>.effort` from the routing file, and a
+    tier without a valid one is refused rather than falling back to config.toml.
+    `--effort` overrides it in any Codex mode; an empty `--effort` omits it. Onboard runs
+    use "medium" unless overridden, so they no longer inherit a config default of "high".
     """
     if override is not None:
         if override == "":
             return None
         value, source = override, "--effort"
-    elif mode == "review":
-        value = tier.get("review_effort")
-        source = 'review_effort of tier "%s" in %s' % (tier_name, ROUTING)
+    elif mode in ("review", "test"):
+        value = review_tier.get("effort")
+        source = 'review.tiers.%s.effort in %s' % (tier_name, ROUTING)
         if value is None:
             fail(
-                'tier "%s" has no review_effort in %s. Codex reviews run at the tier\'s '
+                'tier "%s" has no review effort in %s. Codex reviews run at the tier\'s '
                 "effort, not at the CLI's own default; set one of: %s"
                 % (tier_name, ROUTING, ", ".join(CODEX_EFFORTS))
             )
+    elif mode == "onboard":
+        return "medium"
     else:
         return None
     if not isinstance(value, str) or value not in CODEX_EFFORTS:
@@ -1059,19 +1085,20 @@ def check_trigger(config, tier, trigger, fail):
 
 
 def resolve_deliberation_model(routing, config, fail):
-    """(display name, provider id) of the Claude adviser, from the routing file only."""
-    name = config.get("claude_model")
-    entry = (routing.get("models") or {}).get(name)
-    if not isinstance(entry, dict):
-        fail('deliberation.claude_model "%s" is not a model in %s' % (name, ROUTING))
-    if entry.get("executor") != "claude":
-        fail('deliberation.claude_model "%s" has executor "%s", not "claude"'
-             % (name, entry.get("executor")))
-    model_id = entry.get("id")
-    if not isinstance(model_id, str) or not model_id or model_id.startswith("<"):
-        fail('"%s" has no provider id in %s (found %r). The Claude adviser is pinned to '
-             "an exact id and refused without one." % (name, ROUTING, model_id))
-    return name, model_id
+    """(alias, served-model prefix) of the Claude adviser, from the routing file only.
+
+    An alias rather than a version id, so a new Opus release needs no edit here; the
+    prefix is what verify_claude_model checks the serving model against.
+    """
+    alias = config.get("claude_model_alias")
+    prefix = config.get("claude_model_prefix")
+    if not isinstance(alias, str) or not alias or alias.startswith("-"):
+        fail("deliberation.claude_model_alias in %s is %r, not a model alias"
+             % (ROUTING, alias))
+    if not isinstance(prefix, str) or not prefix.startswith("claude-"):
+        fail("deliberation.claude_model_prefix in %s is %r; it must name the model "
+             "family the alias serves, such as claude-opus-" % (ROUTING, prefix))
+    return alias, prefix
 
 
 def resolve_deliberation_effort(agent, config, override, fail):
@@ -1479,15 +1506,88 @@ def drain_after_timeout(proc, expired, seconds=DRAIN_SECONDS):
     return as_text(expired.output), as_text(expired.stderr), notes
 
 
-def execute(argv, env, stdin_text, cwd, timeout):
-    """Run the CLI. Returns (status, exit_code, stdout, stderr, seconds).
+class Interrupted(Exception):
+    """The dispatcher was told to stop (SIGTERM, SIGHUP, SIGINT) while an agent ran."""
 
-    On timeout the returned stderr is prefixed with any `delegate:` line describing
-    something the cleanup could not confirm. Those lines are absent from an ordinary
-    timeout; they exist so that a containment failure is in the record rather than
-    silently indistinguishable from a clean one.
+    def __init__(self, signum):
+        super().__init__(signum)
+        self.signum = signum
+
+
+# The signals a supervisor uses to stop this process. SIGKILL cannot be caught; for that
+# case the child carries PR_SET_PDEATHSIG (below) and a detached watchdog
+# (orchlib.Watchdog) kills the rest of the run, and the marker environment lets the next
+# run, `orch stop`, and the edit guard find anything that still survived.
+STOP_SIGNALS = tuple(
+    getattr(signal, name) for name in ("SIGTERM", "SIGHUP", "SIGINT") if hasattr(signal, name)
+)
+
+
+def _raise_interrupted(signum, _frame):
+    raise Interrupted(signum)
+
+
+def install_stop_handlers():
+    for signum in STOP_SIGNALS:
+        signal.signal(signum, _raise_interrupted)
+
+
+def ignore_stop_signals():
+    """While cleaning up, a second signal must not cut the cleanup short."""
+    for signum in STOP_SIGNALS:
+        signal.signal(signum, signal.SIG_IGN)
+
+
+def _die_with_parent(parent):
+    """preexec: SIGKILL this child when the dispatcher dies, however it dies. Linux only."""
+    def setup():
+        if not orchlib._set_parent_death_signal(signal.SIGKILL):
+            return   # not Linux: the signal handlers and the watchdog still apply
+        if os.getppid() != parent:   # the dispatcher died before prctl took effect
+            os._exit(1)
+    return setup
+
+
+def stop_watchdog(guard):
+    if guard is not None:
+        guard.done()
+
+
+def sweep_run(run_id, proc, notes):
+    """Stop whatever of this run outlived its CLI: the rest of its process group, then
+    anything carrying the run marker that left the group (setsid, double fork). Returns
+    False if something may still be running."""
+    contained = True
+    if proc is not None and POSIX and proc.returncode is not None and group_alive(proc.pid):
+        # The CLI has exited; its group id stays reserved while any member lives, so it
+        # still names only this run's leftovers.
+        notes.append("processes in the agent's group outlived it and were terminated")
+        signal_group(proc.pid, signal.SIGKILL, notes)
+        time.sleep(0.05)
+        if group_alive(proc.pid):
+            contained = False
+            notes.append("part of the agent's process group %s survived SIGKILL" % proc.pid)
+    if run_id:
+        leftovers = orchlib.marked_processes(run_id=run_id)
+        if leftovers:
+            survived = orchlib.stop_processes(leftovers)
+            notes.append("%d process(es) of this run outlived it and were terminated%s" % (
+                len(leftovers), "; still alive: %s" % survived if survived else ""))
+            contained = contained and not survived
+    return contained
+
+
+def execute(argv, env, stdin_text, cwd, timeout, run_id=None, guard=None):
+    """Run the CLI. Returns (status, exit_code, stdout, stderr, seconds, notes, contained).
+
+    status is completed, failed, timeout, interrupted or error. On timeout or
+    interruption the whole process group is terminated, and anything else still carrying
+    this run's marker is stopped too; `notes` says what the cleanup could not confirm, and
+    `contained` is False when something of the run may still be alive.
     """
     started = time.monotonic()
+    notes = []
+    install_stop_handlers()
     try:
         proc = subprocess.Popen(
             argv,
@@ -1501,33 +1601,52 @@ def execute(argv, env, stdin_text, cwd, timeout):
             # boundary above. This is the crossing BUG-003 was reported against.
             encoding=TEXT_ENCODING,
             errors=TEXT_ERRORS,
-            # The run gets a session of its own, which is what makes the timeout
-            # path able to signal everything it spawned instead of only argv[0].
+            # Its own process group, so every stop path signals everything it spawned.
             start_new_session=POSIX,
+            preexec_fn=_die_with_parent(os.getpid()) if POSIX else None,
         )
+    except Interrupted as stop:
+        ignore_stop_signals()
+        # Popen may have forked before the signal landed; the marker finds that child.
+        contained = sweep_run(run_id, None, notes)
+        return ("interrupted", None, "", "stopped by %s before the agent started"
+                % signal.Signals(stop.signum).name, time.monotonic() - started, notes,
+                contained)
     except OSError as exc:
-        return "error", None, "", str(exc), time.monotonic() - started
+        return "error", None, "", str(exc), time.monotonic() - started, notes, True
 
+    contained = True
     try:
+        if guard is not None:
+            guard.watch_group(proc.pid)
         out, err = proc.communicate(input=stdin_text, timeout=timeout)
         out, err = as_text(out), as_text(err)
         status = "completed" if proc.returncode == 0 else "failed"
     except subprocess.TimeoutExpired as expired:
-        notes = terminate_process_tree(proc)
+        ignore_stop_signals()
+        notes += terminate_process_tree(proc)
+        # Before draining: a process that left the group may hold the output pipes open.
+        contained = sweep_run(run_id, None, notes)
         out, err, drained = drain_after_timeout(proc, expired)
         notes += drained
-        if notes:
-            err = "\n".join(["delegate: " + note for note in notes]
-                             + ([err] if err else []))
         status = "timeout"
-    except KeyboardInterrupt:
-        # The new session is why this is here: it detaches the run from this
-        # process's session, so a Ctrl-C at the terminal no longer reaches the agent
-        # the way it did before that change. Pass it on rather than leaving the agent
-        # orphaned and still writing to the repository.
-        terminate_process_tree(proc)
-        raise
-    return status, proc.returncode, out, err, time.monotonic() - started
+    except Interrupted as stop:
+        ignore_stop_signals()
+        notes.append("stopped by %s; the agent's process group was terminated"
+                     % signal.Signals(stop.signum).name)
+        notes += terminate_process_tree(proc)
+        contained = sweep_run(run_id, None, notes)
+        out, err, drained = drain_after_timeout(proc, subprocess.TimeoutExpired(argv, 0))
+        notes += drained
+        status = "interrupted"
+    ignore_stop_signals()
+    if any("survived" in note or "had not been reaped" in note for note in notes):
+        contained = False
+    # Nothing of a finished run may keep running.
+    contained = sweep_run(run_id, proc, notes) and contained
+    if notes and status != "completed":
+        err = "\n".join(["delegate: " + note for note in notes] + ([err] if err else []))
+    return status, proc.returncode, out, err, time.monotonic() - started, notes, contained
 
 
 # What identifies a report is the contract this dispatcher itself appended to the brief,
@@ -1822,11 +1941,27 @@ def build_parser():
     parser.add_argument(
         "--tier", required=True, choices=("FAST", "SMALL", "NORMAL", "DIFFICULT")
     )
-    parser.add_argument("--model", help="display name from the routing file")
+    parser.add_argument(
+        "--model",
+        help="opencode only, rarely needed: a provider/model id. Default: the stable or "
+        "promoted model (`orch models status`)",
+    )
     parser.add_argument(
         "--effort",
-        help="defaults to the tier's effort (OpenCode --variant) or, for a Codex review, "
-        "its review_effort (-c model_reasoning_effort); an empty string omits it",
+        help="defaults to the model's variant from the routing file (OpenCode) or the "
+        "tier's review effort (Codex); an empty string omits it",
+    )
+    parser.add_argument(
+        "--files",
+        nargs="+",
+        metavar="PATH",
+        help="review only: limit the embedded diff to these repository-relative paths",
+    )
+    parser.add_argument(
+        "--test-results",
+        metavar="PATH",
+        help="review only: a file with the output of tests the orchestrator ran; "
+        "embedded in the brief so the reviewer does not claim or need them",
     )
     parser.add_argument(
         "--previous-findings",
@@ -1895,17 +2030,17 @@ def validate_invocation(agent, mode, model, fail):
             % (agent, " or ".join(MODES[agent]))
         )
     if agent == "opencode":
-        if not model:
-            fail("--model is required for --agent opencode")
-    elif agent == "claude" and model:
+        return
+    if agent == "claude" and model:
         fail(
-            "--model is not accepted for --agent claude. Its model is pinned in the "
-            "routing file as deliberation.claude_model, and is not chosen per run."
+            "--model is not accepted for --agent claude. Its model is the alias in the "
+            "routing file (deliberation.claude_model_alias), not chosen per run."
         )
     elif model:
         fail(
-            "--model is not accepted for --agent %s; %s is not pinned to a model and "
-            "uses its own CLI default." % (agent, agent.capitalize())
+            "--model is not accepted for --agent %s. Its model comes from review.codex_model "
+            "in the routing file, `orch models codex <id>`, or the CLI's own config."
+            % agent
         )
 
 
@@ -1958,7 +2093,8 @@ def deliberation_fields(args, trigger_kind, digest, status, block_state, report,
     }
     if args.agent == "claude":
         verified, served, note = verify_claude_model(
-            envelope, model_id, config.get("claude_auxiliary_model_prefixes", [])
+            envelope, config["claude_model_prefix"],
+            config.get("claude_auxiliary_model_prefixes", []),
         )
         fields.update(model_verified=verified, served_models=served)
         if not verified:
@@ -1971,6 +2107,89 @@ def deliberation_fields(args, trigger_kind, digest, status, block_state, report,
     return fields
 
 
+
+# --------------------------------------------------------------------------
+# Workspaces, metrics and the result
+# --------------------------------------------------------------------------
+
+# Under the state dir rather than /tmp, so a post-mortem survives a reboot (audit BUG-14),
+# and pruned by age so they do not grow without bound.
+WORKSPACE_DAYS = 14
+
+# A brief is one argv element for OpenCode, and Linux caps one at 128 KiB (audit BUG-12).
+# A brief anywhere near this is wrong anyway: agents read the repository themselves.
+MAX_BRIEF_ARG_BYTES = 100 * 1024
+
+
+def runs_dir():
+    root = orchlib.private(orchlib.state_dir() / "runs")
+    marker = root / ".pruned"
+    try:
+        due = time.time() - marker.stat().st_mtime > 3600
+    except OSError:
+        due = True
+    if due:
+        cutoff = time.time() - WORKSPACE_DAYS * 86400
+        for path in root.iterdir():
+            try:
+                if path.is_dir() and path.stat().st_mtime < cutoff:
+                    shutil.rmtree(path, ignore_errors=True)
+            except OSError:
+                pass
+        marker.touch()
+    return root
+
+
+def new_workspace(agent, mode):
+    prefix = "%s-%s-%s-" % (time.strftime("%Y%m%d-%H%M%S"), agent, mode)
+    return Path(tempfile.mkdtemp(prefix=prefix, dir=str(runs_dir())))
+
+
+def codex_tokens(*texts):
+    """Codex's own "tokens used" figure, when it printed one. Never estimated."""
+    for text in texts:
+        found = re.findall(r"tokens used[:\s]*([\d,]+)", text or "", re.I)
+        if found:
+            return int(found[-1].replace(",", ""))
+    return None
+
+
+def catalog_suggestions(agent, routing):
+    if agent == "codex":
+        ids, _age = orchlib.catalog("codex")
+        return ids or []
+    stable = routing["implementers"]["opencode"]["stable_model"]
+    ids, _age = orchlib.catalog("opencode", stable.split("/", 1)[0])
+    families = routing["implementers"]["opencode"].get("candidate_families", [])
+    return [i for i in ids or [] if any(fnmatch.fnmatch(i, f) for f in families)]
+
+
+def fallback_decision(category, recovery, still_alive, other_writers, changed, mixed,
+                      lifecycle_doubts=(), head_moved=False):
+    """Whether Sonnet may take over this implementation now, and why not if not."""
+    if recovery != "fallback_sonnet":
+        return {"allowed": False, "to": None, "reason": recovery,
+                "blockers": ["recovery for %s is %s, not a fallback" % (category, recovery)]}
+    blockers = []
+    if still_alive:
+        blockers.append("processes of this run are still alive: %s"
+                        % ", ".join(str(p["pid"]) for p in still_alive))
+    if other_writers:
+        blockers.append("another delegated writer is active in this repository: %s"
+                        % ", ".join(str(p["pid"]) for p in other_writers))
+    if changed is None:
+        blockers.append("the working tree state could not be read")
+    if mixed:
+        blockers.append("files that already had uncommitted changes were modified: %s - "
+                        "ask the user before continuing" % ", ".join(mixed))
+    blockers += list(lifecycle_doubts)
+    if head_moved:
+        blockers.append("HEAD moved during the run (a commit, reset or checkout) - "
+                        "ask the user before continuing")
+    return {"allowed": not blockers, "to": "sonnet", "reason": category,
+            "blockers": blockers, "partial_changes": changed or []}
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -1979,6 +2198,8 @@ def main():
     validate_invocation(args.agent, args.mode, args.model, fail)
     validate_stage_arguments(args.mode, args.stage, args.trigger, args.own_position,
                              args.counterpart, fail)
+    if (args.files or args.test_results) and args.mode != "review":
+        fail("--files and --test-results are accepted only with --mode review")
 
     routing = load_routing(fail)
     boundaries = load_boundaries(fail)
@@ -1989,32 +2210,46 @@ def main():
         fail('tier "%s" is not in %s' % (args.tier, ROUTING))
 
     deliberation = trigger_kind = None
-    model_name = args.model
+    model_notes, model_source, pass_model = [], None, None
     if args.mode == "deliberate":
         deliberation = load_deliberation(routing, tiers, fail)
         trigger_kind = check_trigger(deliberation, args.tier, args.trigger, fail)
         timeout = args.timeout or deliberation["timeout_seconds"]
         effort = resolve_deliberation_effort(args.agent, deliberation, args.effort, fail)
         if args.agent == "claude":
-            model_name, model_id = resolve_deliberation_model(routing, deliberation, fail)
+            model_id, _prefix = resolve_deliberation_model(routing, deliberation, fail)
+            model_source, pass_model = "alias", model_id
         else:
-            model_id = None
+            model_id, model_source = orchlib.codex_model(routing)
+            pass_model = model_id if model_source == "pinned" else None
     else:
         timeout = args.timeout or tier.get("timeout_seconds")
         if not timeout:
             fail('tier "%s" has no timeout_seconds in %s' % (args.tier, ROUTING))
         if args.agent == "opencode":
-            model_id = resolve_model(routing, args.model, fail)
-            effort = args.effort if args.effort is not None else tier.get("effort")
+            model_id, model_source, model_notes = resolve_model(routing, args.model, fail)
+            variants = routing["implementers"]["opencode"].get("variants") or {}
+            effort = (args.effort if args.effort is not None else variants.get(model_id)) or None
+            pass_model = model_id
         else:
-            model_id = None
-            effort = resolve_codex_effort(args.mode, args.tier, tier, args.effort, fail)
+            model_id, model_source = orchlib.codex_model(routing)
+            pass_model = model_id if model_source == "pinned" else None
+            review_tier = (routing.get("review", {}).get("tiers") or {}).get(args.tier) or {}
+            effort = resolve_codex_effort(args.mode, args.tier, review_tier, args.effort, fail)
 
     previous = None
     if args.previous_findings is not None:
         if args.mode != "review":
             fail("--previous-findings is accepted only with --mode review")
         previous = load_previous_findings(args.previous_findings, fail)
+
+    test_results = None
+    if args.test_results:
+        try:
+            test_results = Path(args.test_results).read_text(encoding=TEXT_ENCODING,
+                                                            errors=TEXT_ERRORS)
+        except OSError as exc:
+            fail("cannot read --test-results %s: %s" % (args.test_results, exc))
 
     brief = "" if sys.stdin.isatty() else sys.stdin.read()
     if not brief.strip():
@@ -2026,7 +2261,7 @@ def main():
 
     # The leading heading also guarantees the brief never starts with "-" when it is
     # passed as a positional argument.
-    scope = review_scope(args.mode, args.tier, previous, cwd)
+    scope = review_scope(args.mode, args.tier, previous, cwd, args.files, test_results)
     heading, contract, digest = args.mode, CONTRACTS[args.mode], None
     if args.mode == "deliberate":
         heading = "deliberate: %s" % args.stage
@@ -2044,11 +2279,19 @@ def main():
         scope + "\n" if scope else "",
         contract,
     )
+    if args.agent == "opencode" and len(full_brief.encode(TEXT_ENCODING)) > MAX_BRIEF_ARG_BYTES:
+        fail("the brief is %d bytes; OpenCode receives it as one argument, capped at %d. "
+             "Keep briefs short - the agent reads the repository itself."
+             % (len(full_brief.encode(TEXT_ENCODING)), MAX_BRIEF_ARG_BYTES))
 
+    workspace = None if args.dry_run else new_workspace(args.agent, args.mode)
+    last_message = (workspace / "last-message.txt") if workspace else None
     argv, env, stdin_text = ADAPTERS[args.agent](
-        brief=full_brief, model_id=model_id, effort=effort, mode=args.mode, cwd=cwd,
-        rules=boundaries,
+        brief=full_brief, model_id=pass_model, effort=effort, mode=args.mode, cwd=cwd,
+        rules=boundaries, last_message=last_message,
     )
+    run_id = uuid.uuid4().hex[:12]
+    env[orchlib.ENV_RUN], env[orchlib.ENV_CWD], env[orchlib.ENV_MODE] = run_id, cwd, args.mode
 
     if args.dry_run:
         executable = resolve_program(argv[0], env)
@@ -2057,6 +2300,8 @@ def main():
                 "dry_run": True,
                 "argv": argv,
                 "cwd": cwd,
+                "model_id": model_id,
+                "model_source": model_source,
                 "agent_path": executable[0] if executable else None,
                 "agent_real_path": executable[1] if executable else None,
                 "timeout_seconds": timeout,
@@ -2073,17 +2318,83 @@ def main():
         print()
         return
 
-    # Outside the repository, so delegation artifacts never reach the working tree.
-    workspace = Path(tempfile.mkdtemp(prefix="delegate-%s-%s-" % (args.agent, args.mode)))
     write_artifact(workspace / "brief.md", full_brief)
-    # Echoed early so the workspace is recoverable if this process is killed.
+    # Echoed early so the workspace is recoverable if this process is killed. stderr only:
+    # stdout is the JSON result and nothing else.
     print("workspace: %s" % workspace, file=sys.stderr)
 
+    writer = args.mode in orchlib.WRITER_MODES
+    status, active, before, head_before, guard = None, [], None, None, None
+    code, out, err, seconds, notes, contained = None, "", "", 0.0, [], True
     executable = resolve_program(argv[0], env)
-    if executable is None:
-        status, code, out, err, seconds = "cli_missing", None, "", "", 0.0
-    else:
-        status, code, out, err, seconds = execute(argv, env, stdin_text, cwd, timeout)
+    # From here on a stop signal produces a result, even before the agent starts: the
+    # checks below run subprocesses of their own (the catalog query, git), and a
+    # dispatcher that died in the middle of one used to orphan it. The watchdog starts
+    # first, so a dispatcher SIGKILLed at any later point - mid-query included - is
+    # cleaned up after.
+    install_stop_handlers()
+    try:
+        guard = orchlib.Watchdog.start(run_id)
+        orchlib.QUERY_MARKER = {orchlib.ENV_RUN: run_id, orchlib.ENV_MODE: "catalog"}
+        if writer:
+            # A full scan, not the registry fast path: an orphan of an older dispatcher
+            # left no registry entry, and this is the check that keeps two writers off
+            # one tree.
+            active = orchlib.marked_processes(cwd=cwd, writers_only=True)
+            if active:
+                status = "busy"
+        if status is None and args.agent in ("opencode", "codex") and model_id:
+            if orchlib.catalog_status(args.agent, model_id) == "absent":
+                status = "invalid_model"
+        if status is None and executable is None:
+            status = "cli_missing"
+        if writer:
+            before = orchlib.tree_snapshot(cwd)
+            head_before = orchlib.head(cwd)
+    except Interrupted as stop:
+        ignore_stop_signals()
+        status = "interrupted"
+        err = "stopped by %s before the agent started" % signal.Signals(stop.signum).name
+    ran = status is None
+    if not ran:
+        ignore_stop_signals()
+    if ran:
+        try:
+            orchlib.register_run(run_id, {
+                "dispatcher_pid": os.getpid(), "cwd": cwd, "agent": args.agent,
+                "mode": args.mode, "started": time.time(), "workspace": str(workspace),
+            })
+        except Interrupted as stop:
+            ignore_stop_signals()
+            ran, status = False, "interrupted"
+            err = "stopped by %s before the agent started" % signal.Signals(stop.signum).name
+            orchlib.unregister_run(run_id)
+    if ran:
+        status, code, out, err, seconds, notes, contained = execute(
+            argv, env, stdin_text, cwd, timeout, run_id, guard)
+    after = orchlib.tree_snapshot(cwd) if writer else None
+    head_after = orchlib.head(cwd) if writer else None
+    changed, mixed = orchlib.tree_changes(before, after)
+    committed = orchlib.committed_files(cwd, head_before, head_after) if writer else []
+    if not ran:
+        # A stop during the catalog query can leave what the query started.
+        contained = sweep_run(run_id, None, notes)
+    still_alive = orchlib.marked_processes(run_id=run_id)
+    if ran and not still_alive:
+        orchlib.unregister_run(run_id)
+    if not still_alive and contained:
+        stop_watchdog(guard)   # otherwise it stays, and acts when this process exits
+    # What could not be confirmed about the run's processes. Any of it means a writer
+    # may still be alive, so no automatic fallback may start beside it.
+    lifecycle_doubts = []
+    if ran and not contained:
+        lifecycle_doubts.append("the cleanup could not confirm every process of the run "
+                                "stopped (see cleanup_notes)")
+    if ran and not orchlib.process_scan_available():
+        lifecycle_doubts.append("/proc cannot be scanned, so surviving processes cannot "
+                                "be ruled out")
+    if ran and guard is None and status in ("interrupted", "timeout"):
+        lifecycle_doubts.append("the run had no watchdog")
 
     write_artifact(workspace / "agent-output.txt", out)
     write_artifact(workspace / "agent-stderr.txt", err)
@@ -2094,40 +2405,72 @@ def main():
         write_artifact(workspace / "agent-text.txt", text)
         if status == "completed" and (envelope is None or envelope.get("is_error")):
             status = "failed"
-    block_state, report = extract_report(text, args.mode)
+    block_state, report = "missing", None
+    if last_message and last_message.exists():
+        block_state, report = extract_report(
+            last_message.read_text(encoding=TEXT_ENCODING, errors=TEXT_ERRORS), args.mode)
+    if block_state != "present":
+        block_state, report = extract_report(text, args.mode)
     off_contract = strip_off_contract(report, args.mode)
 
-    # --variant is the only argument this dispatcher passes whose accepted values are
-    # not verified against the CLI; they are provider-specific. A CLI that rejects an
-    # argument exits before producing any output, so that combination is reported as a
-    # usage error rather than a generic failure - otherwise the cause is invisible.
-    if status == "failed" and not out.strip() and "--variant" in argv:
-        status = "usage_error"
+    category = None
+    if status == "failed":
+        # stderr is the CLI's; stdout is mostly the agent's own words, where "403" or
+        # "billing" are ordinary code. stdout is consulted only when stderr says nothing
+        # and the agent produced no report.
+        category = orchlib.classify_failure(err)
+        if category == "unknown" and block_state != "present":
+            category = orchlib.classify_failure(out[-1500:])
+        if args.agent == "claude" and category == "unknown" and envelope:
+            category = orchlib.classify_failure(str(envelope.get("result", "")))
+    elif status != "completed":
+        category = status
+    elif block_state != "present":
+        category = "incomplete_result"
 
     result = {
         "status": status,
         "agent": args.agent,
         "mode": args.mode,
         "tier": args.tier,
-        "model": model_name,
+        "model": model_id,
         "model_id": model_id,
+        "model_source": model_source,
         "effort": effort,
         "exit_code": code,
         "duration_seconds": round(seconds, 1),
         "timeout_seconds": timeout,
         "cwd": cwd,
+        "run_id": run_id,
         "agent_path": executable[0] if executable else None,
         "agent_real_path": executable[1] if executable else None,
         "workspace": str(workspace),
         "transcript": str(workspace / "agent-output.txt"),
+        "stderr_path": str(workspace / "agent-stderr.txt"),
         "result_block": block_state,
         "off_contract_keys": off_contract,
         "agent_report": report,
     }
+    if model_notes:
+        result["model_notes"] = model_notes
+    if notes:
+        result["cleanup_notes"] = notes
+    if args.agent == "codex":
+        result["tokens_reported"] = codex_tokens(err, out)
+    if writer:
+        # Measured from the tree, not taken from the agent's report.
+        result["files_changed"] = (sorted(set(changed) | set(committed))
+                                   if changed is not None and committed is not None else changed)
+        result["mixed_files"] = mixed
+        result["agent_terminated"] = not still_alive and contained
+        if head_before != head_after:
+            result["head_moved"] = {"before": head_before, "after": head_after}
     if args.mode in VERDICT_MODES:
         result["previous_findings"] = (
             os.path.abspath(args.previous_findings) if args.previous_findings else None
         )
+        result["files_reviewed"] = args.files
+        result["test_results_supplied"] = bool(test_results and test_results.strip())
         verdict, counts, note = derive_verdict(report)
         if verdict is not None:
             result["verdict"] = verdict
@@ -2140,33 +2483,56 @@ def main():
             model_id, deliberation,
         ))
 
-    if status == "cli_missing":
-        result["error"] = (
-            "%s is not installed or not on PATH. Nothing was run." % argv[0]
-        )
-    elif status == "usage_error":
-        result["error"] = (
-            "%s exited %s before producing any output, which is how a CLI reports a "
-            "rejected argument. The only argument here whose accepted values are "
-            "unverified is `--variant %s`, taken from the tier's effort in the routing "
-            "file; variant names are provider-specific. Re-run with --effort '' to drop "
-            "it. If that succeeds, the variant value is the cause; if it fails the same "
-            "way, look at the stderr below. CLI stderr: %s"
-            % (argv[0], code, effort, err.strip()[:800] or "(empty)")
-        )
-    elif status == "error":
-        result["error"] = err
-    elif status == "failed" and args.agent == "claude":
-        result["error"] = (
-            (envelope or {}).get("result") or err.strip()[:800]
-            or "claude reported a failure and no reason"
-        )
-    elif status == "timeout":
-        # A timeout is a blocker, not a verdict on the implementation.
-        result["blocker_reason"] = "timeout"
-        if args.mode in VERDICT_MODES:
+    if category:
+        recovery = ("inspect_diff" if category == "incomplete_result"
+                    else orchlib.recovery_for(args.mode, category))
+        advice = orchlib.ADVICE.get(category, "")
+        excerpt = orchlib.sanitize(err or out) or "(the CLI wrote nothing)"
+        if status == "busy":
+            excerpt = "active: %s" % json.dumps(active)
+            result["active_agents"] = active
+        elif status == "invalid_model":
+            offered = catalog_suggestions(args.agent, routing)
+            excerpt = "%s is not in the %s catalog. Offered: %s" % (
+                model_id, args.agent, ", ".join(offered[:20]) or "(none listed)")
+        elif category == "incomplete_result":
+            advice = ("The CLI exited cleanly but returned no result block. Inspect the "
+                      "diff and the transcript before deciding anything.")
+        result.update(error_category=category, recovery=recovery,
+                      error="%s %s" % (advice, excerpt) if advice else excerpt,
+                      error_excerpt=excerpt)
+        if writer and status != "completed":
+            others = [p for p in orchlib.marked_processes(cwd=cwd, writers_only=True)
+                      if p["run"] != run_id]
+            result["fallback"] = fallback_decision(
+                category, recovery, still_alive, others if status != "busy" else active,
+                changed, mixed, lifecycle_doubts, head_before != head_after)
+        if status != "completed" and (args.mode in VERDICT_MODES or status != "failed"):
+            result["blocker_reason"] = category
+        if args.mode in VERDICT_MODES and status != "completed":
+            # Not a verdict on the code: verification did not happen.
             result["verdict"] = "BLOCKED"
+    if args.mode in VERDICT_MODES:
+        result["review_status"] = {"PASS": "passed", "FAIL": "failed",
+                                   "BLOCKED": "blocked"}.get(result.get("verdict"), "blocked")
+    if args.mode == "implement" and ran:
+        # Always present once an implementation ran: an absent gate must never read as
+        # "nothing to review". review_gate itself never raises; this is the last resort.
+        try:
+            result["review_gate"] = orchlib.implementation_gate(
+                cwd, args.tier, routing, changed, head_before, head_after)
+        except Exception as exc:   # noqa: BLE001 - any failure here fails closed
+            result["review_gate"] = orchlib.gate_failure(
+                args.tier, "the review gate failed: %s: %s" % (type(exc).__name__, exc))
 
+    orchlib.record_outcome(args.agent, model_id, status, category, seconds)
+    orchlib.append_metric({
+        "at": time.strftime("%Y-%m-%dT%H:%M:%S"), "run_id": run_id, "agent": args.agent,
+        "mode": args.mode, "tier": args.tier, "model": model_id, "status": status,
+        "category": category, "seconds": round(seconds, 1), "cwd": cwd,
+        "files_changed": len(changed or []), "verdict": result.get("verdict"),
+        "tokens_reported": result.get("tokens_reported"),
+    })
     write_artifact(workspace / "result.json", json.dumps(result, indent=2) + "\n")
     json.dump(result, sys.stdout, indent=2)
     print()
